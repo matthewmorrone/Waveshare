@@ -24,6 +24,7 @@
 #include <time.h>
 
 #include "ota_config.h"
+#include "weather_ui.h"
 
 namespace
 {
@@ -36,9 +37,12 @@ constexpr uint32_t kMotionRefreshMs = 40;
 constexpr uint32_t kWeatherAnimRefreshMs = 90;
 constexpr uint32_t kWeatherRefreshIntervalMs = 15UL * 60UL * 1000UL;
 constexpr uint32_t kWeatherRetryIntervalMs = 60UL * 1000UL;
-constexpr uint32_t kWeatherFetchTimeoutMs = 10000;
+constexpr uint32_t kWeatherFetchTimeoutMs = 2500;
+constexpr bool kWeatherFetchEnabled = true;
 constexpr uint32_t kWifiConnectTimeoutMs = 12000;
 constexpr uint32_t kWifiRetryIntervalMs = 30000;
+constexpr uint32_t kWifiServiceIntervalMs = 1000;
+constexpr uint32_t kWifiServiceConnectingIntervalMs = 250;
 constexpr uint32_t kRtcWriteIntervalSeconds = 60;
 constexpr uint32_t kDimAfterMs = 30000;
 constexpr uint32_t kSleepAfterMs = 5UL * 60UL * 1000UL;
@@ -51,6 +55,12 @@ constexpr time_t kMinValidEpoch = 1704067200;
 constexpr const char *kSdMountPath = "/sdcard";
 constexpr int kMotionSwipeMinDistancePx = 8;
 constexpr int kMotionSwipeMinDominancePx = -6;
+constexpr int kWeatherSwipeMinDistancePx = 22;
+constexpr int kWeatherSwipeMinDominancePx = 8;
+constexpr int kWeatherNavSwipeMinDistancePx = 12;
+constexpr int kWeatherNavSwipeMinDominancePx = -10;
+constexpr int kScreenNavSwipeMinDistancePx = 20;
+constexpr int kScreenNavSwipeMinDominancePx = 4;
 constexpr int kMotionViewAnimOffsetPx = 28;
 constexpr uint32_t kMotionViewAnimMs = 140;
 constexpr float kMotionDeltaThreshold = 0.18f;
@@ -72,7 +82,6 @@ constexpr int kClockColonWidth = 22;
 constexpr int kClockGlyphHeight = 148;
 constexpr int kClockZoom = 384;
 constexpr size_t kScreenCount = 3;
-constexpr size_t kWeatherParticleCount = 8;
 constexpr size_t kCubeEdgeCount = 12;
 constexpr size_t kCubeArrowSegmentCount = 3;
 constexpr size_t kCubeArrowCount = 3;
@@ -87,6 +96,7 @@ constexpr const char *kSdStartupDirs[] = {
 constexpr const char *kPreferencesNamespace = "waveform";
 constexpr const char *kPrefScreenKey = "screen";
 constexpr const char *kPrefMotionViewKey = "motionview";
+constexpr const char *kPrefWeatherCacheKey = "weather";
 
 struct WiFiCredential
 {
@@ -116,17 +126,6 @@ enum class MotionViewMode : uint8_t
   Count,
 };
 
-enum class WeatherSceneType : uint8_t
-{
-  Clear,
-  PartlyCloudy,
-  Cloudy,
-  Rain,
-  Snow,
-  Storm,
-  Fog,
-};
-
 struct MotionState
 {
   bool valid = false;
@@ -139,26 +138,6 @@ struct MotionState
   float pitch = 0.0f;
   float roll = 0.0f;
   char orientation[20] = "Unavailable";
-};
-
-struct WeatherState
-{
-  bool hasData = false;
-  bool stale = true;
-  bool isDay = true;
-  int weatherCode = -1;
-  int temperatureF = 0;
-  int feelsLikeF = 0;
-  int highF = 0;
-  int lowF = 0;
-  int windMph = 0;
-  int precipitationPercent = 0;
-  int cloudCoverPercent = 0;
-  String condition = "Waiting for weather";
-  String updated = "Waiting for Wi-Fi";
-  String sunrise = "--:--";
-  String sunset = "--:--";
-  String location = WEATHER_LOCATION_LABEL;
 };
 
 struct Vec3
@@ -196,6 +175,10 @@ std::shared_ptr<Arduino_IIC_DriveBus> touchBus = std::make_shared<Arduino_HWIIC>
 Preferences preferences;
 void handleTouchInterrupt();
 void captureMotionReference();
+void refreshWeatherScreen();
+void updateWeatherHero();
+void showNextScreen();
+void showPreviousScreen();
 std::unique_ptr<Arduino_IIC> touchController(
     new Arduino_FT3x68(touchBus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, handleTouchInterrupt));
 
@@ -203,7 +186,7 @@ lv_display_t *display = nullptr;
 lv_indev_t *touchInput = nullptr;
 static uint8_t *lvBuffer = nullptr;
 
-lv_obj_t *screenRoots[kScreenCount] = {nullptr, nullptr, nullptr};
+lv_obj_t *screenRoots[kScreenCount] = {};
 size_t currentScreenIndex = 0;
 
 lv_obj_t *watchTimeLabel = nullptr;
@@ -242,21 +225,6 @@ lv_obj_t *motionCubeArrows[kCubeArrowLineCount] = {nullptr};
 lv_point_precise_t motionCubeEdgePoints[kCubeEdgeCount][2] = {};
 lv_point_precise_t motionCubeArrowPoints[kCubeArrowLineCount][2] = {};
 
-lv_obj_t *weatherScreen = nullptr;
-lv_obj_t *weatherHero = nullptr;
-lv_obj_t *weatherTempLabel = nullptr;
-lv_obj_t *weatherConditionLabel = nullptr;
-lv_obj_t *weatherPrimaryLabel = nullptr;
-lv_obj_t *weatherSecondaryLabel = nullptr;
-lv_obj_t *weatherUpdatedValueLabel = nullptr;
-lv_obj_t *weatherHintLabel = nullptr;
-lv_obj_t *weatherSun = nullptr;
-lv_obj_t *weatherMoon = nullptr;
-lv_obj_t *weatherClouds[3] = {nullptr};
-lv_obj_t *weatherParticles[kWeatherParticleCount] = {nullptr};
-lv_obj_t *weatherBolt = nullptr;
-lv_obj_t *weatherFogBars[3] = {nullptr};
-
 lv_obj_t *otaOverlay = nullptr;
 lv_obj_t *otaStatusLabel = nullptr;
 lv_obj_t *otaFooterLabel = nullptr;
@@ -284,9 +252,9 @@ bool powerButtonReleaseArmed = false;
 bool wifiAttemptInProgress = false;
 bool otaReady = false;
 bool otaInProgress = false;
+bool otaOverlaySticky = false;
 bool ntpConfigured = false;
 bool weatherFetchInProgress = false;
-bool weatherForceRefreshRequested = false;
 bool motionReferenceReady = false;
 bool motionReferenceCapturePending = false;
 bool motionDisplayValid = false;
@@ -294,11 +262,11 @@ bool motionFilterReady = false;
 bool haveLastAccelSample = false;
 bool watchfaceBuilt = false;
 bool motionBuilt = false;
-bool weatherBuilt = false;
 bool sdMounted = false;
 bool touchTapTracking = false;
 bool powerButtonHoldActive = false;
 bool powerButtonShutdownTriggered = false;
+bool weatherDebugOverrideEnabled = false;
 uint8_t sdCardType = CARD_NONE;
 uint64_t sdCardSizeMb = 0;
 
@@ -308,6 +276,8 @@ MotionViewMode renderedMotionViewMode = MotionViewMode::Count;
 MotionState motionState;
 MotionState motionDisplayState;
 WeatherState weatherState;
+WeatherUi weatherUi;
+WeatherSceneType weatherDebugScene = WeatherSceneType::Clear;
 Vec3 motionReferenceDown = {0.0f, 0.0f, 1.0f};
 Vec3 motionReferenceAxisA = {1.0f, 0.0f, 0.0f};
 Vec3 motionReferenceAxisB = {0.0f, 1.0f, 0.0f};
@@ -337,8 +307,10 @@ uint32_t lastWeatherAnimAtMs = 0;
 uint32_t lastImuSampleAtMs = 0;
 uint32_t wifiConnectStartedMs = 0;
 uint32_t nextWifiRetryAtMs = 0;
+uint32_t lastWifiServiceAtMs = 0;
 uint32_t nextWeatherRefreshAtMs = 0;
 uint32_t lastActivityAtMs = 0;
+uint32_t otaOverlayHideAtMs = 0;
 time_t lastRtcWriteEpoch = 0;
 uint32_t touchTapStartedAtMs = 0;
 
@@ -374,6 +346,152 @@ void saveUiState()
 {
   preferences.putUChar(kPrefScreenKey, static_cast<uint8_t>(currentScreenIndex));
   preferences.putUChar(kPrefMotionViewKey, static_cast<uint8_t>(motionViewMode));
+}
+
+void setWeatherUnavailableState(const char *updatedLabel)
+{
+  weatherState.hasData = false;
+  weatherState.stale = true;
+  weatherState.isDay = true;
+  weatherState.weatherCode = -1;
+  weatherState.temperatureF = 0;
+  weatherState.feelsLikeF = 0;
+  weatherState.highF = 0;
+  weatherState.lowF = 0;
+  weatherState.windMph = 0;
+  weatherState.precipitationPercent = 0;
+  weatherState.cloudCoverPercent = 0;
+  weatherState.condition = "Weather unavailable";
+  weatherState.updated = updatedLabel;
+  weatherState.sunrise = "--:--";
+  weatherState.sunset = "--:--";
+  weatherState.location = WEATHER_LOCATION_LABEL;
+  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
+    weatherState.hourly[i] = {};
+  }
+  for (size_t i = 0; i < kDailyForecastCount; ++i) {
+    weatherState.daily[i] = {};
+  }
+}
+
+void saveWeatherCache()
+{
+  if (!weatherState.hasData) {
+    return;
+  }
+
+  DynamicJsonDocument doc(8192);
+  doc["hasData"] = weatherState.hasData;
+  doc["stale"] = weatherState.stale;
+  doc["isDay"] = weatherState.isDay;
+  doc["weatherCode"] = weatherState.weatherCode;
+  doc["temperatureF"] = weatherState.temperatureF;
+  doc["feelsLikeF"] = weatherState.feelsLikeF;
+  doc["highF"] = weatherState.highF;
+  doc["lowF"] = weatherState.lowF;
+  doc["windMph"] = weatherState.windMph;
+  doc["precipitationPercent"] = weatherState.precipitationPercent;
+  doc["cloudCoverPercent"] = weatherState.cloudCoverPercent;
+  doc["condition"] = weatherState.condition;
+  doc["updated"] = weatherState.updated;
+  doc["sunrise"] = weatherState.sunrise;
+  doc["sunset"] = weatherState.sunset;
+  doc["location"] = weatherState.location;
+
+  JsonArray hourly = doc.createNestedArray("hourly");
+  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
+    JsonObject item = hourly.createNestedObject();
+    item["valid"] = weatherState.hourly[i].valid;
+    item["hour"] = weatherState.hourly[i].hour;
+    item["temperatureF"] = weatherState.hourly[i].temperatureF;
+    item["precipitationPercent"] = weatherState.hourly[i].precipitationPercent;
+    item["weatherCode"] = weatherState.hourly[i].weatherCode;
+    item["isDay"] = weatherState.hourly[i].isDay;
+  }
+
+  JsonArray daily = doc.createNestedArray("daily");
+  for (size_t i = 0; i < kDailyForecastCount; ++i) {
+    JsonObject item = daily.createNestedObject();
+    item["valid"] = weatherState.daily[i].valid;
+    item["day"] = weatherState.daily[i].day;
+    item["highF"] = weatherState.daily[i].highF;
+    item["lowF"] = weatherState.daily[i].lowF;
+    item["precipitationPercent"] = weatherState.daily[i].precipitationPercent;
+    item["weatherCode"] = weatherState.daily[i].weatherCode;
+  }
+
+  String serialized;
+  serializeJson(doc, serialized);
+  preferences.putString(kPrefWeatherCacheKey, serialized);
+}
+
+bool restoreWeatherCache()
+{
+  String serialized = preferences.getString(kPrefWeatherCacheKey, "");
+  if (serialized.isEmpty()) {
+    return false;
+  }
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError error = deserializeJson(doc, serialized);
+  if (error) {
+    Serial.printf("Weather cache parse failed: %s\n", error.c_str());
+    return false;
+  }
+
+  weatherState.hasData = doc["hasData"] | false;
+  if (!weatherState.hasData) {
+    return false;
+  }
+
+  weatherState.stale = true;
+  weatherState.isDay = doc["isDay"] | true;
+  weatherState.weatherCode = doc["weatherCode"] | -1;
+  weatherState.temperatureF = doc["temperatureF"] | 0;
+  weatherState.feelsLikeF = doc["feelsLikeF"] | 0;
+  weatherState.highF = doc["highF"] | 0;
+  weatherState.lowF = doc["lowF"] | 0;
+  weatherState.windMph = doc["windMph"] | 0;
+  weatherState.precipitationPercent = doc["precipitationPercent"] | 0;
+  weatherState.cloudCoverPercent = doc["cloudCoverPercent"] | 0;
+  weatherState.condition = String(static_cast<const char *>(doc["condition"] | "Weather unavailable"));
+  weatherState.updated = "Offline - cached weather";
+  weatherState.sunrise = String(static_cast<const char *>(doc["sunrise"] | "--:--"));
+  weatherState.sunset = String(static_cast<const char *>(doc["sunset"] | "--:--"));
+  weatherState.location = String(static_cast<const char *>(doc["location"] | WEATHER_LOCATION_LABEL));
+
+  JsonArray hourly = doc["hourly"].as<JsonArray>();
+  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
+    weatherState.hourly[i] = {};
+    if (hourly.isNull() || i >= hourly.size()) {
+      continue;
+    }
+    JsonObject item = hourly[i].as<JsonObject>();
+    weatherState.hourly[i].valid = item["valid"] | false;
+    weatherState.hourly[i].hour = String(static_cast<const char *>(item["hour"] | "--"));
+    weatherState.hourly[i].temperatureF = item["temperatureF"] | 0;
+    weatherState.hourly[i].precipitationPercent = item["precipitationPercent"] | 0;
+    weatherState.hourly[i].weatherCode = item["weatherCode"] | -1;
+    weatherState.hourly[i].isDay = item["isDay"] | true;
+  }
+
+  JsonArray daily = doc["daily"].as<JsonArray>();
+  for (size_t i = 0; i < kDailyForecastCount; ++i) {
+    weatherState.daily[i] = {};
+    if (daily.isNull() || i >= daily.size()) {
+      continue;
+    }
+    JsonObject item = daily[i].as<JsonObject>();
+    weatherState.daily[i].valid = item["valid"] | false;
+    weatherState.daily[i].day = String(static_cast<const char *>(item["day"] | "---"));
+    weatherState.daily[i].highF = item["highF"] | 0;
+    weatherState.daily[i].lowF = item["lowF"] | 0;
+    weatherState.daily[i].precipitationPercent = item["precipitationPercent"] | 0;
+    weatherState.daily[i].weatherCode = item["weatherCode"] | -1;
+  }
+
+  Serial.println("Restored cached weather state");
+  return true;
 }
 
 void advanceMotionView()
@@ -418,11 +536,6 @@ void handleScreenTap()
     noteActivity();
     return;
   }
-
-  if (currentScreen == ScreenId::Weather) {
-    weatherForceRefreshRequested = true;
-    noteActivity();
-  }
 }
 
 void handleMotionSwipe(int deltaY)
@@ -435,6 +548,65 @@ void handleMotionSwipe(int deltaY)
 
   if (deltaY >= kMotionSwipeMinDistancePx) {
     reverseMotionView();
+    noteActivity();
+  }
+}
+
+bool isWeatherStackScreen(ScreenId screen)
+{
+  return screen == ScreenId::Weather;
+}
+
+void handleWeatherStackSwipe(int deltaY)
+{
+  if (deltaY <= -kWeatherNavSwipeMinDistancePx) {
+    showNextScreen();
+    noteActivity();
+    return;
+  }
+
+  if (deltaY >= kWeatherNavSwipeMinDistancePx) {
+    showPreviousScreen();
+    noteActivity();
+  }
+}
+
+void handleScreenNavigationSwipe(int deltaX)
+{
+  if (deltaX <= -kScreenNavSwipeMinDistancePx) {
+    showNextScreen();
+    noteActivity();
+    return;
+  }
+
+  if (deltaX >= kScreenNavSwipeMinDistancePx) {
+    showPreviousScreen();
+    noteActivity();
+  }
+}
+
+WeatherSceneType cycleWeatherScene(WeatherSceneType scene, int direction)
+{
+  int value = static_cast<int>(scene);
+  value = (value + direction + static_cast<int>(WeatherSceneType::Fog) + 1) %
+          (static_cast<int>(WeatherSceneType::Fog) + 1);
+  return static_cast<WeatherSceneType>(value);
+}
+
+void handleWeatherSwipe(int deltaX)
+{
+  if (deltaX <= -kWeatherSwipeMinDistancePx) {
+    weatherDebugOverrideEnabled = true;
+    weatherDebugScene = cycleWeatherScene(weatherDebugScene, 1);
+    refreshWeatherScreen();
+    noteActivity();
+    return;
+  }
+
+  if (deltaX >= kWeatherSwipeMinDistancePx) {
+    weatherDebugOverrideEnabled = true;
+    weatherDebugScene = cycleWeatherScene(weatherDebugScene, -1);
+    refreshWeatherScreen();
     noteActivity();
   }
 }
@@ -499,6 +671,36 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         touchGestureConsumed = true;
         touchTapTracking = false;
       }
+    } else if (pressedNow && !touchGestureConsumed &&
+               isWeatherStackScreen(static_cast<ScreenId>(currentScreenIndex))) {
+      int deltaX = touchLastX - touchTapStartX;
+      int deltaY = touchLastY - touchTapStartY;
+      int absDx = abs(deltaX);
+      int absDy = abs(deltaY);
+      if (absDy >= kWeatherNavSwipeMinDistancePx &&
+          absDy >= (absDx + kWeatherNavSwipeMinDominancePx)) {
+        handleWeatherStackSwipe(deltaY);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Weather &&
+                 absDx >= kWeatherSwipeMinDistancePx &&
+                 absDx >= (absDy + 10)) {
+        handleWeatherSwipe(deltaX);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      }
+    } else if (pressedNow && !touchGestureConsumed &&
+               static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watchface) {
+      int deltaX = touchLastX - touchTapStartX;
+      int deltaY = touchLastY - touchTapStartY;
+      int absDx = abs(deltaX);
+      int absDy = abs(deltaY);
+      if (absDx >= kScreenNavSwipeMinDistancePx &&
+          absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+        handleScreenNavigationSwipe(deltaX);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      }
     } else if (!pressedNow && wasPressed) {
       int deltaX = touchLastX - touchTapStartX;
       int deltaY = touchLastY - touchTapStartY;
@@ -515,6 +717,18 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
                  absDy >= kMotionSwipeMinDistancePx &&
                  absDy >= (absDx + kMotionSwipeMinDominancePx)) {
         handleMotionSwipe(deltaY);
+      } else if (isWeatherStackScreen(static_cast<ScreenId>(currentScreenIndex)) &&
+                 absDy >= kWeatherNavSwipeMinDistancePx &&
+                 absDy >= (absDx + kWeatherNavSwipeMinDominancePx)) {
+        handleWeatherStackSwipe(deltaY);
+      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Weather &&
+                 absDx >= kWeatherSwipeMinDistancePx &&
+                 absDx >= (absDy + 10)) {
+        handleWeatherSwipe(deltaX);
+      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watchface &&
+                 absDx >= kScreenNavSwipeMinDistancePx &&
+                 absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+        handleScreenNavigationSwipe(deltaX);
       }
       touchTapTracking = false;
     } else if (pressedNow && touchTapTracking) {
@@ -659,6 +873,7 @@ bool rtcTimeLooksValid(const struct tm &timeInfo)
 bool setSystemTimeFromTm(const struct tm &timeInfo)
 {
   struct tm localTime = timeInfo;
+  localTime.tm_isdst = -1;
   time_t epoch = mktime(&localTime);
   if (epoch < kMinValidEpoch) {
     return false;
@@ -862,127 +1077,16 @@ bool networkIsOnline()
   return connectivityState == ConnectivityState::Online && WiFi.status() == WL_CONNECTED;
 }
 
-String weatherTimeFragment(const char *isoText)
-{
-  if (isoText == nullptr || isoText[0] == '\0') {
-    return "--:--";
-  }
-
-  const char *timeFragment = strrchr(isoText, 'T');
-  if (timeFragment == nullptr) {
-    return String(isoText);
-  }
-
-  ++timeFragment;
-  char buffer[6] = {'-', '-', ':', '-', '-', '\0'};
-  strncpy(buffer, timeFragment, 5);
-  buffer[5] = '\0';
-  return String(buffer);
-}
-
-WeatherSceneType weatherSceneTypeForCode(int weatherCode)
-{
-  switch (weatherCode) {
-    case 0:
-      return WeatherSceneType::Clear;
-    case 1:
-    case 2:
-      return WeatherSceneType::PartlyCloudy;
-    case 3:
-      return WeatherSceneType::Cloudy;
-    case 45:
-    case 48:
-      return WeatherSceneType::Fog;
-    case 51:
-    case 53:
-    case 55:
-    case 56:
-    case 57:
-    case 61:
-    case 63:
-    case 65:
-    case 66:
-    case 67:
-    case 80:
-    case 81:
-    case 82:
-      return WeatherSceneType::Rain;
-    case 71:
-    case 73:
-    case 75:
-    case 77:
-    case 85:
-    case 86:
-      return WeatherSceneType::Snow;
-    case 95:
-    case 96:
-    case 99:
-      return WeatherSceneType::Storm;
-    default:
-      return WeatherSceneType::Cloudy;
-  }
-}
-
-String weatherConditionFromCode(int weatherCode, bool isDay)
-{
-  switch (weatherCode) {
-    case 0:
-      return isDay ? "Clear sky" : "Clear night";
-    case 1:
-      return isDay ? "Mostly sunny" : "Mostly clear";
-    case 2:
-      return "Partly cloudy";
-    case 3:
-      return "Overcast";
-    case 45:
-    case 48:
-      return "Fog";
-    case 51:
-    case 53:
-    case 55:
-      return "Drizzle";
-    case 56:
-    case 57:
-      return "Freezing drizzle";
-    case 61:
-    case 63:
-    case 65:
-      return "Rain";
-    case 66:
-    case 67:
-      return "Freezing rain";
-    case 71:
-    case 73:
-    case 75:
-      return "Snow";
-    case 77:
-      return "Snow grains";
-    case 80:
-    case 81:
-    case 82:
-      return "Rain showers";
-    case 85:
-    case 86:
-      return "Snow showers";
-    case 95:
-      return "Thunderstorm";
-    case 96:
-    case 99:
-      return "Thunder + hail";
-    default:
-      return "Weather";
-  }
-}
-
 String weatherApiUrl()
 {
-  char url[512];
+  char url[768];
   snprintf(url,
            sizeof(url),
            "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
            "&current=temperature_2m,apparent_temperature,is_day,weather_code,wind_speed_10m,cloud_cover"
-           "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max"
-           "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto&forecast_days=1",
+           "&hourly=time,temperature_2m,precipitation_probability,weather_code,is_day"
+           "&daily=time,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max,weather_code"
+           "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto&forecast_days=10&forecast_hours=24",
            WEATHER_LATITUDE,
            WEATHER_LONGITUDE);
   return String(url);
@@ -1016,6 +1120,8 @@ void setOfflineMode(const char *reason)
   if (weatherState.hasData) {
     weatherState.stale = true;
     weatherState.updated = "Offline - cached weather";
+  } else {
+    setWeatherUnavailableState("Offline - no cached weather");
   }
 
   Serial.printf("Offline mode: %s\n", reason);
@@ -1030,7 +1136,12 @@ void beginWifiAttempt(size_t credentialIndex)
   connectivityState = ConnectivityState::Connecting;
   wifiConnectStartedMs = millis();
 
-  WiFi.disconnect();
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.disconnect(true, true);
+  delay(40);
+  WiFi.mode(WIFI_OFF);
+  delay(40);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setHostname(OTA_HOSTNAME);
@@ -1166,6 +1277,12 @@ void updateOtaOverlay(const String &status, const String &footer, int percent)
   }
 }
 
+void scheduleOtaOverlayHide(uint32_t delayMs)
+{
+  otaOverlaySticky = true;
+  otaOverlayHideAtMs = millis() + delayMs;
+}
+
 void hideOtaOverlay()
 {
   if (!otaOverlay) {
@@ -1173,6 +1290,8 @@ void hideOtaOverlay()
   }
 
   lv_obj_add_flag(otaOverlay, LV_OBJ_FLAG_HIDDEN);
+  otaOverlaySticky = false;
+  otaOverlayHideAtMs = 0;
 }
 
 void startOta()
@@ -1190,6 +1309,8 @@ void startOta()
       .onStart([]() {
         Serial.println("OTA start");
         otaInProgress = true;
+        otaOverlaySticky = false;
+        otaOverlayHideAtMs = 0;
         updateOtaOverlay("Receiving firmware", "do not power off", 0);
       })
       .onEnd([]() {
@@ -1224,6 +1345,7 @@ void startOta()
             break;
         }
         updateOtaOverlay(status, "returning to app", 0);
+        scheduleOtaOverlayHide(1600);
       });
 
   ArduinoOTA.begin();
@@ -1304,16 +1426,26 @@ bool fetchWeather()
   if (http.begin(secureClient, weatherApiUrl())) {
     int statusCode = http.GET();
     if (statusCode == HTTP_CODE_OK) {
-      DynamicJsonDocument doc(8192);
+      DynamicJsonDocument doc(24576);
       DeserializationError error = deserializeJson(doc, http.getString());
       if (!error) {
         JsonObject current = doc["current"];
+        JsonObject hourly = doc["hourly"];
         JsonObject daily = doc["daily"];
+
+        JsonArray hourlyTimes = hourly["time"].as<JsonArray>();
+        JsonArray hourlyTemps = hourly["temperature_2m"].as<JsonArray>();
+        JsonArray hourlyPrecip = hourly["precipitation_probability"].as<JsonArray>();
+        JsonArray hourlyCodes = hourly["weather_code"].as<JsonArray>();
+        JsonArray hourlyIsDay = hourly["is_day"].as<JsonArray>();
+
+        JsonArray dayArray = daily["time"].as<JsonArray>();
         JsonArray highArray = daily["temperature_2m_max"].as<JsonArray>();
         JsonArray lowArray = daily["temperature_2m_min"].as<JsonArray>();
         JsonArray sunriseArray = daily["sunrise"].as<JsonArray>();
         JsonArray sunsetArray = daily["sunset"].as<JsonArray>();
         JsonArray precipitationArray = daily["precipitation_probability_max"].as<JsonArray>();
+        JsonArray dailyCodes = daily["weather_code"].as<JsonArray>();
 
         float temperature = current["temperature_2m"].as<float>();
         float feelsLike = current["apparent_temperature"].as<float>();
@@ -1339,7 +1471,43 @@ bool fetchWeather()
             !sunriseArray.isNull() && sunriseArray.size() > 0 ? weatherTimeFragment(sunriseArray[0].as<const char *>()) : "--:--";
         weatherState.sunset =
             !sunsetArray.isNull() && sunsetArray.size() > 0 ? weatherTimeFragment(sunsetArray[0].as<const char *>()) : "--:--";
+        weatherState.location = WEATHER_LOCATION_LABEL;
 
+        for (size_t i = 0; i < kHourlyForecastCount; ++i) {
+          weatherState.hourly[i] = {};
+          if (hourlyTimes.isNull() || hourlyTemps.isNull() || i >= hourlyTimes.size() || i >= hourlyTemps.size()) {
+            continue;
+          }
+
+          weatherState.hourly[i].valid = true;
+          weatherState.hourly[i].hour = weatherHourFragment(hourlyTimes[i].as<const char *>());
+          weatherState.hourly[i].temperatureF = static_cast<int>(roundf(hourlyTemps[i].as<float>()));
+          weatherState.hourly[i].precipitationPercent =
+              !hourlyPrecip.isNull() && i < hourlyPrecip.size() ? hourlyPrecip[i].as<int>() : 0;
+          weatherState.hourly[i].weatherCode =
+              !hourlyCodes.isNull() && i < hourlyCodes.size() ? (hourlyCodes[i] | -1) : -1;
+          weatherState.hourly[i].isDay =
+              !hourlyIsDay.isNull() && i < hourlyIsDay.size() ? ((hourlyIsDay[i] | 1) == 1) : true;
+        }
+
+        for (size_t i = 0; i < kDailyForecastCount; ++i) {
+          weatherState.daily[i] = {};
+          if (dayArray.isNull() || highArray.isNull() || lowArray.isNull() ||
+              i >= dayArray.size() || i >= highArray.size() || i >= lowArray.size()) {
+            continue;
+          }
+
+          weatherState.daily[i].valid = true;
+          weatherState.daily[i].day = weatherDayFragment(dayArray[i].as<const char *>());
+          weatherState.daily[i].highF = static_cast<int>(roundf(highArray[i].as<float>()));
+          weatherState.daily[i].lowF = static_cast<int>(roundf(lowArray[i].as<float>()));
+          weatherState.daily[i].precipitationPercent =
+              !precipitationArray.isNull() && i < precipitationArray.size() ? precipitationArray[i].as<int>() : 0;
+          weatherState.daily[i].weatherCode =
+              !dailyCodes.isNull() && i < dailyCodes.size() ? (dailyCodes[i] | -1) : -1;
+        }
+
+        saveWeatherCache();
         nextWeatherRefreshAtMs = millis() + kWeatherRefreshIntervalMs;
         success = true;
       } else {
@@ -1358,12 +1526,7 @@ bool fetchWeather()
       weatherState.stale = true;
       weatherState.updated = "Offline - cached weather";
     } else {
-      weatherState.hasData = false;
-      weatherState.stale = true;
-      weatherState.condition = "Weather unavailable";
-      weatherState.updated = networkIsOnline() ? "Retrying shortly" : "Waiting for Wi-Fi";
-      weatherState.sunrise = "--:--";
-      weatherState.sunset = "--:--";
+      setWeatherUnavailableState(networkIsOnline() ? "Retrying shortly" : "Waiting for Wi-Fi");
     }
     nextWeatherRefreshAtMs = millis() + kWeatherRetryIntervalMs;
   }
@@ -1382,13 +1545,7 @@ void updateWeather()
     return;
   }
 
-  if (weatherFetchInProgress || otaInProgress || inLightSleep) {
-    return;
-  }
-
-  if (weatherForceRefreshRequested) {
-    weatherForceRefreshRequested = false;
-    fetchWeather();
+  if (!kWeatherFetchEnabled || weatherFetchInProgress || otaInProgress || inLightSleep) {
     return;
   }
 
@@ -1746,6 +1903,11 @@ void restoreFromLightSleep()
     nextWifiRetryAtMs = millis();
   }
 
+  if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Weather) {
+    weatherDebugOverrideEnabled = false;
+    refreshWeatherScreen();
+  }
+
   lv_obj_invalidate(lv_screen_active());
 }
 
@@ -1924,6 +2086,12 @@ void showScreen(size_t index)
     renderedMotionTransitionDirection = 0;
     captureMotionReference();
     centerMotionDot();
+  } else if (static_cast<ScreenId>(index) == ScreenId::Weather) {
+    weatherDebugOverrideEnabled = false;
+    if (kWeatherFetchEnabled && networkIsOnline() && !weatherFetchInProgress && !otaInProgress && !inLightSleep) {
+      fetchWeather();
+    }
+    refreshWeatherScreen();
   }
 }
 
@@ -2042,25 +2210,13 @@ void buildWatchfaceScreen()
   lv_obj_set_style_pad_all(watchBatteryFill, 0, 0);
   lv_obj_align(watchBatteryFill, LV_ALIGN_LEFT_MID, 0, 0);
 
-  watchTimeRow = lv_obj_create(screen);
-  applyRootStyle(watchTimeRow);
-  lv_obj_set_size(watchTimeRow, LCD_WIDTH - 4, kClockGlyphHeight);
-  lv_obj_set_layout(watchTimeRow, LV_LAYOUT_FLEX);
-  lv_obj_set_flex_flow(watchTimeRow, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(watchTimeRow, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_column(watchTimeRow, 0, 0);
-  lv_obj_align(watchTimeRow, LV_ALIGN_TOP_MID, 0, kWatchTimeY);
-
-  for (size_t i = 0; i < 5; ++i) {
-    const int glyphWidth = (i == 2) ? kClockColonWidth : kClockDigitWidth;
-    watchTimeGlyphs[i] = lv_label_create(watchTimeRow);
-    lv_obj_set_size(watchTimeGlyphs[i], glyphWidth, kClockGlyphHeight);
-    lv_obj_set_style_text_font(watchTimeGlyphs[i], &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(watchTimeGlyphs[i], lvColor(255, 255, 255), 0);
-    lv_obj_set_style_text_align(watchTimeGlyphs[i], LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_transform_zoom(watchTimeGlyphs[i], kClockZoom, 0);
-    lv_label_set_text(watchTimeGlyphs[i], (i == 2) ? ":" : "-");
-  }
+  watchTimeLabel = lv_label_create(screen);
+  lv_obj_set_width(watchTimeLabel, LCD_WIDTH - 24);
+  lv_obj_set_style_text_font(watchTimeLabel, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(watchTimeLabel, lvColor(255, 255, 255), 0);
+  lv_obj_set_style_text_align(watchTimeLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(watchTimeLabel, "--:--");
+  lv_obj_align(watchTimeLabel, LV_ALIGN_TOP_MID, 0, kWatchTimeY);
 
   watchDateLabel = lv_label_create(screen);
   lv_obj_set_width(watchDateLabel, LCD_WIDTH - 36);
@@ -2255,101 +2411,7 @@ void buildMotionScreen()
 
 void buildWeatherScreen()
 {
-  lv_obj_t *screen = lv_obj_create(nullptr);
-  applyRootStyle(screen);
-  weatherScreen = screen;
-
-  weatherHero = lv_obj_create(screen);
-  lv_obj_set_size(weatherHero, LCD_WIDTH, 224);
-  lv_obj_align(weatherHero, LV_ALIGN_TOP_MID, 0, 0);
-  lv_obj_set_style_border_width(weatherHero, 0, 0);
-  lv_obj_set_style_pad_all(weatherHero, 0, 0);
-  lv_obj_set_style_radius(weatherHero, 0, 0);
-
-  weatherSun = lv_obj_create(weatherHero);
-  lv_obj_set_size(weatherSun, 74, 74);
-  lv_obj_set_style_radius(weatherSun, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(weatherSun, lvColor(255, 196, 72), 0);
-  lv_obj_set_style_border_width(weatherSun, 0, 0);
-
-  weatherMoon = lv_obj_create(weatherHero);
-  lv_obj_set_size(weatherMoon, 66, 66);
-  lv_obj_set_style_radius(weatherMoon, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(weatherMoon, lvColor(210, 220, 255), 0);
-  lv_obj_set_style_border_width(weatherMoon, 0, 0);
-
-  weatherClouds[0] = createCloud(weatherHero, 126, 44);
-  weatherClouds[1] = createCloud(weatherHero, 106, 38);
-  weatherClouds[2] = createCloud(weatherHero, 144, 48);
-
-  for (size_t i = 0; i < kWeatherParticleCount; ++i) {
-    weatherParticles[i] = lv_obj_create(weatherHero);
-    lv_obj_set_size(weatherParticles[i], 4, 18);
-    lv_obj_set_style_radius(weatherParticles[i], LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(weatherParticles[i], 0, 0);
-    lv_obj_set_style_bg_color(weatherParticles[i], lvColor(144, 194, 255), 0);
-  }
-
-  weatherBolt = lv_label_create(weatherHero);
-  lv_obj_set_style_text_font(weatherBolt, &lv_font_montserrat_48, 0);
-  lv_label_set_text(weatherBolt, LV_SYMBOL_CHARGE);
-  lv_obj_set_style_text_color(weatherBolt, lvColor(255, 220, 84), 0);
-
-  for (int i = 0; i < 3; ++i) {
-    weatherFogBars[i] = lv_obj_create(weatherHero);
-    lv_obj_set_size(weatherFogBars[i], 220, 8);
-    lv_obj_set_style_radius(weatherFogBars[i], LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(weatherFogBars[i], lvColor(214, 222, 232), 0);
-    lv_obj_set_style_bg_opa(weatherFogBars[i], LV_OPA_70, 0);
-    lv_obj_set_style_border_width(weatherFogBars[i], 0, 0);
-  }
-
-  weatherTempLabel = lv_label_create(screen);
-  lv_obj_set_style_text_font(weatherTempLabel, &lv_font_montserrat_48, 0);
-  lv_label_set_text(weatherTempLabel, "--");
-  lv_obj_align(weatherTempLabel, LV_ALIGN_TOP_LEFT, 24, 248);
-
-  weatherConditionLabel = lv_label_create(screen);
-  lv_obj_set_width(weatherConditionLabel, LCD_WIDTH - 48);
-  lv_obj_set_style_text_font(weatherConditionLabel, &lv_font_montserrat_20, 0);
-  lv_label_set_long_mode(weatherConditionLabel, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(weatherConditionLabel, "Waiting for weather");
-  lv_obj_align_to(weatherConditionLabel, weatherTempLabel, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
-
-  weatherPrimaryLabel = lv_label_create(screen);
-  lv_obj_set_width(weatherPrimaryLabel, LCD_WIDTH - 48);
-  lv_obj_set_style_text_font(weatherPrimaryLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(weatherPrimaryLabel, lvColor(208, 214, 226), 0);
-  lv_label_set_long_mode(weatherPrimaryLabel, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(weatherPrimaryLabel, "");
-  lv_obj_align_to(weatherPrimaryLabel, weatherConditionLabel, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 14);
-
-  weatherSecondaryLabel = lv_label_create(screen);
-  lv_obj_set_width(weatherSecondaryLabel, LCD_WIDTH - 48);
-  lv_obj_set_style_text_font(weatherSecondaryLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(weatherSecondaryLabel, lvColor(168, 178, 192), 0);
-  lv_label_set_long_mode(weatherSecondaryLabel, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(weatherSecondaryLabel, "");
-  lv_obj_align_to(weatherSecondaryLabel, weatherPrimaryLabel, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
-
-  weatherUpdatedValueLabel = lv_label_create(screen);
-  lv_obj_set_width(weatherUpdatedValueLabel, LCD_WIDTH - 48);
-  lv_obj_set_style_text_font(weatherUpdatedValueLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(weatherUpdatedValueLabel, lvColor(116, 126, 140), 0);
-  lv_label_set_long_mode(weatherUpdatedValueLabel, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(weatherUpdatedValueLabel, "Waiting for Wi-Fi");
-  lv_obj_align(weatherUpdatedValueLabel, LV_ALIGN_BOTTOM_LEFT, 24, -42);
-
-  weatherHintLabel = lv_label_create(screen);
-  lv_obj_set_width(weatherHintLabel, LCD_WIDTH - 48);
-  lv_obj_set_style_text_font(weatherHintLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(weatherHintLabel, lvColor(88, 104, 124), 0);
-  lv_obj_set_style_text_align(weatherHintLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(weatherHintLabel, "Tap to refresh");
-  lv_obj_align(weatherHintLabel, LV_ALIGN_BOTTOM_MID, 0, -14);
-
-  screenRoots[static_cast<size_t>(ScreenId::Weather)] = screen;
-  weatherBuilt = true;
+  screenRoots[static_cast<size_t>(ScreenId::Weather)] = buildCurrentWeatherScreen(weatherUi);
 }
 
 void buildOtaOverlay()
@@ -2481,14 +2543,7 @@ void refreshWatchface()
     return;
   }
 
-  String renderedTime = timeText();
-  if (renderedTime.length() != 5) {
-    renderedTime = "--:--";
-  }
-  for (size_t i = 0; i < 5; ++i) {
-    char glyph[2] = {renderedTime[static_cast<int>(i)], '\0'};
-    lv_label_set_text(watchTimeGlyphs[i], glyph);
-  }
+  lv_label_set_text(watchTimeLabel, timeText().c_str());
   lv_label_set_text(watchDateLabel, dateText().c_str());
   lv_label_set_text(watchTimezoneLabel, timezoneText().c_str());
 
@@ -2745,150 +2800,15 @@ void refreshMotionScreen()
   }
 }
 
-void updateWeatherHero()
-{
-  if (!weatherBuilt) {
-    return;
-  }
-
-  uint32_t tick = millis() / 90;
-  WeatherSceneType scene = weatherState.hasData ? weatherSceneTypeForCode(weatherState.weatherCode) : WeatherSceneType::Cloudy;
-
-  lv_color_t topColor = lvColor(24, 34, 52);
-  lv_color_t bottomColor = lvColor(6, 10, 18);
-  switch (scene) {
-    case WeatherSceneType::Clear:
-      topColor = weatherState.isDay ? lvColor(60, 110, 210) : lvColor(16, 26, 64);
-      bottomColor = weatherState.isDay ? lvColor(148, 194, 255) : lvColor(6, 10, 24);
-      break;
-    case WeatherSceneType::PartlyCloudy:
-      topColor = lvColor(58, 82, 140);
-      bottomColor = lvColor(110, 150, 220);
-      break;
-    case WeatherSceneType::Cloudy:
-      topColor = lvColor(42, 50, 62);
-      bottomColor = lvColor(76, 88, 108);
-      break;
-    case WeatherSceneType::Rain:
-      topColor = lvColor(26, 34, 48);
-      bottomColor = lvColor(48, 66, 94);
-      break;
-    case WeatherSceneType::Snow:
-      topColor = lvColor(82, 110, 156);
-      bottomColor = lvColor(192, 214, 244);
-      break;
-    case WeatherSceneType::Storm:
-      topColor = lvColor(20, 24, 34);
-      bottomColor = lvColor(58, 70, 92);
-      break;
-    case WeatherSceneType::Fog:
-      topColor = lvColor(72, 82, 96);
-      bottomColor = lvColor(144, 154, 166);
-      break;
-  }
-
-  lv_obj_set_style_bg_color(weatherHero, topColor, 0);
-  lv_obj_set_style_bg_grad_color(weatherHero, bottomColor, 0);
-  lv_obj_set_style_bg_grad_dir(weatherHero, LV_GRAD_DIR_VER, 0);
-
-  lv_obj_add_flag(weatherSun, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(weatherMoon, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(weatherBolt, LV_OBJ_FLAG_HIDDEN);
-  for (auto *cloud : weatherClouds) {
-    lv_obj_add_flag(cloud, LV_OBJ_FLAG_HIDDEN);
-  }
-  for (auto *particle : weatherParticles) {
-    lv_obj_add_flag(particle, LV_OBJ_FLAG_HIDDEN);
-  }
-  for (auto *bar : weatherFogBars) {
-    lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN);
-  }
-
-  if (scene == WeatherSceneType::Clear || scene == WeatherSceneType::PartlyCloudy) {
-    lv_obj_t *celestial = weatherState.isDay ? weatherSun : weatherMoon;
-    lv_obj_clear_flag(celestial, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(celestial, 34 + static_cast<int>((tick % 18) / 3), 28 + static_cast<int>((tick / 2) % 10));
-  }
-
-  if (scene == WeatherSceneType::PartlyCloudy || scene == WeatherSceneType::Cloudy ||
-      scene == WeatherSceneType::Rain || scene == WeatherSceneType::Snow ||
-      scene == WeatherSceneType::Storm || scene == WeatherSceneType::Fog) {
-    lv_obj_clear_flag(weatherClouds[0], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(weatherClouds[1], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(weatherClouds[2], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(weatherClouds[0], 168 + static_cast<int>((tick % 12) - 6), 52);
-    lv_obj_set_pos(weatherClouds[1], 64 + static_cast<int>((tick % 16) - 8), 96);
-    lv_obj_set_pos(weatherClouds[2], 188 + static_cast<int>((tick % 10) - 5), 112);
-  }
-
-  if (scene == WeatherSceneType::Rain || scene == WeatherSceneType::Storm) {
-    for (size_t i = 0; i < kWeatherParticleCount; ++i) {
-      lv_obj_clear_flag(weatherParticles[i], LV_OBJ_FLAG_HIDDEN);
-      lv_obj_set_style_bg_color(weatherParticles[i], lvColor(144, 194, 255), 0);
-      lv_obj_set_size(weatherParticles[i], 4, 18);
-      int x = 42 + static_cast<int>(i * 36);
-      int y = 86 + static_cast<int>((tick * 12 + i * 23) % 110);
-      lv_obj_set_pos(weatherParticles[i], x, y);
-    }
-  }
-
-  if (scene == WeatherSceneType::Snow) {
-    for (size_t i = 0; i < kWeatherParticleCount; ++i) {
-      lv_obj_clear_flag(weatherParticles[i], LV_OBJ_FLAG_HIDDEN);
-      lv_obj_set_style_bg_color(weatherParticles[i], lvColor(248, 250, 255), 0);
-      lv_obj_set_size(weatherParticles[i], 8, 8);
-      lv_obj_set_style_radius(weatherParticles[i], LV_RADIUS_CIRCLE, 0);
-      int x = 30 + static_cast<int>((i * 38 + tick * 5) % 280);
-      int y = 74 + static_cast<int>((tick * 8 + i * 17) % 120);
-      lv_obj_set_pos(weatherParticles[i], x, y);
-    }
-  }
-
-  if (scene == WeatherSceneType::Storm) {
-    lv_obj_clear_flag(weatherBolt, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(weatherBolt, 244, 74 + static_cast<int>((tick % 4) * 2));
-  }
-
-  if (scene == WeatherSceneType::Fog) {
-    for (int i = 0; i < 3; ++i) {
-      lv_obj_clear_flag(weatherFogBars[i], LV_OBJ_FLAG_HIDDEN);
-      lv_obj_set_pos(weatherFogBars[i], 48 + static_cast<int>((tick % 10) - 5), 82 + (i * 34));
-    }
-  }
-}
-
 void refreshWeatherScreen()
 {
-  if (!weatherBuilt) {
-    return;
-  }
-
-  if (weatherState.hasData) {
-    String temp = String(weatherState.temperatureF) + "\xC2\xB0";
-    lv_label_set_text(weatherTempLabel, temp.c_str());
-    lv_label_set_text(weatherConditionLabel, weatherState.condition.c_str());
-
-    String primary = "High " + String(weatherState.highF) +
-                     "  Low " + String(weatherState.lowF) +
-                     "  Feels " + String(weatherState.feelsLikeF);
-    String secondary = "Wind " + String(weatherState.windMph) +
-                       " mph  Rain " + String(weatherState.precipitationPercent) +
-                       "%  " + (weatherState.isDay ? "Sunset " : "Sunrise ") +
-                       (weatherState.isDay ? weatherState.sunset : weatherState.sunrise);
-    lv_label_set_text(weatherPrimaryLabel, primary.c_str());
-    lv_label_set_text(weatherSecondaryLabel, secondary.c_str());
-    lv_label_set_text(weatherUpdatedValueLabel,
-                      (weatherState.stale ? "Offline - cached forecast" : weatherState.updated).c_str());
-  } else {
-    lv_label_set_text(weatherTempLabel, "--");
-    lv_label_set_text(weatherConditionLabel, weatherState.condition.c_str());
-    lv_label_set_text(weatherPrimaryLabel, networkIsOnline() ? "Refreshing weather" : "Weather offline");
-    lv_label_set_text(weatherSecondaryLabel,
-                      networkIsOnline() ? "Generated animation stays active" : "Waiting for Wi-Fi");
-    lv_label_set_text(weatherUpdatedValueLabel, weatherState.updated.c_str());
-  }
-
+  refreshCurrentWeatherScreen(weatherUi, weatherState, networkIsOnline(), weatherDebugOverrideEnabled, weatherDebugScene);
   updateWeatherHero();
+}
+
+void updateWeatherHero()
+{
+  ::updateWeatherHero(weatherUi, weatherState, weatherDebugOverrideEnabled, weatherDebugScene, millis());
 }
 
 void setupLvgl()
@@ -2928,6 +2848,7 @@ void setup()
   Serial.begin(115200);
   delay(250);
   preferences.begin(kPreferencesNamespace, false);
+  restoreWeatherCache();
 
   setenv("TZ", TIMEZONE_POSIX, 1);
   tzset();
@@ -2943,6 +2864,12 @@ void setup()
   gfx->fillScreen(kBackgroundColor);
   gfx->displayOn();
 
+#ifdef WAVEFORM_DIAG_DISPLAY
+  gfx->fillScreen(0xFFFF);
+  Serial.println("WAVEFORM_DIAG_DISPLAY active");
+  return;
+#endif
+
   Wire.begin(IIC_SDA, IIC_SCL);
   pinMode(TP_INT, INPUT_PULLUP);
 
@@ -2951,9 +2878,13 @@ void setup()
   initRtc();
   initTouch();
   initImu();
-  initSdCard();
+  // Temporary isolation: skip SD init while debugging black-screen boot.
+  sdMounted = false;
 
   configuredNetworkCount = countConfiguredNetworks();
+  if (configuredNetworkCount == 0 && !weatherState.hasData) {
+    setWeatherUnavailableState("Offline - no Wi-Fi configured");
+  }
   nextWeatherRefreshAtMs = millis() + 1000;
   nextWifiRetryAtMs = 0;
   lastActivityAtMs = millis();
@@ -2967,11 +2898,7 @@ void setup()
 
   setupLvgl();
   buildUi();
-  uint8_t savedScreen = preferences.getUChar(kPrefScreenKey, 0);
-  if (savedScreen >= kScreenCount) {
-    savedScreen = 0;
-  }
-  showScreen(savedScreen);
+  showScreen(0);
   refreshUi();
   lastStatusRefreshAtMs = millis();
   lastMotionRefreshAtMs = millis();
@@ -2980,7 +2907,18 @@ void setup()
 
 void loop()
 {
-  updateWiFi();
+#ifdef WAVEFORM_DIAG_DISPLAY
+  delay(50);
+  return;
+#endif
+
+  uint32_t now = millis();
+  uint32_t wifiServiceIntervalMs =
+      wifiAttemptInProgress ? kWifiServiceConnectingIntervalMs : kWifiServiceIntervalMs;
+  if (now - lastWifiServiceAtMs >= wifiServiceIntervalMs) {
+    lastWifiServiceAtMs = now;
+    updateWiFi();
+  }
   updateWeather();
   updateImuState();
   updateTopButton();
@@ -2993,11 +2931,13 @@ void loop()
     ArduinoOTA.handle();
   }
 
-  uint32_t now = millis();
+  if (!otaInProgress && otaOverlaySticky && static_cast<int32_t>(millis() - otaOverlayHideAtMs) >= 0) {
+    hideOtaOverlay();
+  }
+
   if (now - lastStatusRefreshAtMs >= kStatusRefreshMs) {
     lastStatusRefreshAtMs = now;
     refreshWatchface();
-    refreshWeatherScreen();
   }
 
   if (now - lastMotionRefreshAtMs >= kMotionRefreshMs) {
