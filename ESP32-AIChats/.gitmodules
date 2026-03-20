@@ -1,0 +1,6 @@
+[submodule "doubao/doubao/esp-adf-example"]
+	path = doubao/doubao/esp-adf-example
+	url = https://github.com/espressif/esp-adf.git
+[submodule "doubao/esp-adf-example"]
+	path = doubao/esp-adf-example
+	url = https://github.com/espressif/esp-adf.git
