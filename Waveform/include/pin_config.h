@@ -17,9 +17,9 @@
 #define TP_INT 21
 #define IMU_IRQ 33
 
-#define AUDIO_MCLK 16
-#define AUDIO_BCLK 9
-#define AUDIO_DIN 10
-#define AUDIO_WS 45
-#define AUDIO_DOUT 8
-#define AUDIO_PA 46
+#define TOP_BUTTON_PIN 4
+#define PMU_IRQ_PIN 5
+
+constexpr int SDMMC_CLK = 2;
+constexpr int SDMMC_CMD = 1;
+constexpr int SDMMC_DATA = 3;

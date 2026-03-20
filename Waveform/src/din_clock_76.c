@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 76 px
  * Bpp: 4
- * Opts: --size 76 --bpp 4 --format lvgl --font /System/Library/Fonts/Supplemental/DIN Condensed Bold.ttf --symbols 0123456789:- --output /Users/matthewmorrone/Documents/Arduino/Waveshare/Waveform_LVGL/src/din_clock_76.c --lv-font-name din_clock_76
+ * Opts: --size 76 --bpp 4 --format lvgl --font /System/Library/Fonts/Supplemental/DIN Condensed Bold.ttf --symbols 0123456789:- --output /Users/matthewmorrone/Documents/Arduino/Waveshare/Waveform/src/din_clock_76.c --lv-font-name din_clock_76
  ******************************************************************************/
 
 #include "lvgl.h"
@@ -486,4 +486,3 @@ lv_font_t din_clock_76 = {
 
 
 #endif /*#if DIN_CLOCK_76*/
-
