@@ -23,3 +23,9 @@
 constexpr int SDMMC_CLK = 2;
 constexpr int SDMMC_CMD = 1;
 constexpr int SDMMC_DATA = 3;
+
+constexpr int AUDIO_I2S_MCLK = 16;
+constexpr int AUDIO_I2S_BCLK = 9;
+constexpr int AUDIO_I2S_DIN = 10;
+constexpr int AUDIO_I2S_WS = 45;
+constexpr int AUDIO_I2S_DOUT = 8;

@@ -1,17 +1,78 @@
-#include "weather_ui.h"
+#include "config/ota_config.h"
+#include "config/screen_constants.h"
+#include "core/screen_manager.h"
+#include "modules/weather_module.h"
+#include "screens/screen_callbacks.h"
+#include "screens/weather_ui.h"
 
-#include "pin_config.h"
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 #include <math.h>
 #include <time.h>
 
+void showNextScreen();
+void showPreviousScreen();
+void noteActivity();
+bool hasValidTime();
+
 namespace
 {
+const ScreenModule kModule = {
+    ScreenId::Weather,
+    "Weather",
+    waveformBuildWeatherScreen,
+    waveformRefreshWeatherScreen,
+    waveformEnterWeatherScreen,
+    waveformLeaveWeatherScreen,
+    waveformTickWeatherScreen,
+    waveformWeatherScreenRoot,
+};
+
 constexpr uint16_t kBackgroundColor = 0x0000;
+constexpr double kSynodicMonthDays = 29.530588853;
+constexpr time_t kReferenceNewMoonUnix = 947182440;
+constexpr const char *kDefaultUnavailableCondition = "Weather unavailable";
+constexpr const char *kDefaultOfflineWeatherLabel = "Offline - cached weather";
+
+WeatherModuleConfig gConfig = {};
+WeatherState gState;
+WeatherUi gUi;
+lv_obj_t *gRoot = nullptr;
+bool gFetchInProgress = false;
+bool gDebugOverrideEnabled = false;
+WeatherSceneType gDebugScene = WeatherSceneType::Clear;
+uint32_t gNextRefreshAtMs = 0;
 
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b)
 {
   return lv_color_make(r, g, b);
+}
+
+bool networkOnline()
+{
+  return gConfig.networkIsOnline && gConfig.networkIsOnline();
+}
+
+bool otaBusy()
+{
+  return gConfig.otaInProgress && gConfig.otaInProgress();
+}
+
+bool lightSleepActive()
+{
+  return gConfig.lightSleepActive && gConfig.lightSleepActive();
+}
+
+String apiUrl()
+{
+  return gConfig.apiUrl ? gConfig.apiUrl() : String();
+}
+
+String updatedLabel()
+{
+  return gConfig.updatedLabel ? gConfig.updatedLabel() : String("Updated just now");
 }
 
 void applyRootStyle(lv_obj_t *obj)
@@ -125,6 +186,57 @@ void dailyTemperatureBounds(const WeatherState &state, int &minTemp, int &maxTem
   }
   if (minTemp == maxTemp) {
     maxTemp = minTemp + 1;
+  }
+}
+
+float currentMoonPhaseFraction()
+{
+  time_t now = time(nullptr);
+  if (now < 946684800) {
+    return 0.5f;
+  }
+
+  double daysSinceReference = difftime(now, kReferenceNewMoonUnix) / 86400.0;
+  double lunation = fmod(daysSinceReference / kSynodicMonthDays, 1.0);
+  if (lunation < 0.0) {
+    lunation += 1.0;
+  }
+  return static_cast<float>(lunation);
+}
+
+void updateMoonPhaseVisual(WeatherUi &ui, lv_color_t skyColor)
+{
+  if (!ui.moon || !ui.moonShadow) {
+    return;
+  }
+
+  constexpr int moonSize = 66;
+  constexpr int moonX = 42;
+  constexpr int moonY = 32;
+  constexpr float moonRadius = moonSize * 0.5f;
+
+  float phase = currentMoonPhaseFraction();
+  float illumination = 0.5f * (1.0f - cosf(phase * 2.0f * static_cast<float>(M_PI)));
+  bool waxing = phase < 0.5f;
+
+  lv_obj_set_pos(ui.moon, moonX, moonY);
+  lv_obj_set_style_bg_color(ui.moon, lvColor(210, 220, 255), 0);
+  lv_obj_set_style_bg_opa(ui.moon, LV_OPA_COVER, 0);
+
+  float shadowOffset = illumination * moonSize;
+  int shadowX = moonX + static_cast<int>(roundf((waxing ? -1.0f : 1.0f) * shadowOffset));
+  lv_obj_set_pos(ui.moonShadow, shadowX, moonY);
+  lv_obj_set_style_bg_color(ui.moonShadow, skyColor, 0);
+  lv_obj_set_style_bg_opa(ui.moonShadow, LV_OPA_COVER, 0);
+
+  if (illumination >= 0.995f) {
+    lv_obj_add_flag(ui.moonShadow, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_clear_flag(ui.moonShadow, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  if (illumination <= 0.005f) {
+    lv_obj_set_pos(ui.moonShadow, moonX, moonY);
   }
 }
 } // namespace
@@ -329,6 +441,12 @@ lv_obj_t *buildCurrentWeatherScreen(WeatherUi &ui)
   lv_obj_set_style_radius(ui.moon, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(ui.moon, lvColor(210, 220, 255), 0);
   lv_obj_set_style_border_width(ui.moon, 0, 0);
+
+  ui.moonShadow = lv_obj_create(ui.hero);
+  lv_obj_set_size(ui.moonShadow, 66, 66);
+  lv_obj_set_style_radius(ui.moonShadow, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(ui.moonShadow, lvColor(16, 26, 64), 0);
+  lv_obj_set_style_border_width(ui.moonShadow, 0, 0);
 
   ui.clouds[0] = createCloud(ui.hero, 126, 44);
   ui.clouds[1] = createCloud(ui.hero, 106, 38);
@@ -784,6 +902,9 @@ void updateWeatherHero(WeatherUi &ui,
     lv_obj_add_flag(ray, LV_OBJ_FLAG_HIDDEN);
   }
   lv_obj_add_flag(ui.moon, LV_OBJ_FLAG_HIDDEN);
+  if (ui.moonShadow) {
+    lv_obj_add_flag(ui.moonShadow, LV_OBJ_FLAG_HIDDEN);
+  }
   lv_obj_add_flag(ui.bolt, LV_OBJ_FLAG_HIDDEN);
   for (auto *cloud : ui.clouds) {
     lv_obj_add_flag(cloud, LV_OBJ_FLAG_HIDDEN);
@@ -838,6 +959,8 @@ void updateWeatherHero(WeatherUi &ui,
         const uint8_t rayOpa = static_cast<uint8_t>(32 + (176.0f * fade * fade));
         lv_obj_set_style_line_opa(ray, static_cast<lv_opa_t>(rayOpa), 0);
       }
+    } else {
+      updateMoonPhaseVisual(ui, topColor);
     }
   }
 
@@ -925,4 +1048,485 @@ void updateWeatherHero(WeatherUi &ui,
       lv_obj_set_pos(ui.fogBars[i], 48 + static_cast<int>((tick % 10) - 5), 82 + (i * 34));
     }
   }
+}
+
+void handleWeatherStackSwipe(int deltaY)
+{
+  if (deltaY <= -kWeatherNavSwipeMinDistancePx) {
+    showNextScreen();
+    noteActivity();
+    return;
+  }
+
+  if (deltaY >= kWeatherNavSwipeMinDistancePx) {
+    showPreviousScreen();
+    noteActivity();
+  }
+}
+
+void handleWeatherSwipe(int deltaX)
+{
+  if (deltaX <= -kWeatherSwipeMinDistancePx) {
+    weatherModuleCycleDebugScene(1);
+    noteActivity();
+    return;
+  }
+
+  if (deltaX >= kWeatherSwipeMinDistancePx) {
+    weatherModuleCycleDebugScene(-1);
+    noteActivity();
+  }
+}
+
+void setUnavailableState(const char *updatedText)
+{
+  gState.hasData = false;
+  gState.stale = true;
+  gState.isDay = true;
+  gState.weatherCode = -1;
+  gState.temperatureF = 0;
+  gState.feelsLikeF = 0;
+  gState.highF = 0;
+  gState.lowF = 0;
+  gState.windMph = 0;
+  gState.precipitationPercent = 0;
+  gState.cloudCoverPercent = 0;
+  gState.condition = kDefaultUnavailableCondition;
+  gState.updated = updatedText ? updatedText : "Waiting for Wi-Fi";
+  gState.sunrise = "--:--";
+  gState.sunset = "--:--";
+  gState.location = WEATHER_LOCATION_LABEL;
+  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
+    gState.hourly[i] = {};
+  }
+  for (size_t i = 0; i < kDailyForecastCount; ++i) {
+    gState.daily[i] = {};
+  }
+}
+
+void saveWeatherCache()
+{
+  if (!gConfig.preferences || !gConfig.cacheKey || !gState.hasData) {
+    return;
+  }
+
+  DynamicJsonDocument doc(8192);
+  doc["hasData"] = gState.hasData;
+  doc["stale"] = gState.stale;
+  doc["isDay"] = gState.isDay;
+  doc["weatherCode"] = gState.weatherCode;
+  doc["temperatureF"] = gState.temperatureF;
+  doc["feelsLikeF"] = gState.feelsLikeF;
+  doc["highF"] = gState.highF;
+  doc["lowF"] = gState.lowF;
+  doc["windMph"] = gState.windMph;
+  doc["precipitationPercent"] = gState.precipitationPercent;
+  doc["cloudCoverPercent"] = gState.cloudCoverPercent;
+  doc["condition"] = gState.condition;
+  doc["updated"] = gState.updated;
+  doc["sunrise"] = gState.sunrise;
+  doc["sunset"] = gState.sunset;
+  doc["location"] = gState.location;
+
+  JsonArray hourly = doc.createNestedArray("hourly");
+  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
+    JsonObject item = hourly.createNestedObject();
+    item["valid"] = gState.hourly[i].valid;
+    item["hour"] = gState.hourly[i].hour;
+    item["temperatureF"] = gState.hourly[i].temperatureF;
+    item["precipitationPercent"] = gState.hourly[i].precipitationPercent;
+    item["weatherCode"] = gState.hourly[i].weatherCode;
+    item["isDay"] = gState.hourly[i].isDay;
+  }
+
+  JsonArray daily = doc.createNestedArray("daily");
+  for (size_t i = 0; i < kDailyForecastCount; ++i) {
+    JsonObject item = daily.createNestedObject();
+    item["valid"] = gState.daily[i].valid;
+    item["day"] = gState.daily[i].day;
+    item["highF"] = gState.daily[i].highF;
+    item["lowF"] = gState.daily[i].lowF;
+    item["precipitationPercent"] = gState.daily[i].precipitationPercent;
+    item["weatherCode"] = gState.daily[i].weatherCode;
+  }
+
+  String serialized;
+  serializeJson(doc, serialized);
+  gConfig.preferences->putString(gConfig.cacheKey, serialized);
+}
+
+static void refreshUi()
+{
+  refreshCurrentWeatherScreen(gUi, gState, networkOnline(), gDebugOverrideEnabled, gDebugScene);
+  updateWeatherHero(gUi, gState, gDebugOverrideEnabled, gDebugScene, millis());
+}
+
+WeatherSceneType cycleWeatherScene(WeatherSceneType scene, int direction)
+{
+  int value = static_cast<int>(scene);
+  value = (value + direction + static_cast<int>(WeatherSceneType::Fog) + 1) %
+          (static_cast<int>(WeatherSceneType::Fog) + 1);
+  return static_cast<WeatherSceneType>(value);
+}
+
+bool fetchWeather()
+{
+  if (!networkOnline()) {
+    return false;
+  }
+
+  String url = apiUrl();
+  if (url.isEmpty()) {
+    return false;
+  }
+
+  gFetchInProgress = true;
+  Serial.println("Fetching weather...");
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
+  HTTPClient http;
+  http.setConnectTimeout(gConfig.fetchTimeoutMs);
+  http.setTimeout(gConfig.fetchTimeoutMs);
+
+  bool success = false;
+  if (http.begin(secureClient, url)) {
+    int statusCode = http.GET();
+    if (statusCode == HTTP_CODE_OK) {
+      DynamicJsonDocument doc(24576);
+      DeserializationError error = deserializeJson(doc, http.getString());
+      if (!error) {
+        JsonObject current = doc["current"];
+        JsonObject hourly = doc["hourly"];
+        JsonObject daily = doc["daily"];
+
+        JsonArray hourlyTimes = hourly["time"].as<JsonArray>();
+        JsonArray hourlyTemps = hourly["temperature_2m"].as<JsonArray>();
+        JsonArray hourlyPrecip = hourly["precipitation_probability"].as<JsonArray>();
+        JsonArray hourlyCodes = hourly["weather_code"].as<JsonArray>();
+        JsonArray hourlyIsDay = hourly["is_day"].as<JsonArray>();
+
+        JsonArray dayArray = daily["time"].as<JsonArray>();
+        JsonArray highArray = daily["temperature_2m_max"].as<JsonArray>();
+        JsonArray lowArray = daily["temperature_2m_min"].as<JsonArray>();
+        JsonArray sunriseArray = daily["sunrise"].as<JsonArray>();
+        JsonArray sunsetArray = daily["sunset"].as<JsonArray>();
+        JsonArray precipitationArray = daily["precipitation_probability_max"].as<JsonArray>();
+        JsonArray dailyCodes = daily["weather_code"].as<JsonArray>();
+
+        float temperature = current["temperature_2m"].as<float>();
+        float feelsLike = current["apparent_temperature"].as<float>();
+        float wind = current["wind_speed_10m"].as<float>();
+        float high = !highArray.isNull() && highArray.size() > 0 ? highArray[0].as<float>() : temperature;
+        float low = !lowArray.isNull() && lowArray.size() > 0 ? lowArray[0].as<float>() : temperature;
+
+        gState.hasData = true;
+        gState.stale = false;
+        gState.isDay = (current["is_day"] | 1) == 1;
+        gState.weatherCode = current["weather_code"] | -1;
+        gState.temperatureF = static_cast<int>(roundf(temperature));
+        gState.feelsLikeF = static_cast<int>(roundf(feelsLike));
+        gState.highF = static_cast<int>(roundf(high));
+        gState.lowF = static_cast<int>(roundf(low));
+        gState.windMph = static_cast<int>(roundf(wind));
+        gState.precipitationPercent =
+            !precipitationArray.isNull() && precipitationArray.size() > 0 ? precipitationArray[0].as<int>() : 0;
+        gState.cloudCoverPercent = current["cloud_cover"] | 0;
+        gState.condition = weatherConditionFromCode(gState.weatherCode, gState.isDay);
+        gState.updated = updatedLabel();
+        gState.sunrise =
+            !sunriseArray.isNull() && sunriseArray.size() > 0 ? weatherTimeFragment(sunriseArray[0].as<const char *>()) : "--:--";
+        gState.sunset =
+            !sunsetArray.isNull() && sunsetArray.size() > 0 ? weatherTimeFragment(sunsetArray[0].as<const char *>()) : "--:--";
+        gState.location = WEATHER_LOCATION_LABEL;
+
+        for (size_t i = 0; i < kHourlyForecastCount; ++i) {
+          gState.hourly[i] = {};
+          if (hourlyTimes.isNull() || hourlyTemps.isNull() || i >= hourlyTimes.size() || i >= hourlyTemps.size()) {
+            continue;
+          }
+
+          gState.hourly[i].valid = true;
+          gState.hourly[i].hour = weatherHourFragment(hourlyTimes[i].as<const char *>());
+          gState.hourly[i].temperatureF = static_cast<int>(roundf(hourlyTemps[i].as<float>()));
+          gState.hourly[i].precipitationPercent =
+              !hourlyPrecip.isNull() && i < hourlyPrecip.size() ? hourlyPrecip[i].as<int>() : 0;
+          gState.hourly[i].weatherCode =
+              !hourlyCodes.isNull() && i < hourlyCodes.size() ? (hourlyCodes[i] | -1) : -1;
+          gState.hourly[i].isDay =
+              !hourlyIsDay.isNull() && i < hourlyIsDay.size() ? ((hourlyIsDay[i] | 1) == 1) : true;
+        }
+
+        for (size_t i = 0; i < kDailyForecastCount; ++i) {
+          gState.daily[i] = {};
+          if (dayArray.isNull() || highArray.isNull() || lowArray.isNull() ||
+              i >= dayArray.size() || i >= highArray.size() || i >= lowArray.size()) {
+            continue;
+          }
+
+          gState.daily[i].valid = true;
+          gState.daily[i].day = weatherDayFragment(dayArray[i].as<const char *>());
+          gState.daily[i].highF = static_cast<int>(roundf(highArray[i].as<float>()));
+          gState.daily[i].lowF = static_cast<int>(roundf(lowArray[i].as<float>()));
+          gState.daily[i].precipitationPercent =
+              !precipitationArray.isNull() && i < precipitationArray.size() ? precipitationArray[i].as<int>() : 0;
+          gState.daily[i].weatherCode =
+              !dailyCodes.isNull() && i < dailyCodes.size() ? (dailyCodes[i] | -1) : -1;
+        }
+
+        saveWeatherCache();
+        gNextRefreshAtMs = millis() + gConfig.refreshIntervalMs;
+        success = true;
+      } else {
+        Serial.printf("Weather JSON parse failed: %s\n", error.c_str());
+      }
+    } else {
+      String responseBody = http.getString();
+      Serial.printf("Weather request failed: HTTP %d\n", statusCode);
+      if (responseBody.length() > 0) {
+        Serial.printf("Weather response body: %s\n", responseBody.c_str());
+      }
+    }
+    http.end();
+  } else {
+    Serial.println("Weather request setup failed");
+  }
+
+  if (!success) {
+    if (gState.hasData) {
+      gState.stale = true;
+      gState.updated = kDefaultOfflineWeatherLabel;
+    } else {
+      setUnavailableState(networkOnline() ? "Retrying shortly" : "Waiting for Wi-Fi");
+    }
+    gNextRefreshAtMs = millis() + gConfig.retryIntervalMs;
+  }
+
+  gFetchInProgress = false;
+  return success;
+}
+
+void weatherModuleConfigure(const WeatherModuleConfig &config)
+{
+  gConfig = config;
+}
+
+bool weatherModuleRestoreCache()
+{
+  if (!gConfig.preferences || !gConfig.cacheKey) {
+    return false;
+  }
+
+  String serialized = gConfig.preferences->getString(gConfig.cacheKey, "");
+  if (serialized.isEmpty()) {
+    return false;
+  }
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError error = deserializeJson(doc, serialized);
+  if (error) {
+    Serial.printf("Weather cache parse failed: %s\n", error.c_str());
+    return false;
+  }
+
+  gState.hasData = doc["hasData"] | false;
+  if (!gState.hasData) {
+    return false;
+  }
+
+  gState.stale = true;
+  gState.isDay = doc["isDay"] | true;
+  gState.weatherCode = doc["weatherCode"] | -1;
+  gState.temperatureF = doc["temperatureF"] | 0;
+  gState.feelsLikeF = doc["feelsLikeF"] | 0;
+  gState.highF = doc["highF"] | 0;
+  gState.lowF = doc["lowF"] | 0;
+  gState.windMph = doc["windMph"] | 0;
+  gState.precipitationPercent = doc["precipitationPercent"] | 0;
+  gState.cloudCoverPercent = doc["cloudCoverPercent"] | 0;
+  gState.condition = String(static_cast<const char *>(doc["condition"] | kDefaultUnavailableCondition));
+  gState.updated = kDefaultOfflineWeatherLabel;
+  gState.sunrise = String(static_cast<const char *>(doc["sunrise"] | "--:--"));
+  gState.sunset = String(static_cast<const char *>(doc["sunset"] | "--:--"));
+  gState.location = String(static_cast<const char *>(doc["location"] | WEATHER_LOCATION_LABEL));
+
+  JsonArray hourly = doc["hourly"].as<JsonArray>();
+  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
+    gState.hourly[i] = {};
+    if (hourly.isNull() || i >= hourly.size()) {
+      continue;
+    }
+    JsonObject item = hourly[i].as<JsonObject>();
+    gState.hourly[i].valid = item["valid"] | false;
+    gState.hourly[i].hour = String(static_cast<const char *>(item["hour"] | "--"));
+    gState.hourly[i].temperatureF = item["temperatureF"] | 0;
+    gState.hourly[i].precipitationPercent = item["precipitationPercent"] | 0;
+    gState.hourly[i].weatherCode = item["weatherCode"] | -1;
+    gState.hourly[i].isDay = item["isDay"] | true;
+  }
+
+  JsonArray daily = doc["daily"].as<JsonArray>();
+  for (size_t i = 0; i < kDailyForecastCount; ++i) {
+    gState.daily[i] = {};
+    if (daily.isNull() || i >= daily.size()) {
+      continue;
+    }
+    JsonObject item = daily[i].as<JsonObject>();
+    gState.daily[i].valid = item["valid"] | false;
+    gState.daily[i].day = String(static_cast<const char *>(item["day"] | "---"));
+    gState.daily[i].highF = item["highF"] | 0;
+    gState.daily[i].lowF = item["lowF"] | 0;
+    gState.daily[i].precipitationPercent = item["precipitationPercent"] | 0;
+    gState.daily[i].weatherCode = item["weatherCode"] | -1;
+  }
+
+  Serial.println("Restored cached weather state");
+  return true;
+}
+
+bool weatherModuleHasData()
+{
+  return gState.hasData;
+}
+
+void weatherModuleSetUnavailable(const char *updatedLabel)
+{
+  setUnavailableState(updatedLabel);
+}
+
+void weatherModuleMarkOffline()
+{
+  if (gState.hasData) {
+    gState.stale = true;
+    gState.updated = kDefaultOfflineWeatherLabel;
+  } else {
+    setUnavailableState("Offline - no cached weather");
+  }
+}
+
+void weatherModuleScheduleRefreshIn(uint32_t delayMs)
+{
+  gNextRefreshAtMs = millis() + delayMs;
+}
+
+void weatherModuleUpdate()
+{
+  if (!networkOnline()) {
+    if (gState.hasData && !gState.stale) {
+      gState.stale = true;
+      gState.updated = kDefaultOfflineWeatherLabel;
+    }
+    return;
+  }
+
+  if (!gConfig.fetchEnabled || gFetchInProgress || otaBusy() || lightSleepActive()) {
+    return;
+  }
+
+  if (static_cast<int32_t>(millis() - gNextRefreshAtMs) >= 0) {
+    fetchWeather();
+  }
+}
+
+void weatherModuleCycleDebugScene(int direction)
+{
+  gDebugOverrideEnabled = true;
+  gDebugScene = cycleWeatherScene(gDebugScene, direction);
+  if (gUi.currentScreen) {
+    refreshUi();
+  }
+}
+
+void weatherModuleClearDebugOverride()
+{
+  gDebugOverrideEnabled = false;
+}
+
+void weatherModuleRefreshUi()
+{
+  if (!gUi.currentScreen || !gUi.cityLabel || !gUi.tempLabel || !gUi.conditionLabel) {
+    return;
+  }
+
+  refreshUi();
+}
+
+lv_obj_t *waveformWeatherScreenRoot()
+{
+  return gRoot;
+}
+
+bool waveformBuildWeatherScreen()
+{
+  if (!gRoot) {
+    gRoot = buildCurrentWeatherScreen(gUi);
+  }
+
+  return gRoot && gUi.currentScreen && gUi.cityLabel && gUi.tempLabel && gUi.conditionLabel;
+}
+
+bool waveformRefreshWeatherScreen()
+{
+  if (!gUi.currentScreen || !gUi.cityLabel || !gUi.tempLabel || !gUi.conditionLabel) {
+    return false;
+  }
+
+  refreshUi();
+  return true;
+}
+
+void waveformEnterWeatherScreen()
+{
+  gDebugOverrideEnabled = false;
+  if (gConfig.fetchEnabled && networkOnline() && !gFetchInProgress && !otaBusy() && !lightSleepActive()) {
+    fetchWeather();
+  }
+}
+
+void waveformLeaveWeatherScreen()
+{
+}
+
+void waveformTickWeatherScreen(uint32_t nowMs)
+{
+  (void)nowMs;
+  if (gUi.currentScreen) {
+    updateWeatherHero(gUi, gState, gDebugOverrideEnabled, gDebugScene, millis());
+  }
+}
+
+const ScreenModule &weatherScreenModule()
+{
+  return kModule;
+}
+
+
+String weatherApiUrl()
+{
+  char url[768];
+  snprintf(url,
+           sizeof(url),
+           "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,apparent_temperature,is_day,weather_code,wind_speed_10m,cloud_cover"
+           "&hourly=temperature_2m,precipitation_probability,weather_code,is_day"
+           "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max,weather_code"
+           "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto&forecast_days=10&forecast_hours=24",
+           WEATHER_LATITUDE,
+           WEATHER_LONGITUDE);
+  return String(url);
+}
+
+String weatherUpdatedLabel()
+{
+  if (!hasValidTime()) {
+    return "Updated just now";
+  }
+
+  char buffer[24];
+  struct tm localTime = {};
+  time_t now = time(nullptr);
+  localtime_r(&now, &localTime);
+  strftime(buffer, sizeof(buffer), "Updated %H:%M", &localTime);
+  return String(buffer);
 }

@@ -1,3 +1,11 @@
 /Waveform/.pio/
+/.remember/
 /.codex/
 /ESP32-AIChats/xiaozhi-esp32/v2.2.4/ESP32S3/v2.2.4_waveshare-esp32-s3-touch-amoled-1.8.zip
+/esp-idf/
+/esp-idf-tools/
+/esp-idf-component-cache/
+/esp-iot-solution/
+/lv_micropython/
+/.pip-cache/
+/.pydeps/

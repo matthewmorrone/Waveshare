@@ -1,0 +1,6 @@
+# stubs/ntptime.pyi - MicroPython ntptime stubs
+
+host: str
+
+def settime() -> None: ...
+def time() -> int: ...

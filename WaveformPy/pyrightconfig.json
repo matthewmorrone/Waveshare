@@ -1,0 +1,11 @@
+{
+  "pythonVersion": "3.10",
+  "stubPath": "stubs",
+  "extraPaths": ["stubs"],
+  "reportMissingModuleSource": "none",
+  "reportMissingImports": "warning",
+  "typeCheckingMode": "basic",
+  "ignore": [
+    "stubs"
+  ]
+}

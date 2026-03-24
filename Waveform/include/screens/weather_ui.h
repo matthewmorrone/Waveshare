@@ -86,6 +86,7 @@ struct WeatherUi
   lv_obj_t *sunRays[kWeatherSunRayCount] = {nullptr};
   lv_point_precise_t sunRayPoints[kWeatherSunRayCount][2] = {};
   lv_obj_t *moon = nullptr;
+  lv_obj_t *moonShadow = nullptr;
   lv_obj_t *clouds[3] = {nullptr};
   lv_obj_t *particles[kWeatherParticleCount] = {nullptr};
   lv_obj_t *bolt = nullptr;

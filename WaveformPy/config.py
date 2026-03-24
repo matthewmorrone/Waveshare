@@ -1,0 +1,77 @@
+# config.py - Hardware pin definitions and constants
+# Mirrors Waveform/include/pin_config.h
+
+# Display (QSPI SH8601)
+LCD_WIDTH   = 368
+LCD_HEIGHT  = 448
+PIN_LCD_SDIO0 = 4
+PIN_LCD_SDIO1 = 5
+PIN_LCD_SDIO2 = 6
+PIN_LCD_SDIO3 = 7
+PIN_LCD_SCLK  = 11
+PIN_LCD_CS    = 12
+PIN_LCD_RST   = 13
+
+# I2C Bus
+PIN_SDA = 15
+PIN_SCL = 14
+
+# Touch (FT3x68)
+PIN_TOUCH_INT = 21
+TOUCH_ADDR    = 0x38
+
+# IMU (QMI8658)
+IMU_ADDR      = 0x6B
+PIN_IMU_IRQ   = 33
+
+# RTC (PCF85063)
+RTC_ADDR      = 0x51
+
+# Power Management (AXP2101)
+PMU_ADDR      = 0x34
+
+# GPIO Expander (XCA9554)
+EXPANDER_ADDR = 0x20
+EXP_PIN_SIDE_BTN = 4
+EXP_PIN_PMU_IRQ  = 5
+
+# Audio Codec (ES8311) via I2S
+CODEC_ADDR    = 0x18
+PIN_I2S_MCLK  = 16
+PIN_I2S_BCLK  = 9
+PIN_I2S_DIN   = 10
+PIN_I2S_WS    = 45
+PIN_I2S_DOUT  = 8
+
+# SD Card (SDMMC)
+PIN_SD_CLK  = 2
+PIN_SD_CMD  = 1
+PIN_SD_DATA = 3
+
+# Power/Timing
+BRIGHTNESS_ACTIVE = 255
+BRIGHTNESS_DIM    = 26
+IDLE_DIM_MS       = 30_000
+IDLE_SLEEP_MS     = 300_000
+
+# Screen refresh intervals (ms)
+INTERVAL_STATUS   = 250
+INTERVAL_MOTION   = 40
+INTERVAL_RECORDER = 33
+INTERVAL_WEATHER  = 90
+INTERVAL_SKY      = 1000
+
+# Data fetch intervals (ms)
+INTERVAL_WEATHER_FETCH = 15 * 60 * 1000
+INTERVAL_GEO_FETCH     = 15 * 60 * 1000
+INTERVAL_IMU_SAMPLE    = 20
+
+# WiFi
+WIFI_CONNECT_TIMEOUT_MS = 12_000
+WIFI_RETRY_INTERVAL_MS  = 30_000
+
+# OTA
+OTA_HOSTNAME = "waveformpy"
+
+# Timezone (POSIX)
+TZ_POSIX = "EST5EDT,M3.2.0,M11.1.0"

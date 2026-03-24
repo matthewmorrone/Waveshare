@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
 
-#include "pin_config.h"
+#include "config/pin_config.h"
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     LCD_CS,

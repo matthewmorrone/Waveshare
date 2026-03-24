@@ -1,0 +1,4 @@
+ota_config.py
+prefs.json
+__pycache__/
+*.pyc

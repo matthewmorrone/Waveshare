@@ -4,16 +4,17 @@
 #include <ArduinoOTA.h>
 #include <Arduino_DriveBus_Library.h>
 #include <Arduino_GFX_Library.h>
+#include <ESP_I2S.h>
+#include <FS.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
-#include "pin_config.h"
+#include <qrcode.h>
 #include <SD_MMC.h>
 #include <SensorPCF85063.hpp>
 #include <SensorQMI8658.hpp>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
-#include <XPowersLib.h>
 #include <driver/gpio.h>
 #include <esp_heap_caps.h>
 #include <esp_sleep.h>
@@ -25,21 +26,26 @@
 #include <sys/time.h>
 #include <time.h>
 
-#include "ota_config.h"
-#include "weather_ui.h"
+#include "config/ota_config.h"
+#include "config/pin_config.h"
+#include "config/screen_constants.h"
+#include "core/screen_manager.h"
+#include "drivers/es8311.h"
+#include "modules/storage.h"
+#include "modules/weather_module.h"
+#include "modules/wifi_manager.h"
+#include "screens/screen_callbacks.h"
 
-namespace
-{
+#include <XPowersLib.h>
+
 constexpr uint16_t kBackgroundColor = 0x0000;
 constexpr uint8_t kActiveBrightness = 255;
 constexpr uint8_t kDimBrightness = 26;
 constexpr uint32_t kButtonDebounceMs = 180;
 constexpr uint32_t kStatusRefreshMs = 250;
-constexpr uint32_t kMotionRefreshMs = 40;
+constexpr uint32_t kRecorderVisualRefreshMs = 33;
 constexpr uint32_t kWeatherAnimRefreshMs = 90;
-constexpr uint32_t kWeatherRefreshIntervalMs = 15UL * 60UL * 1000UL;
-constexpr uint32_t kWeatherRetryIntervalMs = 60UL * 1000UL;
-constexpr uint32_t kWeatherFetchTimeoutMs = 2500;
+constexpr uint32_t kSkyRefreshMs = 1000;
 constexpr bool kWeatherFetchEnabled = true;
 constexpr uint32_t kWifiConnectTimeoutMs = 12000;
 constexpr uint32_t kWifiRetryIntervalMs = 30000;
@@ -54,52 +60,13 @@ constexpr uint32_t kShutdownHoldArmMs = 450;
 constexpr uint32_t kPowerButtonShutdownHoldMs = 4000;
 constexpr uint32_t kLvglBufferRows = 40;
 constexpr time_t kMinValidEpoch = 1704067200;
-constexpr const char *kSdMountPath = "/sdcard";
 constexpr int kMotionSwipeMinDistancePx = 8;
 constexpr int kMotionSwipeMinDominancePx = -6;
-constexpr int kWeatherSwipeMinDistancePx = 22;
-constexpr int kWeatherSwipeMinDominancePx = 8;
-constexpr int kWeatherNavSwipeMinDistancePx = 12;
-constexpr int kWeatherNavSwipeMinDominancePx = -10;
+constexpr int kQrSwipeMinDistancePx = 18;
+constexpr int kQrSwipeMinDominancePx = 2;
 constexpr int kScreenNavSwipeMinDistancePx = 20;
 constexpr int kScreenNavSwipeMinDominancePx = 4;
-constexpr int kMotionViewAnimOffsetPx = 28;
-constexpr uint32_t kMotionViewAnimMs = 140;
-constexpr float kMotionDeltaThreshold = 0.18f;
-constexpr float kMotionSensorSmoothingAlpha = 0.18f;
-constexpr float kMotionReadoutSmoothingAlpha = 0.14f;
-constexpr float kMotionIndicatorSmoothingAlpha = 0.12f;
-constexpr float kMotionIndicatorDeadzoneVector = 0.035f;
-constexpr float kMotionIndicatorFullScaleVector = 0.55f;
-constexpr int kDotDiameter = 26;
 constexpr int kTapMaxTravelPx = 12;
-constexpr int kBatteryTrackWidth = 266;
-constexpr int kBatteryTrackHeight = 12;
-constexpr int kBatteryTrackY = 358;
-constexpr int kWatchTimeY = 58;
-constexpr int kWatchDateY = 272;
-constexpr int kWatchTimezoneY = 306;
-constexpr int kClockDigitWidth = 50;
-constexpr int kClockColonWidth = 22;
-constexpr int kClockGlyphHeight = 148;
-constexpr int kClockZoom = 384;
-constexpr int kCalculatorCardWidth = LCD_WIDTH - 28;
-constexpr int kCalculatorButtonWidth = 72;
-constexpr int kCalculatorButtonHeight = 52;
-constexpr int kCalculatorButtonGap = 5;
-constexpr uint32_t kCalculatorClearLongPressMs = 450;
-constexpr size_t kScreenCount = 4;
-constexpr size_t kCubeEdgeCount = 12;
-constexpr size_t kCubeArrowSegmentCount = 3;
-constexpr size_t kCubeArrowCount = 3;
-constexpr size_t kCubeArrowLineCount = kCubeArrowCount * kCubeArrowSegmentCount;
-constexpr const char *kSdStartupDirs[] = {
-    "/assets",
-    "/config",
-    "/cache",
-    "/recordings",
-    "/update",
-};
 constexpr const char *kPreferencesNamespace = "waveform";
 constexpr const char *kPrefScreenKey = "screen";
 constexpr const char *kPrefMotionViewKey = "motionview";
@@ -109,72 +76,6 @@ struct WiFiCredential
 {
   const char *ssid;
   const char *password;
-};
-
-enum class ConnectivityState : uint8_t
-{
-  Offline,
-  Connecting,
-  Online,
-};
-
-enum class ScreenId : uint8_t
-{
-  Watchface,
-  Motion,
-  Weather,
-  Calculator,
-};
-
-enum class MotionViewMode : uint8_t
-{
-  Dot,
-  Cube,
-  Raw,
-  Count,
-};
-
-struct MotionState
-{
-  bool valid = false;
-  float ax = 0.0f;
-  float ay = 0.0f;
-  float az = 0.0f;
-  float gx = 0.0f;
-  float gy = 0.0f;
-  float gz = 0.0f;
-  float pitch = 0.0f;
-  float roll = 0.0f;
-  char orientation[20] = "Unavailable";
-};
-
-struct CalculatorUi
-{
-  lv_obj_t *screen = nullptr;
-  lv_obj_t *historyLabel = nullptr;
-  lv_obj_t *displayLabel = nullptr;
-  lv_obj_t *buttons[20] = {};
-  lv_obj_t *buttonLabels[20] = {};
-  lv_point_precise_t iconLinePoints[20][4][2] = {};
-
-  double accumulator = 0.0;
-  double lastOperand = 0.0;
-  char pendingOperator = '\0';
-  char lastOperator = '\0';
-  bool hasAccumulator = false;
-  bool enteringNewValue = true;
-  bool error = false;
-  bool trigUsesDegrees = true;
-  bool showingFunctionSet = false;
-  char currentText[24] = "0";
-  char historyText[48] = "";
-};
-
-struct Vec3
-{
-  float x = 0.0f;
-  float y = 0.0f;
-  float z = 0.0f;
 };
 
 constexpr WiFiCredential kWiFiCredentials[] = {
@@ -203,16 +104,27 @@ SensorPCF85063 rtc;
 SensorQMI8658 imu;
 std::shared_ptr<Arduino_IIC_DriveBus> touchBus = std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
 Preferences preferences;
+I2SClass audioI2s;
+extern uint32_t nextGeoRefreshAtMs;
+extern uint32_t nextSolarRefreshAtMs;
+extern size_t currentQrIndex;
+extern bool qrNeedsRender;
+void setGeoUnavailableState(const char *updatedLabel);
+void setSolarUnavailableState(const char *updatedLabel);
+void updateGeo();
+void updateSolarSystem();
 void handleTouchInterrupt();
 void captureMotionReference();
-void refreshWeatherScreen();
-void updateWeatherHero();
+bool refreshManagedScreen(ScreenId id);
+void saveMotionViewPreference();
+void saveScreenPreference(size_t screenIndex);
 void showNextScreen();
 void showPreviousScreen();
-void refreshCalculatorScreen();
-void buildCalculatorScreenRoot();
-void styleCalculatorButton(lv_obj_t *button, const char *labelText);
-void setLinePoints(lv_point_precise_t points[2], float x1, float y1, float x2, float y2);
+void updateRecorderAudio();
+void initRtc();
+void updateRecorderVisuals();
+extern bool audioRecordingActive;
+extern bool audioPlaybackActive;
 std::unique_ptr<Arduino_IIC> touchController(
     new Arduino_FT3x68(touchBus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, handleTouchInterrupt));
 
@@ -221,13 +133,17 @@ lv_indev_t *touchInput = nullptr;
 static uint8_t *lvBuffer = nullptr;
 
 lv_obj_t *screenRoots[kScreenCount] = {};
+bool screenRefreshPending[kScreenCount] = {};
 size_t currentScreenIndex = 0;
+bool screenPreferenceSavePending = false;
+size_t pendingScreenPreferenceIndex = 0;
 
 lv_obj_t *watchTimeLabel = nullptr;
 lv_obj_t *watchTimeRow = nullptr;
 lv_obj_t *watchTimeGlyphs[5] = {nullptr};
 lv_obj_t *watchDateLabel = nullptr;
 lv_obj_t *watchTimezoneLabel = nullptr;
+lv_obj_t *watchFirmwareLabel = nullptr;
 lv_obj_t *watchBatteryTrack = nullptr;
 lv_obj_t *watchBatteryFill = nullptr;
 lv_obj_t *watchWifiIcon = nullptr;
@@ -288,31 +204,21 @@ bool otaReady = false;
 bool otaInProgress = false;
 bool otaOverlaySticky = false;
 bool ntpConfigured = false;
-bool weatherFetchInProgress = false;
 bool motionReferenceReady = false;
 bool motionReferenceCapturePending = false;
 bool motionDisplayValid = false;
 bool motionFilterReady = false;
 bool haveLastAccelSample = false;
-bool watchfaceBuilt = false;
 bool motionBuilt = false;
 bool sdMounted = false;
 bool touchTapTracking = false;
 bool powerButtonHoldActive = false;
 bool powerButtonShutdownTriggered = false;
-bool weatherDebugOverrideEnabled = false;
-uint8_t sdCardType = CARD_NONE;
-uint64_t sdCardSizeMb = 0;
-
 ConnectivityState connectivityState = ConnectivityState::Offline;
 MotionViewMode motionViewMode = MotionViewMode::Dot;
 MotionViewMode renderedMotionViewMode = MotionViewMode::Count;
 MotionState motionState;
 MotionState motionDisplayState;
-WeatherState weatherState;
-WeatherUi weatherUi;
-CalculatorUi calculatorUi;
-WeatherSceneType weatherDebugScene = WeatherSceneType::Clear;
 Vec3 motionReferenceDown = {0.0f, 0.0f, 1.0f};
 Vec3 motionReferenceAxisA = {1.0f, 0.0f, 0.0f};
 Vec3 motionReferenceAxisB = {0.0f, 1.0f, 0.0f};
@@ -339,15 +245,16 @@ uint32_t powerButtonHoldStartedAtMs = 0;
 uint32_t lastStatusRefreshAtMs = 0;
 uint32_t lastMotionRefreshAtMs = 0;
 uint32_t lastWeatherAnimAtMs = 0;
+uint32_t lastRecorderVisualRefreshAtMs = 0;
 uint32_t lastImuSampleAtMs = 0;
 uint32_t wifiConnectStartedMs = 0;
 uint32_t nextWifiRetryAtMs = 0;
 uint32_t lastWifiServiceAtMs = 0;
-uint32_t nextWeatherRefreshAtMs = 0;
 uint32_t lastActivityAtMs = 0;
 uint32_t otaOverlayHideAtMs = 0;
 time_t lastRtcWriteEpoch = 0;
 uint32_t touchTapStartedAtMs = 0;
+uint32_t lastSkyRefreshAtMs = 0;
 
 int16_t touchTapStartX = LCD_WIDTH / 2;
 int16_t touchTapStartY = LCD_HEIGHT / 2;
@@ -377,156 +284,26 @@ void noteActivity()
   }
 }
 
-void saveUiState()
+void saveMotionViewPreference()
 {
-  preferences.putUChar(kPrefScreenKey, static_cast<uint8_t>(currentScreenIndex));
   preferences.putUChar(kPrefMotionViewKey, static_cast<uint8_t>(motionViewMode));
 }
 
-void setWeatherUnavailableState(const char *updatedLabel)
+void saveScreenPreference(size_t screenIndex)
 {
-  weatherState.hasData = false;
-  weatherState.stale = true;
-  weatherState.isDay = true;
-  weatherState.weatherCode = -1;
-  weatherState.temperatureF = 0;
-  weatherState.feelsLikeF = 0;
-  weatherState.highF = 0;
-  weatherState.lowF = 0;
-  weatherState.windMph = 0;
-  weatherState.precipitationPercent = 0;
-  weatherState.cloudCoverPercent = 0;
-  weatherState.condition = "Weather unavailable";
-  weatherState.updated = updatedLabel;
-  weatherState.sunrise = "--:--";
-  weatherState.sunset = "--:--";
-  weatherState.location = WEATHER_LOCATION_LABEL;
-  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
-    weatherState.hourly[i] = {};
-  }
-  for (size_t i = 0; i < kDailyForecastCount; ++i) {
-    weatherState.daily[i] = {};
-  }
+  preferences.putUChar(kPrefScreenKey, static_cast<uint8_t>(screenIndex));
 }
 
-void saveWeatherCache()
+void scheduleScreenRefresh(ScreenId id)
 {
-  if (!weatherState.hasData) {
-    return;
-  }
-
-  DynamicJsonDocument doc(8192);
-  doc["hasData"] = weatherState.hasData;
-  doc["stale"] = weatherState.stale;
-  doc["isDay"] = weatherState.isDay;
-  doc["weatherCode"] = weatherState.weatherCode;
-  doc["temperatureF"] = weatherState.temperatureF;
-  doc["feelsLikeF"] = weatherState.feelsLikeF;
-  doc["highF"] = weatherState.highF;
-  doc["lowF"] = weatherState.lowF;
-  doc["windMph"] = weatherState.windMph;
-  doc["precipitationPercent"] = weatherState.precipitationPercent;
-  doc["cloudCoverPercent"] = weatherState.cloudCoverPercent;
-  doc["condition"] = weatherState.condition;
-  doc["updated"] = weatherState.updated;
-  doc["sunrise"] = weatherState.sunrise;
-  doc["sunset"] = weatherState.sunset;
-  doc["location"] = weatherState.location;
-
-  JsonArray hourly = doc.createNestedArray("hourly");
-  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
-    JsonObject item = hourly.createNestedObject();
-    item["valid"] = weatherState.hourly[i].valid;
-    item["hour"] = weatherState.hourly[i].hour;
-    item["temperatureF"] = weatherState.hourly[i].temperatureF;
-    item["precipitationPercent"] = weatherState.hourly[i].precipitationPercent;
-    item["weatherCode"] = weatherState.hourly[i].weatherCode;
-    item["isDay"] = weatherState.hourly[i].isDay;
-  }
-
-  JsonArray daily = doc.createNestedArray("daily");
-  for (size_t i = 0; i < kDailyForecastCount; ++i) {
-    JsonObject item = daily.createNestedObject();
-    item["valid"] = weatherState.daily[i].valid;
-    item["day"] = weatherState.daily[i].day;
-    item["highF"] = weatherState.daily[i].highF;
-    item["lowF"] = weatherState.daily[i].lowF;
-    item["precipitationPercent"] = weatherState.daily[i].precipitationPercent;
-    item["weatherCode"] = weatherState.daily[i].weatherCode;
-  }
-
-  String serialized;
-  serializeJson(doc, serialized);
-  preferences.putString(kPrefWeatherCacheKey, serialized);
+  screenRefreshPending[static_cast<size_t>(id)] = true;
 }
 
-bool restoreWeatherCache()
+String firmwareUpdatedText()
 {
-  String serialized = preferences.getString(kPrefWeatherCacheKey, "");
-  if (serialized.isEmpty()) {
-    return false;
-  }
-
-  DynamicJsonDocument doc(8192);
-  DeserializationError error = deserializeJson(doc, serialized);
-  if (error) {
-    Serial.printf("Weather cache parse failed: %s\n", error.c_str());
-    return false;
-  }
-
-  weatherState.hasData = doc["hasData"] | false;
-  if (!weatherState.hasData) {
-    return false;
-  }
-
-  weatherState.stale = true;
-  weatherState.isDay = doc["isDay"] | true;
-  weatherState.weatherCode = doc["weatherCode"] | -1;
-  weatherState.temperatureF = doc["temperatureF"] | 0;
-  weatherState.feelsLikeF = doc["feelsLikeF"] | 0;
-  weatherState.highF = doc["highF"] | 0;
-  weatherState.lowF = doc["lowF"] | 0;
-  weatherState.windMph = doc["windMph"] | 0;
-  weatherState.precipitationPercent = doc["precipitationPercent"] | 0;
-  weatherState.cloudCoverPercent = doc["cloudCoverPercent"] | 0;
-  weatherState.condition = String(static_cast<const char *>(doc["condition"] | "Weather unavailable"));
-  weatherState.updated = "Offline - cached weather";
-  weatherState.sunrise = String(static_cast<const char *>(doc["sunrise"] | "--:--"));
-  weatherState.sunset = String(static_cast<const char *>(doc["sunset"] | "--:--"));
-  weatherState.location = String(static_cast<const char *>(doc["location"] | WEATHER_LOCATION_LABEL));
-
-  JsonArray hourly = doc["hourly"].as<JsonArray>();
-  for (size_t i = 0; i < kHourlyForecastCount; ++i) {
-    weatherState.hourly[i] = {};
-    if (hourly.isNull() || i >= hourly.size()) {
-      continue;
-    }
-    JsonObject item = hourly[i].as<JsonObject>();
-    weatherState.hourly[i].valid = item["valid"] | false;
-    weatherState.hourly[i].hour = String(static_cast<const char *>(item["hour"] | "--"));
-    weatherState.hourly[i].temperatureF = item["temperatureF"] | 0;
-    weatherState.hourly[i].precipitationPercent = item["precipitationPercent"] | 0;
-    weatherState.hourly[i].weatherCode = item["weatherCode"] | -1;
-    weatherState.hourly[i].isDay = item["isDay"] | true;
-  }
-
-  JsonArray daily = doc["daily"].as<JsonArray>();
-  for (size_t i = 0; i < kDailyForecastCount; ++i) {
-    weatherState.daily[i] = {};
-    if (daily.isNull() || i >= daily.size()) {
-      continue;
-    }
-    JsonObject item = daily[i].as<JsonObject>();
-    weatherState.daily[i].valid = item["valid"] | false;
-    weatherState.daily[i].day = String(static_cast<const char *>(item["day"] | "---"));
-    weatherState.daily[i].highF = item["highF"] | 0;
-    weatherState.daily[i].lowF = item["lowF"] | 0;
-    weatherState.daily[i].precipitationPercent = item["precipitationPercent"] | 0;
-    weatherState.daily[i].weatherCode = item["weatherCode"] | -1;
-  }
-
-  Serial.println("Restored cached weather state");
-  return true;
+  char text[40];
+  snprintf(text, sizeof(text), "FW %s %.5s", __DATE__, __TIME__);
+  return String(text);
 }
 
 void advanceMotionView()
@@ -534,7 +311,7 @@ void advanceMotionView()
   renderedMotionTransitionDirection = -1;
   motionViewMode = static_cast<MotionViewMode>((static_cast<uint8_t>(motionViewMode) + 1) %
                                                static_cast<uint8_t>(MotionViewMode::Count));
-  saveUiState();
+  saveMotionViewPreference();
 }
 
 void reverseMotionView()
@@ -543,7 +320,7 @@ void reverseMotionView()
   motionViewMode = static_cast<MotionViewMode>(
       (static_cast<uint8_t>(motionViewMode) + static_cast<uint8_t>(MotionViewMode::Count) - 1) %
       static_cast<uint8_t>(MotionViewMode::Count));
-  saveUiState();
+  saveMotionViewPreference();
 }
 
 void centerMotionDot()
@@ -589,19 +366,24 @@ void handleMotionSwipe(int deltaY)
 
 bool isWeatherStackScreen(ScreenId screen)
 {
-  return screen == ScreenId::Weather;
+  return screen == ScreenId::Weather || screen == ScreenId::Geo ||
+         screen == ScreenId::Solar || screen == ScreenId::Sky;
 }
 
-void handleWeatherStackSwipe(int deltaY)
+void handleQrSwipe(int deltaY)
 {
-  if (deltaY <= -kWeatherNavSwipeMinDistancePx) {
-    showNextScreen();
+  if (deltaY <= -kQrSwipeMinDistancePx) {
+    currentQrIndex = (currentQrIndex + 1) % kQrEntryCount;
+    qrNeedsRender = true;
+    scheduleScreenRefresh(ScreenId::Qr);
     noteActivity();
     return;
   }
 
-  if (deltaY >= kWeatherNavSwipeMinDistancePx) {
-    showPreviousScreen();
+  if (deltaY >= kQrSwipeMinDistancePx) {
+    currentQrIndex = (currentQrIndex + kQrEntryCount - 1) % kQrEntryCount;
+    qrNeedsRender = true;
+    scheduleScreenRefresh(ScreenId::Qr);
     noteActivity();
   }
 }
@@ -616,32 +398,6 @@ void handleScreenNavigationSwipe(int deltaX)
 
   if (deltaX >= kScreenNavSwipeMinDistancePx) {
     showPreviousScreen();
-    noteActivity();
-  }
-}
-
-WeatherSceneType cycleWeatherScene(WeatherSceneType scene, int direction)
-{
-  int value = static_cast<int>(scene);
-  value = (value + direction + static_cast<int>(WeatherSceneType::Fog) + 1) %
-          (static_cast<int>(WeatherSceneType::Fog) + 1);
-  return static_cast<WeatherSceneType>(value);
-}
-
-void handleWeatherSwipe(int deltaX)
-{
-  if (deltaX <= -kWeatherSwipeMinDistancePx) {
-    weatherDebugOverrideEnabled = true;
-    weatherDebugScene = cycleWeatherScene(weatherDebugScene, 1);
-    refreshWeatherScreen();
-    noteActivity();
-    return;
-  }
-
-  if (deltaX >= kWeatherSwipeMinDistancePx) {
-    weatherDebugOverrideEnabled = true;
-    weatherDebugScene = cycleWeatherScene(weatherDebugScene, -1);
-    refreshWeatherScreen();
     noteActivity();
   }
 }
@@ -707,6 +463,18 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         touchTapTracking = false;
       }
     } else if (pressedNow && !touchGestureConsumed &&
+               static_cast<ScreenId>(currentScreenIndex) == ScreenId::Qr) {
+      int deltaX = touchLastX - touchTapStartX;
+      int deltaY = touchLastY - touchTapStartY;
+      int absDx = abs(deltaX);
+      int absDy = abs(deltaY);
+      if (absDy >= kQrSwipeMinDistancePx &&
+          absDy >= (absDx + kQrSwipeMinDominancePx)) {
+        handleQrSwipe(deltaY);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      }
+    } else if (pressedNow && !touchGestureConsumed &&
                isWeatherStackScreen(static_cast<ScreenId>(currentScreenIndex))) {
       int deltaX = touchLastX - touchTapStartX;
       int deltaY = touchLastY - touchTapStartY;
@@ -752,6 +520,10 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
                  absDy >= kMotionSwipeMinDistancePx &&
                  absDy >= (absDx + kMotionSwipeMinDominancePx)) {
         handleMotionSwipe(deltaY);
+      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Qr &&
+                 absDy >= kQrSwipeMinDistancePx &&
+                 absDy >= (absDx + kQrSwipeMinDominancePx)) {
+        handleQrSwipe(deltaY);
       } else if (isWeatherStackScreen(static_cast<ScreenId>(currentScreenIndex)) &&
                  absDy >= kWeatherNavSwipeMinDistancePx &&
                  absDy >= (absDx + kWeatherNavSwipeMinDominancePx)) {
@@ -803,53 +575,6 @@ bool initTouch()
   return true;
 }
 
-const char *sdCardTypeLabel(uint8_t cardType)
-{
-  switch (cardType) {
-    case CARD_MMC:
-      return "MMC";
-    case CARD_SD:
-      return "SDSC";
-    case CARD_SDHC:
-      return "SDHC";
-    default:
-      return "UNKNOWN";
-  }
-}
-
-void ensureSdDirectories()
-{
-  for (const char *dir : kSdStartupDirs) {
-    String fullPath = String(kSdMountPath) + dir;
-    if (!SD_MMC.exists(fullPath.c_str()) && !SD_MMC.mkdir(fullPath.c_str())) {
-      Serial.printf("Failed to create SD directory: %s\n", fullPath.c_str());
-    }
-  }
-}
-
-void initSdCard()
-{
-  SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_DATA);
-  if (!SD_MMC.begin(kSdMountPath, true)) {
-    Serial.println("SD card not mounted");
-    return;
-  }
-
-  uint8_t cardType = SD_MMC.cardType();
-  if (cardType == CARD_NONE) {
-    Serial.println("No SD card detected");
-    SD_MMC.end();
-    return;
-  }
-
-  sdMounted = true;
-  sdCardType = cardType;
-  sdCardSizeMb = SD_MMC.cardSize() / (1024 * 1024);
-  ensureSdDirectories();
-
-  Serial.printf("SD mounted: %s, %llu MB\n", sdCardTypeLabel(sdCardType), sdCardSizeMb);
-}
-
 void initExpander()
 {
   expanderReady = false;
@@ -873,6 +598,7 @@ void initExpander()
   expander.pinMode(1, OUTPUT);
   expander.pinMode(2, OUTPUT);
   expander.pinMode(6, OUTPUT);
+  expander.pinMode(7, OUTPUT);
   expander.digitalWrite(0, LOW);
   expander.digitalWrite(1, LOW);
   expander.digitalWrite(2, LOW);
@@ -882,6 +608,8 @@ void initExpander()
   expander.digitalWrite(1, HIGH);
   expander.digitalWrite(2, HIGH);
   expander.digitalWrite(6, HIGH);
+  expander.digitalWrite(7, HIGH);
+  delay(20);
   sideButtonPressed = expander.digitalRead(TOP_BUTTON_PIN) == HIGH;
   sideButtonReleaseArmed = false;
   sideButtonPressedAtMs = millis();
@@ -934,41 +662,6 @@ bool setSystemTimeFromTm(const struct tm &timeInfo)
       .tv_usec = 0,
   };
   return settimeofday(&tv, nullptr) == 0;
-}
-
-void loadTimeFromRtc()
-{
-  if (!rtcReady) {
-    return;
-  }
-
-  struct tm rtcTime = {};
-  rtc.getDateTime(&rtcTime);
-  if (!rtcTimeLooksValid(rtcTime)) {
-    Serial.println("RTC time is not valid yet");
-    return;
-  }
-
-  if (setSystemTimeFromTm(rtcTime)) {
-    Serial.printf("Loaded time from RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
-                  rtcTime.tm_year + 1900,
-                  rtcTime.tm_mon + 1,
-                  rtcTime.tm_mday,
-                  rtcTime.tm_hour,
-                  rtcTime.tm_min,
-                  rtcTime.tm_sec);
-  }
-}
-
-void initRtc()
-{
-  rtcReady = rtc.begin(Wire, IIC_SDA, IIC_SCL);
-  if (!rtcReady) {
-    Serial.println("RTC not found");
-    return;
-  }
-
-  loadTimeFromRtc();
 }
 
 size_t countConfiguredNetworks()
@@ -1122,38 +815,128 @@ void persistTimeToRtc()
   lastRtcWriteEpoch = now;
 }
 
-bool networkIsOnline()
+float degreesToRadians(float degrees)
 {
-  return connectivityState == ConnectivityState::Online && WiFi.status() == WL_CONNECTED;
+  return degrees * (PI / 180.0f);
 }
 
-String weatherApiUrl()
+float radiansToDegrees(float radians)
 {
-  char url[768];
-  snprintf(url,
-           sizeof(url),
-           "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-           "&current=temperature_2m,apparent_temperature,is_day,weather_code,wind_speed_10m,cloud_cover"
-           "&hourly=time,temperature_2m,precipitation_probability,weather_code,is_day"
-           "&daily=time,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max,weather_code"
-           "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto&forecast_days=10&forecast_hours=24",
-           WEATHER_LATITUDE,
-           WEATHER_LONGITUDE);
-  return String(url);
+  return radians * (180.0f / PI);
 }
 
-String weatherUpdatedLabel()
+float normalizeDegrees(float degrees)
 {
-  if (!hasValidTime()) {
-    return "Updated just now";
+  while (degrees < 0.0f) {
+    degrees += 360.0f;
+  }
+  while (degrees >= 360.0f) {
+    degrees -= 360.0f;
+  }
+  return degrees;
+}
+
+double julianDateFromUnix(time_t unixTime)
+{
+  return (static_cast<double>(unixTime) / 86400.0) + 2440587.5;
+}
+
+double localSiderealTimeDegrees(time_t unixTime, float longitudeDegrees)
+{
+  double jd = julianDateFromUnix(unixTime);
+  double t = (jd - 2451545.0) / 36525.0;
+  double gmst = 280.46061837 +
+                (360.98564736629 * (jd - 2451545.0)) +
+                (0.000387933 * t * t) -
+                (t * t * t / 38710000.0);
+  return normalizeDegrees(static_cast<float>(gmst + longitudeDegrees));
+}
+
+bool equatorialToHorizontal(float raHours,
+                            float decDegrees,
+                            float latitudeDegrees,
+                            float longitudeDegrees,
+                            time_t unixTime,
+                            float &altitudeDegrees,
+                            float &azimuthDegrees)
+{
+  double raDegrees = static_cast<double>(raHours) * 15.0;
+  double decRadians = degreesToRadians(decDegrees);
+  double latRadians = degreesToRadians(latitudeDegrees);
+  double hourAngleDegrees = localSiderealTimeDegrees(unixTime, longitudeDegrees) - raDegrees;
+  while (hourAngleDegrees < -180.0) {
+    hourAngleDegrees += 360.0;
+  }
+  while (hourAngleDegrees > 180.0) {
+    hourAngleDegrees -= 360.0;
   }
 
-  char buffer[24];
-  struct tm localTime = {};
-  time_t now = time(nullptr);
-  localtime_r(&now, &localTime);
-  strftime(buffer, sizeof(buffer), "Updated %H:%M", &localTime);
-  return String(buffer);
+  double hourAngleRadians = degreesToRadians(static_cast<float>(hourAngleDegrees));
+  double sinAltitude = (sin(decRadians) * sin(latRadians)) +
+                       (cos(decRadians) * cos(latRadians) * cos(hourAngleRadians));
+  sinAltitude = fmax(-1.0, fmin(1.0, sinAltitude));
+  double altitudeRadians = asin(sinAltitude);
+  double cosAltitude = cos(altitudeRadians);
+
+  if (fabs(cosAltitude) < 0.000001) {
+    altitudeDegrees = 90.0f;
+    azimuthDegrees = 0.0f;
+    return true;
+  }
+
+  double cosAzimuth = (sin(decRadians) - (sin(altitudeRadians) * sin(latRadians))) /
+                      (cosAltitude * cos(latRadians));
+  cosAzimuth = fmax(-1.0, fmin(1.0, cosAzimuth));
+  double azimuthRadians = acos(cosAzimuth);
+  if (sin(hourAngleRadians) > 0.0) {
+    azimuthRadians = (2.0 * PI) - azimuthRadians;
+  }
+
+  altitudeDegrees = radiansToDegrees(static_cast<float>(altitudeRadians));
+  azimuthDegrees = radiansToDegrees(static_cast<float>(azimuthRadians));
+  return true;
+}
+
+float compressedOrbitRadius(float distanceAu)
+{
+  return sqrtf(fmaxf(distanceAu, 0.0f));
+}
+
+bool parseHorizonsVectorRow(const String &result, float &xAu, float &yAu, float &zAu)
+{
+  int startIndex = result.indexOf("$$SOE");
+  if (startIndex < 0) {
+    return false;
+  }
+
+  startIndex = result.indexOf('\n', startIndex);
+  if (startIndex < 0) {
+    return false;
+  }
+  ++startIndex;
+
+  int endIndex = result.indexOf('\n', startIndex);
+  if (endIndex < 0) {
+    return false;
+  }
+
+  String row = result.substring(startIndex, endIndex);
+  row.trim();
+  if (row.length() == 0) {
+    return false;
+  }
+
+  float parsedX = 0.0f;
+  float parsedY = 0.0f;
+  float parsedZ = 0.0f;
+  if (sscanf(row.c_str(), " %*[^,], %*[^,], %f, %f, %f", &parsedX, &parsedY, &parsedZ) != 3) {
+    return false;
+  }
+
+  xAu = parsedX;
+  yAu = parsedY;
+  zAu = parsedZ;
+  return true;
 }
 
 void setOfflineMode(const char *reason)
@@ -1167,14 +950,19 @@ void setOfflineMode(const char *reason)
   otaReady = false;
   ntpConfigured = false;
 
-  if (weatherState.hasData) {
-    weatherState.stale = true;
-    weatherState.updated = "Offline - cached weather";
-  } else {
-    setWeatherUnavailableState("Offline - no cached weather");
-  }
+  weatherModuleMarkOffline();
 
   Serial.printf("Offline mode: %s\n", reason);
+}
+
+bool otaUpdateInProgress()
+{
+  return otaInProgress;
+}
+
+bool lightSleepActive()
+{
+  return inLightSleep;
 }
 
 void beginWifiAttempt(size_t credentialIndex)
@@ -1413,7 +1201,7 @@ void updateWiFi()
     if (connectivityState != ConnectivityState::Online) {
       connectivityState = ConnectivityState::Online;
       wifiAttemptInProgress = false;
-      nextWeatherRefreshAtMs = millis() + 1000;
+      weatherModuleScheduleRefreshIn(1000);
       Serial.printf("Wi-Fi connected to \"%s\": %s\n",
                     WiFi.SSID().c_str(),
                     WiFi.localIP().toString().c_str());
@@ -1456,153 +1244,6 @@ void updateWiFi()
   beginNextWifiCycle();
 }
 
-bool fetchWeather()
-{
-  if (!networkIsOnline()) {
-    return false;
-  }
-
-  weatherFetchInProgress = true;
-  Serial.println("Fetching weather...");
-
-  WiFiClientSecure secureClient;
-  secureClient.setInsecure();
-
-  HTTPClient http;
-  http.setConnectTimeout(kWeatherFetchTimeoutMs);
-  http.setTimeout(kWeatherFetchTimeoutMs);
-
-  bool success = false;
-  if (http.begin(secureClient, weatherApiUrl())) {
-    int statusCode = http.GET();
-    if (statusCode == HTTP_CODE_OK) {
-      DynamicJsonDocument doc(24576);
-      DeserializationError error = deserializeJson(doc, http.getString());
-      if (!error) {
-        JsonObject current = doc["current"];
-        JsonObject hourly = doc["hourly"];
-        JsonObject daily = doc["daily"];
-
-        JsonArray hourlyTimes = hourly["time"].as<JsonArray>();
-        JsonArray hourlyTemps = hourly["temperature_2m"].as<JsonArray>();
-        JsonArray hourlyPrecip = hourly["precipitation_probability"].as<JsonArray>();
-        JsonArray hourlyCodes = hourly["weather_code"].as<JsonArray>();
-        JsonArray hourlyIsDay = hourly["is_day"].as<JsonArray>();
-
-        JsonArray dayArray = daily["time"].as<JsonArray>();
-        JsonArray highArray = daily["temperature_2m_max"].as<JsonArray>();
-        JsonArray lowArray = daily["temperature_2m_min"].as<JsonArray>();
-        JsonArray sunriseArray = daily["sunrise"].as<JsonArray>();
-        JsonArray sunsetArray = daily["sunset"].as<JsonArray>();
-        JsonArray precipitationArray = daily["precipitation_probability_max"].as<JsonArray>();
-        JsonArray dailyCodes = daily["weather_code"].as<JsonArray>();
-
-        float temperature = current["temperature_2m"].as<float>();
-        float feelsLike = current["apparent_temperature"].as<float>();
-        float wind = current["wind_speed_10m"].as<float>();
-        float high = !highArray.isNull() && highArray.size() > 0 ? highArray[0].as<float>() : temperature;
-        float low = !lowArray.isNull() && lowArray.size() > 0 ? lowArray[0].as<float>() : temperature;
-
-        weatherState.hasData = true;
-        weatherState.stale = false;
-        weatherState.isDay = (current["is_day"] | 1) == 1;
-        weatherState.weatherCode = current["weather_code"] | -1;
-        weatherState.temperatureF = static_cast<int>(roundf(temperature));
-        weatherState.feelsLikeF = static_cast<int>(roundf(feelsLike));
-        weatherState.highF = static_cast<int>(roundf(high));
-        weatherState.lowF = static_cast<int>(roundf(low));
-        weatherState.windMph = static_cast<int>(roundf(wind));
-        weatherState.precipitationPercent =
-            !precipitationArray.isNull() && precipitationArray.size() > 0 ? precipitationArray[0].as<int>() : 0;
-        weatherState.cloudCoverPercent = current["cloud_cover"] | 0;
-        weatherState.condition = weatherConditionFromCode(weatherState.weatherCode, weatherState.isDay);
-        weatherState.updated = weatherUpdatedLabel();
-        weatherState.sunrise =
-            !sunriseArray.isNull() && sunriseArray.size() > 0 ? weatherTimeFragment(sunriseArray[0].as<const char *>()) : "--:--";
-        weatherState.sunset =
-            !sunsetArray.isNull() && sunsetArray.size() > 0 ? weatherTimeFragment(sunsetArray[0].as<const char *>()) : "--:--";
-        weatherState.location = WEATHER_LOCATION_LABEL;
-
-        for (size_t i = 0; i < kHourlyForecastCount; ++i) {
-          weatherState.hourly[i] = {};
-          if (hourlyTimes.isNull() || hourlyTemps.isNull() || i >= hourlyTimes.size() || i >= hourlyTemps.size()) {
-            continue;
-          }
-
-          weatherState.hourly[i].valid = true;
-          weatherState.hourly[i].hour = weatherHourFragment(hourlyTimes[i].as<const char *>());
-          weatherState.hourly[i].temperatureF = static_cast<int>(roundf(hourlyTemps[i].as<float>()));
-          weatherState.hourly[i].precipitationPercent =
-              !hourlyPrecip.isNull() && i < hourlyPrecip.size() ? hourlyPrecip[i].as<int>() : 0;
-          weatherState.hourly[i].weatherCode =
-              !hourlyCodes.isNull() && i < hourlyCodes.size() ? (hourlyCodes[i] | -1) : -1;
-          weatherState.hourly[i].isDay =
-              !hourlyIsDay.isNull() && i < hourlyIsDay.size() ? ((hourlyIsDay[i] | 1) == 1) : true;
-        }
-
-        for (size_t i = 0; i < kDailyForecastCount; ++i) {
-          weatherState.daily[i] = {};
-          if (dayArray.isNull() || highArray.isNull() || lowArray.isNull() ||
-              i >= dayArray.size() || i >= highArray.size() || i >= lowArray.size()) {
-            continue;
-          }
-
-          weatherState.daily[i].valid = true;
-          weatherState.daily[i].day = weatherDayFragment(dayArray[i].as<const char *>());
-          weatherState.daily[i].highF = static_cast<int>(roundf(highArray[i].as<float>()));
-          weatherState.daily[i].lowF = static_cast<int>(roundf(lowArray[i].as<float>()));
-          weatherState.daily[i].precipitationPercent =
-              !precipitationArray.isNull() && i < precipitationArray.size() ? precipitationArray[i].as<int>() : 0;
-          weatherState.daily[i].weatherCode =
-              !dailyCodes.isNull() && i < dailyCodes.size() ? (dailyCodes[i] | -1) : -1;
-        }
-
-        saveWeatherCache();
-        nextWeatherRefreshAtMs = millis() + kWeatherRefreshIntervalMs;
-        success = true;
-      } else {
-        Serial.printf("Weather JSON parse failed: %s\n", error.c_str());
-      }
-    } else {
-      Serial.printf("Weather request failed: HTTP %d\n", statusCode);
-    }
-    http.end();
-  } else {
-    Serial.println("Weather request setup failed");
-  }
-
-  if (!success) {
-    if (weatherState.hasData) {
-      weatherState.stale = true;
-      weatherState.updated = "Offline - cached weather";
-    } else {
-      setWeatherUnavailableState(networkIsOnline() ? "Retrying shortly" : "Waiting for Wi-Fi");
-    }
-    nextWeatherRefreshAtMs = millis() + kWeatherRetryIntervalMs;
-  }
-
-  weatherFetchInProgress = false;
-  return success;
-}
-
-void updateWeather()
-{
-  if (!networkIsOnline()) {
-    if (weatherState.hasData && !weatherState.stale) {
-      weatherState.stale = true;
-      weatherState.updated = "Offline - cached weather";
-    }
-    return;
-  }
-
-  if (!kWeatherFetchEnabled || weatherFetchInProgress || otaInProgress || inLightSleep) {
-    return;
-  }
-
-  if (static_cast<int32_t>(millis() - nextWeatherRefreshAtMs) >= 0) {
-    fetchWeather();
-  }
-}
 
 Vec3 vec3(float x, float y, float z)
 {
@@ -1954,8 +1595,8 @@ void restoreFromLightSleep()
   }
 
   if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Weather) {
-    weatherDebugOverrideEnabled = false;
-    refreshWeatherScreen();
+    weatherModuleClearDebugOverride();
+    weatherModuleRefreshUi();
   }
 
   lv_obj_invalidate(lv_screen_active());
@@ -1990,7 +1631,7 @@ void enterLightSleep()
 
 void updateIdleState()
 {
-  if (otaInProgress || inLightSleep) {
+  if (otaInProgress || inLightSleep || audioRecordingActive || audioPlaybackActive) {
     return;
   }
 
@@ -2121,48 +1762,45 @@ void enableTapBubbling(lv_obj_t *obj)
   lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE);
 }
 
-void showScreen(size_t index)
+bool showScreen(size_t index)
 {
   if (index >= kScreenCount) {
-    return;
+    return false;
   }
 
-  if (static_cast<ScreenId>(index) == ScreenId::Calculator && !screenRoots[index]) {
-    buildCalculatorScreenRoot();
-    refreshCalculatorScreen();
+  ScreenId nextScreen = static_cast<ScreenId>(index);
+  ScreenId previousScreen = static_cast<ScreenId>(currentScreenIndex);
+  if (previousScreen != nextScreen) {
+    screenManagerLeave(previousScreen);
   }
 
-  if (!screenRoots[index]) {
-    return;
+  if (!screenManagerEnsureBuilt(nextScreen)) {
+    screenManagerShowFallback(nextScreen, screenManagerFailureReason(nextScreen));
+    lv_refr_now(display);
+    return false;
   }
 
+  size_t previousScreenIndex = currentScreenIndex;
   currentScreenIndex = index;
-  saveUiState();
-  lv_screen_load(screenRoots[index]);
+  lv_screen_load(screenManagerRoot(nextScreen));
   lv_refr_now(display);
 
-  if (static_cast<ScreenId>(index) == ScreenId::Motion) {
-    renderedMotionViewMode = MotionViewMode::Count;
-    renderedMotionTransitionDirection = 0;
-    captureMotionReference();
-    centerMotionDot();
-  } else if (static_cast<ScreenId>(index) == ScreenId::Weather) {
-    weatherDebugOverrideEnabled = false;
-    if (kWeatherFetchEnabled && networkIsOnline() && !weatherFetchInProgress && !otaInProgress && !inLightSleep) {
-      fetchWeather();
-    }
-    refreshWeatherScreen();
-  }
+  screenManagerEnter(nextScreen);
+  scheduleScreenRefresh(nextScreen);
+  pendingScreenPreferenceIndex = currentScreenIndex;
+  screenPreferenceSavePending = true;
+  (void)previousScreenIndex;
+  return true;
 }
 
 void showNextScreen()
 {
-  showScreen((currentScreenIndex + 1) % kScreenCount);
+  showScreen(screenManagerNextEnabledIndex(currentScreenIndex));
 }
 
 void showPreviousScreen()
 {
-  showScreen((currentScreenIndex + kScreenCount - 1) % kScreenCount);
+  showScreen(screenManagerPreviousEnabledIndex(currentScreenIndex));
 }
 
 void updateTopButton()
@@ -2228,1068 +1866,6 @@ void updatePowerKey()
   power.clearIrqStatus();
 }
 
-void buildWatchfaceScreen()
-{
-  lv_obj_t *screen = lv_obj_create(nullptr);
-  applyRootStyle(screen);
-  lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
-
-  lv_obj_t *iconRow = lv_obj_create(screen);
-  applyRootStyle(iconRow);
-  lv_obj_set_size(iconRow, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-  lv_obj_set_layout(iconRow, LV_LAYOUT_FLEX);
-  lv_obj_set_flex_flow(iconRow, LV_FLEX_FLOW_ROW);
-  lv_obj_set_style_pad_column(iconRow, 14, 0);
-  lv_obj_align(iconRow, LV_ALIGN_TOP_RIGHT, -20, 18);
-
-  watchBluetoothIcon = lv_label_create(iconRow);
-  lv_obj_set_style_text_font(watchBluetoothIcon, &lv_font_montserrat_20, 0);
-  lv_label_set_text(watchBluetoothIcon, LV_SYMBOL_BLUETOOTH);
-
-  watchWifiIcon = lv_label_create(iconRow);
-  lv_obj_set_style_text_font(watchWifiIcon, &lv_font_montserrat_20, 0);
-  lv_label_set_text(watchWifiIcon, LV_SYMBOL_WIFI);
-
-  watchUsbIcon = lv_label_create(iconRow);
-  lv_obj_set_style_text_font(watchUsbIcon, &lv_font_montserrat_20, 0);
-  lv_label_set_text(watchUsbIcon, LV_SYMBOL_CHARGE);
-
-  watchBatteryTrack = lv_obj_create(screen);
-  lv_obj_set_size(watchBatteryTrack, kBatteryTrackWidth, kBatteryTrackHeight);
-  lv_obj_align(watchBatteryTrack, LV_ALIGN_TOP_MID, 0, kBatteryTrackY);
-  lv_obj_set_style_radius(watchBatteryTrack, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(watchBatteryTrack, lvColor(24, 30, 36), 0);
-  lv_obj_set_style_border_width(watchBatteryTrack, 1, 0);
-  lv_obj_set_style_border_color(watchBatteryTrack, lvColor(46, 54, 64), 0);
-  lv_obj_set_style_pad_all(watchBatteryTrack, 0, 0);
-
-  watchBatteryFill = lv_obj_create(watchBatteryTrack);
-  lv_obj_set_size(watchBatteryFill, kBatteryTrackWidth, kBatteryTrackHeight);
-  lv_obj_set_style_radius(watchBatteryFill, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_border_width(watchBatteryFill, 0, 0);
-  lv_obj_set_style_pad_all(watchBatteryFill, 0, 0);
-  lv_obj_align(watchBatteryFill, LV_ALIGN_LEFT_MID, 0, 0);
-
-  watchTimeLabel = lv_label_create(screen);
-  lv_obj_set_width(watchTimeLabel, LCD_WIDTH - 24);
-  lv_obj_set_style_text_font(watchTimeLabel, &lv_font_montserrat_48, 0);
-  lv_obj_set_style_text_color(watchTimeLabel, lvColor(255, 255, 255), 0);
-  lv_obj_set_style_text_align(watchTimeLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(watchTimeLabel, "--:--");
-  lv_obj_align(watchTimeLabel, LV_ALIGN_TOP_MID, 0, kWatchTimeY);
-
-  watchDateLabel = lv_label_create(screen);
-  lv_obj_set_width(watchDateLabel, LCD_WIDTH - 36);
-  lv_obj_set_style_text_font(watchDateLabel, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(watchDateLabel, lvColor(255, 255, 255), 0);
-  lv_obj_set_style_text_align(watchDateLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(watchDateLabel, "Waiting for RTC or Wi-Fi");
-  lv_obj_align(watchDateLabel, LV_ALIGN_TOP_MID, 0, kWatchDateY);
-
-  watchTimezoneLabel = lv_label_create(screen);
-  lv_obj_set_width(watchTimezoneLabel, LCD_WIDTH - 36);
-  lv_obj_set_style_text_font(watchTimezoneLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(watchTimezoneLabel, lvColor(148, 156, 168), 0);
-  lv_obj_set_style_text_align(watchTimezoneLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(watchTimezoneLabel, "TIME UNAVAILABLE");
-  lv_obj_align(watchTimezoneLabel, LV_ALIGN_TOP_MID, 0, kWatchTimezoneY);
-
-  watchStatusLabel = lv_label_create(screen);
-  lv_obj_set_style_text_font(watchStatusLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(watchStatusLabel, lvColor(112, 124, 140), 0);
-  lv_obj_set_width(watchStatusLabel, LCD_WIDTH - 64);
-  lv_obj_set_style_text_align(watchStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_long_mode(watchStatusLabel, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(watchStatusLabel, "Buttons cycle screens");
-  lv_obj_align(watchStatusLabel, LV_ALIGN_BOTTOM_MID, 0, -28);
-
-  screenRoots[static_cast<size_t>(ScreenId::Watchface)] = screen;
-  watchfaceBuilt = true;
-}
-
-void buildMotionScreen()
-{
-  lv_obj_t *screen = lv_obj_create(nullptr);
-  applyRootStyle(screen);
-  motionScreen = screen;
-
-  motionDotView = lv_obj_create(screen);
-  applyRootStyle(motionDotView);
-  lv_obj_set_size(motionDotView, LCD_WIDTH, LCD_HEIGHT);
-  enableTapBubbling(motionDotView);
-
-  motionDotBoundary = lv_obj_create(motionDotView);
-  lv_obj_set_size(motionDotBoundary, LCD_WIDTH - 24, LCD_WIDTH - 24);
-  lv_obj_align(motionDotBoundary, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_radius(motionDotBoundary, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(motionDotBoundary, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(motionDotBoundary, 2, 0);
-  lv_obj_set_style_border_color(motionDotBoundary, lvColor(52, 58, 66), 0);
-
-  motionDotCrossH = lv_obj_create(motionDotView);
-  lv_obj_set_size(motionDotCrossH, LCD_WIDTH - 48, 2);
-  lv_obj_align(motionDotCrossH, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_bg_color(motionDotCrossH, lvColor(38, 44, 52), 0);
-  lv_obj_set_style_border_width(motionDotCrossH, 0, 0);
-
-  motionDotCrossV = lv_obj_create(motionDotView);
-  lv_obj_set_size(motionDotCrossV, 2, LCD_WIDTH - 48);
-  lv_obj_align(motionDotCrossV, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_bg_color(motionDotCrossV, lvColor(38, 44, 52), 0);
-  lv_obj_set_style_border_width(motionDotCrossV, 0, 0);
-
-  motionDot = lv_obj_create(motionDotView);
-  lv_obj_set_size(motionDot, kDotDiameter, kDotDiameter);
-  lv_obj_set_style_radius(motionDot, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(motionDot, lvColor(255, 255, 255), 0);
-  lv_obj_set_style_border_width(motionDot, 3, 0);
-  lv_obj_set_style_border_color(motionDot, lvColor(0, 0, 0), 0);
-  lv_obj_align(motionDot, LV_ALIGN_CENTER, 0, 0);
-
-  motionCubeView = lv_obj_create(screen);
-  applyRootStyle(motionCubeView);
-  lv_obj_set_size(motionCubeView, LCD_WIDTH, LCD_HEIGHT);
-  enableTapBubbling(motionCubeView);
-
-  for (size_t i = 0; i < kCubeEdgeCount; ++i) {
-    motionCubeEdges[i] = lv_line_create(motionCubeView);
-    lv_obj_set_size(motionCubeEdges[i], LCD_WIDTH, LCD_HEIGHT);
-    styleLine(motionCubeEdges[i], lvColor(88, 96, 110), 2);
-    lv_line_set_points(motionCubeEdges[i], motionCubeEdgePoints[i], 2);
-  }
-
-  lv_color_t arrowColors[kCubeArrowCount] = {
-      lvColor(46, 142, 255),
-      lvColor(255, 255, 255),
-      lvColor(140, 154, 176),
-  };
-  for (size_t i = 0; i < kCubeArrowLineCount; ++i) {
-    motionCubeArrows[i] = lv_line_create(motionCubeView);
-    lv_obj_set_size(motionCubeArrows[i], LCD_WIDTH, LCD_HEIGHT);
-    styleLine(motionCubeArrows[i], arrowColors[i / kCubeArrowSegmentCount], 3);
-    lv_line_set_points(motionCubeArrows[i], motionCubeArrowPoints[i], 2);
-  }
-
-  motionRawView = lv_obj_create(screen);
-  applyRootStyle(motionRawView);
-  lv_obj_set_size(motionRawView, LCD_WIDTH, LCD_HEIGHT);
-  enableTapBubbling(motionRawView);
-
-  motionRawCard = lv_obj_create(motionRawView);
-  lv_obj_set_size(motionRawCard, LCD_WIDTH - 36, LCD_HEIGHT - 68);
-  lv_obj_align(motionRawCard, LV_ALIGN_CENTER, 0, 6);
-  lv_obj_set_style_radius(motionRawCard, 26, 0);
-  lv_obj_set_style_bg_color(motionRawCard, lvColor(10, 14, 20), 0);
-  lv_obj_set_style_bg_opa(motionRawCard, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(motionRawCard, 1, 0);
-  lv_obj_set_style_border_color(motionRawCard, lvColor(28, 36, 48), 0);
-  lv_obj_set_style_outline_width(motionRawCard, 0, 0);
-  lv_obj_set_style_pad_all(motionRawCard, 0, 0);
-  lv_obj_clear_flag(motionRawCard, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(motionRawCard, LV_SCROLLBAR_MODE_OFF);
-
-  motionRawOrientation = lv_label_create(motionRawCard);
-  lv_obj_set_width(motionRawOrientation, LCD_WIDTH - 76);
-  lv_obj_set_style_text_font(motionRawOrientation, &lv_font_montserrat_36, 0);
-  lv_obj_set_style_text_color(motionRawOrientation, lvColor(250, 252, 255), 0);
-  lv_obj_set_style_text_align(motionRawOrientation, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(motionRawOrientation, "Unavailable");
-  lv_obj_align(motionRawOrientation, LV_ALIGN_TOP_MID, 0, 26);
-
-  motionRawPitchCaption = lv_label_create(motionRawCard);
-  lv_obj_set_style_text_font(motionRawPitchCaption, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(motionRawPitchCaption, lvColor(110, 126, 146), 0);
-  lv_label_set_text(motionRawPitchCaption, "PITCH");
-  lv_obj_align(motionRawPitchCaption, LV_ALIGN_TOP_LEFT, 28, 96);
-
-  motionRawRollCaption = lv_label_create(motionRawCard);
-  lv_obj_set_style_text_font(motionRawRollCaption, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(motionRawRollCaption, lvColor(110, 126, 146), 0);
-  lv_label_set_text(motionRawRollCaption, "ROLL");
-  lv_obj_align(motionRawRollCaption, LV_ALIGN_TOP_RIGHT, -28, 96);
-
-  motionRawPitch = lv_label_create(motionRawCard);
-  lv_obj_set_width(motionRawPitch, 112);
-  lv_obj_set_style_text_font(motionRawPitch, &lv_font_montserrat_28, 0);
-  lv_obj_set_style_text_color(motionRawPitch, lvColor(148, 214, 255), 0);
-  lv_obj_set_style_text_align(motionRawPitch, LV_TEXT_ALIGN_LEFT, 0);
-  lv_label_set_text(motionRawPitch, "--.-");
-  lv_obj_align_to(motionRawPitch, motionRawPitchCaption, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
-
-  motionRawRoll = lv_label_create(motionRawCard);
-  lv_obj_set_width(motionRawRoll, 112);
-  lv_obj_set_style_text_font(motionRawRoll, &lv_font_montserrat_28, 0);
-  lv_obj_set_style_text_color(motionRawRoll, lvColor(244, 246, 250), 0);
-  lv_obj_set_style_text_align(motionRawRoll, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_label_set_text(motionRawRoll, "--.-");
-  lv_obj_align_to(motionRawRoll, motionRawRollCaption, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 6);
-
-  motionRawAccelCaption = lv_label_create(motionRawCard);
-  lv_obj_set_style_text_font(motionRawAccelCaption, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(motionRawAccelCaption, lvColor(110, 126, 146), 0);
-  lv_label_set_text(motionRawAccelCaption, "ACCELEROMETER");
-  lv_obj_align(motionRawAccelCaption, LV_ALIGN_TOP_LEFT, 28, 176);
-
-  motionRawAccel = lv_label_create(motionRawCard);
-  lv_obj_set_width(motionRawAccel, 124);
-  lv_obj_set_style_text_font(motionRawAccel, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(motionRawAccel, lvColor(214, 220, 230), 0);
-  lv_obj_set_style_text_line_space(motionRawAccel, 8, 0);
-  lv_obj_set_style_text_align(motionRawAccel, LV_TEXT_ALIGN_LEFT, 0);
-  lv_label_set_long_mode(motionRawAccel, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(motionRawAccel, "X  --.-\nY  --.-\nZ  --.-");
-  lv_obj_align_to(motionRawAccel, motionRawAccelCaption, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
-
-  motionRawGyroCaption = lv_label_create(motionRawCard);
-  lv_obj_set_style_text_font(motionRawGyroCaption, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(motionRawGyroCaption, lvColor(110, 126, 146), 0);
-  lv_label_set_text(motionRawGyroCaption, "GYROSCOPE");
-  lv_obj_align(motionRawGyroCaption, LV_ALIGN_TOP_RIGHT, -28, 176);
-
-  motionRawGyro = lv_label_create(motionRawCard);
-  lv_obj_set_width(motionRawGyro, 124);
-  lv_obj_set_style_text_font(motionRawGyro, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(motionRawGyro, lvColor(160, 194, 255), 0);
-  lv_obj_set_style_text_line_space(motionRawGyro, 8, 0);
-  lv_obj_set_style_text_align(motionRawGyro, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_label_set_long_mode(motionRawGyro, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(motionRawGyro, "X  ---\nY  ---\nZ  ---");
-  lv_obj_align_to(motionRawGyro, motionRawGyroCaption, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 10);
-
-  motionTapOverlay = lv_obj_create(screen);
-  lv_obj_set_size(motionTapOverlay, LCD_WIDTH, LCD_HEIGHT);
-  lv_obj_set_style_bg_opa(motionTapOverlay, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(motionTapOverlay, 0, 0);
-  lv_obj_set_style_outline_width(motionTapOverlay, 0, 0);
-  lv_obj_set_style_pad_all(motionTapOverlay, 0, 0);
-  lv_obj_clear_flag(motionTapOverlay, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_move_foreground(motionTapOverlay);
-
-  screenRoots[static_cast<size_t>(ScreenId::Motion)] = screen;
-  motionBuilt = true;
-}
-
-void setCalculatorText(char *buffer, size_t capacity, const char *text)
-{
-  if (capacity == 0) {
-    return;
-  }
-
-  snprintf(buffer, capacity, "%s", text ? text : "");
-}
-
-constexpr size_t kCalculatorButtonCount = 20;
-
-constexpr const char *kCalculatorBasicLabels[kCalculatorButtonCount] = {
-    "fn", "+/-", "%", "/",
-    "7",  "8",   "9", "x",
-    "4",  "5",   "6", "-",
-    "1",  "2",   "3", "+",
-    "BS", "0",   ".", "=",
-};
-
-constexpr const char *kCalculatorFunctionSetLabels[kCalculatorButtonCount] = {
-    "123", "sin",  "cos", "/",
-    "tan", "sqrt", "sq",  "x",
-    "1/x", "ln",   "log", "-",
-    "n!",  "pi",   "e",   "+",
-    "BS",  "rand", ".",   "=",
-};
-
-constexpr const char *kCalculatorSupportedFunctionLabels[] = {
-    "sqrt",
-    "sq",
-    "1/x",
-    "sin",
-    "cos",
-    "tan",
-    "ln",
-    "log",
-    "pi",
-    "e",
-    "n!",
-    "rand",
-};
-
-bool isCalculatorFunctionLabel(const char *labelText)
-{
-  if (!labelText) {
-    return false;
-  }
-
-  for (const char *functionLabel : kCalculatorSupportedFunctionLabels) {
-    if (strcmp(labelText, functionLabel) == 0) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-void formatCalculatorValue(double value, char *buffer, size_t capacity)
-{
-  if (!isfinite(value)) {
-    setCalculatorText(buffer, capacity, "Error");
-    return;
-  }
-
-  if (fabs(value) < 0.0000001) {
-    value = 0.0;
-  }
-
-  snprintf(buffer, capacity, "%.10g", value);
-}
-
-void updateCalculatorDisplayFont()
-{
-  if (!calculatorUi.displayLabel) {
-    return;
-  }
-
-  const size_t length = strlen(calculatorUi.currentText);
-  const lv_font_t *font = &lv_font_montserrat_36;
-  if (length > 12) {
-    font = &lv_font_montserrat_24;
-  } else if (length > 9) {
-    font = &lv_font_montserrat_28;
-  }
-  lv_obj_set_style_text_font(calculatorUi.displayLabel, font, 0);
-}
-
-void refreshCalculatorScreen()
-{
-  if (!calculatorUi.screen || !calculatorUi.historyLabel || !calculatorUi.displayLabel) {
-    return;
-  }
-
-  bool hasHistory = calculatorUi.historyText[0] != '\0';
-  if (hasHistory) {
-    lv_obj_clear_flag(calculatorUi.historyLabel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_align(calculatorUi.historyLabel, LV_ALIGN_TOP_RIGHT, 0, 6);
-    lv_obj_align(calculatorUi.displayLabel, LV_ALIGN_TOP_RIGHT, 0, 28);
-  } else {
-    lv_obj_add_flag(calculatorUi.historyLabel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_align(calculatorUi.displayLabel, LV_ALIGN_TOP_RIGHT, 0, 10);
-  }
-
-  lv_label_set_text(calculatorUi.historyLabel, calculatorUi.historyText);
-  lv_label_set_text(calculatorUi.displayLabel, calculatorUi.currentText);
-  updateCalculatorDisplayFont();
-}
-
-void applyCalculatorButtonSet(const char *const *labels)
-{
-  for (size_t i = 0; i < kCalculatorButtonCount; ++i) {
-    if (!calculatorUi.buttons[i] || !calculatorUi.buttonLabels[i]) {
-      continue;
-    }
-    styleCalculatorButton(calculatorUi.buttons[i], labels[i]);
-  }
-}
-
-void setCalculatorCurrentValue(double value)
-{
-  formatCalculatorValue(value, calculatorUi.currentText, sizeof(calculatorUi.currentText));
-}
-
-double calculatorCurrentValue()
-{
-  return strtod(calculatorUi.currentText, nullptr);
-}
-
-void setCalculatorHistory(const char *text)
-{
-  setCalculatorText(calculatorUi.historyText, sizeof(calculatorUi.historyText), text);
-}
-
-void resetCalculator()
-{
-  calculatorUi.accumulator = 0.0;
-  calculatorUi.lastOperand = 0.0;
-  calculatorUi.pendingOperator = '\0';
-  calculatorUi.lastOperator = '\0';
-  calculatorUi.hasAccumulator = false;
-  calculatorUi.enteringNewValue = true;
-  calculatorUi.error = false;
-  setCalculatorText(calculatorUi.currentText, sizeof(calculatorUi.currentText), "0");
-  setCalculatorHistory("");
-  refreshCalculatorScreen();
-}
-
-void toggleCalculatorButtonSet()
-{
-  calculatorUi.showingFunctionSet = !calculatorUi.showingFunctionSet;
-  applyCalculatorButtonSet(calculatorUi.showingFunctionSet ? kCalculatorFunctionSetLabels : kCalculatorBasicLabels);
-}
-
-void showCalculatorError(const char *reason)
-{
-  calculatorUi.accumulator = 0.0;
-  calculatorUi.lastOperand = 0.0;
-  calculatorUi.pendingOperator = '\0';
-  calculatorUi.lastOperator = '\0';
-  calculatorUi.hasAccumulator = false;
-  calculatorUi.enteringNewValue = true;
-  calculatorUi.error = true;
-  setCalculatorText(calculatorUi.currentText, sizeof(calculatorUi.currentText), "Error");
-  setCalculatorHistory(reason);
-  refreshCalculatorScreen();
-}
-
-void ensureCalculatorReadyForInput()
-{
-  if (calculatorUi.error) {
-    resetCalculator();
-  }
-}
-
-bool applyCalculatorBinaryOperation(char op, double lhs, double rhs, double &result)
-{
-  switch (op) {
-    case '+':
-      result = lhs + rhs;
-      return true;
-    case '-':
-      result = lhs - rhs;
-      return true;
-    case '*':
-      result = lhs * rhs;
-      return true;
-    case '/':
-      if (fabs(rhs) < 0.0000001) {
-        return false;
-      }
-      result = lhs / rhs;
-      return true;
-    default:
-      result = rhs;
-      return true;
-  }
-}
-
-void updateCalculatorPendingHistory()
-{
-  if (calculatorUi.pendingOperator == '\0' || !calculatorUi.hasAccumulator) {
-    return;
-  }
-
-  char lhs[24];
-  formatCalculatorValue(calculatorUi.accumulator, lhs, sizeof(lhs));
-  snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "%s %c", lhs, calculatorUi.pendingOperator);
-}
-
-bool factorialCalculatorValue(double value, double &result)
-{
-  double rounded = round(value);
-  if (value < 0.0 || fabs(value - rounded) > 0.0000001 || rounded > 170.0) {
-    return false;
-  }
-
-  result = 1.0;
-  for (int i = 2; i <= static_cast<int>(rounded); ++i) {
-    result *= static_cast<double>(i);
-  }
-
-  return true;
-}
-
-void inputCalculatorDigit(char digit)
-{
-  ensureCalculatorReadyForInput();
-
-  if (calculatorUi.enteringNewValue) {
-    calculatorUi.currentText[0] = digit;
-    calculatorUi.currentText[1] = '\0';
-    calculatorUi.enteringNewValue = false;
-    refreshCalculatorScreen();
-    return;
-  }
-
-  if ((strcmp(calculatorUi.currentText, "0") == 0) || (strcmp(calculatorUi.currentText, "-0") == 0)) {
-    if (calculatorUi.currentText[0] == '-') {
-      calculatorUi.currentText[1] = digit;
-      calculatorUi.currentText[2] = '\0';
-    } else {
-      calculatorUi.currentText[0] = digit;
-      calculatorUi.currentText[1] = '\0';
-    }
-    refreshCalculatorScreen();
-    return;
-  }
-
-  size_t length = strlen(calculatorUi.currentText);
-  if (length + 1 < sizeof(calculatorUi.currentText)) {
-    calculatorUi.currentText[length] = digit;
-    calculatorUi.currentText[length + 1] = '\0';
-  }
-  refreshCalculatorScreen();
-}
-
-void inputCalculatorDecimal()
-{
-  ensureCalculatorReadyForInput();
-
-  if (calculatorUi.enteringNewValue) {
-    setCalculatorText(calculatorUi.currentText, sizeof(calculatorUi.currentText), "0.");
-    calculatorUi.enteringNewValue = false;
-    refreshCalculatorScreen();
-    return;
-  }
-
-  if (strchr(calculatorUi.currentText, '.') == nullptr &&
-      strlen(calculatorUi.currentText) + 1 < sizeof(calculatorUi.currentText)) {
-    strcat(calculatorUi.currentText, ".");
-  }
-  refreshCalculatorScreen();
-}
-
-void toggleCalculatorSign()
-{
-  ensureCalculatorReadyForInput();
-
-  if (calculatorUi.enteringNewValue) {
-    setCalculatorText(calculatorUi.currentText, sizeof(calculatorUi.currentText), "-0");
-    calculatorUi.enteringNewValue = false;
-    refreshCalculatorScreen();
-    return;
-  }
-
-  if (strcmp(calculatorUi.currentText, "0") == 0) {
-    refreshCalculatorScreen();
-    return;
-  }
-
-  if (calculatorUi.currentText[0] == '-') {
-    memmove(calculatorUi.currentText, calculatorUi.currentText + 1, strlen(calculatorUi.currentText));
-  } else if (strlen(calculatorUi.currentText) + 1 < sizeof(calculatorUi.currentText)) {
-    memmove(calculatorUi.currentText + 1, calculatorUi.currentText, strlen(calculatorUi.currentText) + 1);
-    calculatorUi.currentText[0] = '-';
-  }
-  refreshCalculatorScreen();
-}
-
-void backspaceCalculator()
-{
-  ensureCalculatorReadyForInput();
-
-  if (calculatorUi.enteringNewValue) {
-    refreshCalculatorScreen();
-    return;
-  }
-
-  size_t length = strlen(calculatorUi.currentText);
-  if (length <= 1 || (length == 2 && calculatorUi.currentText[0] == '-')) {
-    setCalculatorText(calculatorUi.currentText, sizeof(calculatorUi.currentText), "0");
-    calculatorUi.enteringNewValue = true;
-    refreshCalculatorScreen();
-    return;
-  }
-
-  calculatorUi.currentText[length - 1] = '\0';
-  refreshCalculatorScreen();
-}
-
-void applyCalculatorPercent()
-{
-  ensureCalculatorReadyForInput();
-
-  double value = calculatorCurrentValue();
-  if (calculatorUi.pendingOperator != '\0' && calculatorUi.hasAccumulator) {
-    value = calculatorUi.accumulator * value / 100.0;
-  } else {
-    value /= 100.0;
-  }
-
-  setCalculatorCurrentValue(value);
-  calculatorUi.enteringNewValue = false;
-  refreshCalculatorScreen();
-}
-
-bool commitCalculatorPendingOperation(double rhs)
-{
-  double result = 0.0;
-  if (!applyCalculatorBinaryOperation(calculatorUi.pendingOperator, calculatorUi.accumulator, rhs, result)) {
-    showCalculatorError("Cannot divide by zero");
-    return false;
-  }
-
-  calculatorUi.accumulator = result;
-  calculatorUi.hasAccumulator = true;
-  setCalculatorCurrentValue(result);
-  return true;
-}
-
-void queueCalculatorOperator(char op)
-{
-  ensureCalculatorReadyForInput();
-
-  double value = calculatorCurrentValue();
-  if (!calculatorUi.hasAccumulator) {
-    calculatorUi.accumulator = value;
-    calculatorUi.hasAccumulator = true;
-  } else if (calculatorUi.pendingOperator != '\0' && !calculatorUi.enteringNewValue) {
-    if (!commitCalculatorPendingOperation(value)) {
-      return;
-    }
-  } else if (calculatorUi.pendingOperator == '\0') {
-    calculatorUi.accumulator = value;
-  }
-
-  calculatorUi.pendingOperator = op;
-  calculatorUi.enteringNewValue = true;
-  calculatorUi.lastOperator = '\0';
-  updateCalculatorPendingHistory();
-  refreshCalculatorScreen();
-}
-
-void applyCalculatorEquals()
-{
-  ensureCalculatorReadyForInput();
-
-  if (calculatorUi.pendingOperator != '\0') {
-    double rhs = calculatorUi.enteringNewValue ? calculatorUi.accumulator : calculatorCurrentValue();
-    char lhsText[24];
-    char rhsText[24];
-    formatCalculatorValue(calculatorUi.accumulator, lhsText, sizeof(lhsText));
-    formatCalculatorValue(rhs, rhsText, sizeof(rhsText));
-
-    if (!commitCalculatorPendingOperation(rhs)) {
-      return;
-    }
-
-    snprintf(calculatorUi.historyText,
-             sizeof(calculatorUi.historyText),
-             "%s %c %s",
-             lhsText,
-             calculatorUi.pendingOperator,
-             rhsText);
-    calculatorUi.lastOperator = calculatorUi.pendingOperator;
-    calculatorUi.lastOperand = rhs;
-    calculatorUi.pendingOperator = '\0';
-    calculatorUi.enteringNewValue = true;
-    refreshCalculatorScreen();
-    return;
-  }
-
-  if (calculatorUi.lastOperator != '\0') {
-    double lhs = calculatorCurrentValue();
-    char lhsText[24];
-    char rhsText[24];
-    double result = 0.0;
-
-    formatCalculatorValue(lhs, lhsText, sizeof(lhsText));
-    formatCalculatorValue(calculatorUi.lastOperand, rhsText, sizeof(rhsText));
-    if (!applyCalculatorBinaryOperation(calculatorUi.lastOperator, lhs, calculatorUi.lastOperand, result)) {
-      showCalculatorError("Cannot divide by zero");
-      return;
-    }
-
-    calculatorUi.accumulator = result;
-    calculatorUi.hasAccumulator = true;
-    setCalculatorCurrentValue(result);
-    snprintf(calculatorUi.historyText,
-             sizeof(calculatorUi.historyText),
-             "%s %c %s",
-             lhsText,
-             calculatorUi.lastOperator,
-             rhsText);
-    calculatorUi.enteringNewValue = true;
-    refreshCalculatorScreen();
-    return;
-  }
-
-  refreshCalculatorScreen();
-}
-
-void applyCalculatorFunction(const char *action)
-{
-  ensureCalculatorReadyForInput();
-
-  if (!action) {
-    return;
-  }
-
-  double result = 0.0;
-  double value = calculatorCurrentValue();
-  char inputText[24];
-  setCalculatorText(inputText, sizeof(inputText), calculatorUi.currentText);
-
-  if (strcmp(action, "sqrt") == 0) {
-    if (value < 0.0) {
-      showCalculatorError("sqrt needs >= 0");
-      return;
-    }
-    result = sqrt(value);
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "sqrt(%s)", inputText);
-  } else if (strcmp(action, "sq") == 0) {
-    result = value * value;
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "(%s)^2", inputText);
-  } else if (strcmp(action, "1/x") == 0) {
-    if (fabs(value) < 0.0000001) {
-      showCalculatorError("Cannot divide by zero");
-      return;
-    }
-    result = 1.0 / value;
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "1/(%s)", inputText);
-  } else if (strcmp(action, "abs") == 0) {
-    result = fabs(value);
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "abs(%s)", inputText);
-  } else if (strcmp(action, "sin") == 0) {
-    double radians = calculatorUi.trigUsesDegrees ? value * (M_PI / 180.0) : value;
-    result = sin(radians);
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "sin(%s)", inputText);
-  } else if (strcmp(action, "cos") == 0) {
-    double radians = calculatorUi.trigUsesDegrees ? value * (M_PI / 180.0) : value;
-    result = cos(radians);
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "cos(%s)", inputText);
-  } else if (strcmp(action, "tan") == 0) {
-    double radians = calculatorUi.trigUsesDegrees ? value * (M_PI / 180.0) : value;
-    result = tan(radians);
-    if (!isfinite(result)) {
-      showCalculatorError("tan is undefined");
-      return;
-    }
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "tan(%s)", inputText);
-  } else if (strcmp(action, "ln") == 0) {
-    if (value <= 0.0) {
-      showCalculatorError("ln needs > 0");
-      return;
-    }
-    result = log(value);
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "ln(%s)", inputText);
-  } else if (strcmp(action, "log") == 0) {
-    if (value <= 0.0) {
-      showCalculatorError("log needs > 0");
-      return;
-    }
-    result = log10(value);
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "log(%s)", inputText);
-  } else if (strcmp(action, "pi") == 0) {
-    result = M_PI;
-    setCalculatorHistory("pi");
-  } else if (strcmp(action, "e") == 0) {
-    result = M_E;
-    setCalculatorHistory("e");
-  } else if (strcmp(action, "n!") == 0) {
-    if (!factorialCalculatorValue(value, result)) {
-      showCalculatorError("n! needs int 0-170");
-      return;
-    }
-    snprintf(calculatorUi.historyText, sizeof(calculatorUi.historyText), "(%s)!", inputText);
-  } else if (strcmp(action, "rand") == 0) {
-    result = static_cast<double>(random(0, 1000000)) / 1000000.0;
-    setCalculatorHistory("rand");
-  } else {
-    return;
-  }
-
-  if (!isfinite(result)) {
-    showCalculatorError("Invalid operation");
-    return;
-  }
-
-  setCalculatorCurrentValue(result);
-  calculatorUi.accumulator = result;
-  calculatorUi.hasAccumulator = true;
-  calculatorUi.enteringNewValue = true;
-  calculatorUi.pendingOperator = '\0';
-  calculatorUi.lastOperator = '\0';
-  calculatorUi.lastOperand = 0.0;
-  refreshCalculatorScreen();
-}
-
-void handleCalculatorAction(const char *action)
-{
-  if (!action) {
-    return;
-  }
-
-  if (strcmp(action, "C") == 0) {
-    resetCalculator();
-    return;
-  }
-  if (strcmp(action, "+/-") == 0) {
-    toggleCalculatorSign();
-    return;
-  }
-  if (strcmp(action, "%") == 0) {
-    applyCalculatorPercent();
-    return;
-  }
-  if (strcmp(action, "BS") == 0) {
-    backspaceCalculator();
-    return;
-  }
-  if (strcmp(action, "fn") == 0 || strcmp(action, "123") == 0) {
-    toggleCalculatorButtonSet();
-    return;
-  }
-  if (isCalculatorFunctionLabel(action)) {
-    applyCalculatorFunction(action);
-    return;
-  }
-  if (strcmp(action, ".") == 0) {
-    inputCalculatorDecimal();
-    return;
-  }
-  if (strcmp(action, "=") == 0) {
-    applyCalculatorEquals();
-    return;
-  }
-  if (strcmp(action, "x") == 0) {
-    queueCalculatorOperator('*');
-    return;
-  }
-  if (strcmp(action, "/") == 0) {
-    queueCalculatorOperator('/');
-    return;
-  }
-  if (strlen(action) == 1 && strchr("+-", action[0])) {
-    queueCalculatorOperator(action[0]);
-    return;
-  }
-  if (strlen(action) == 1 && action[0] >= '0' && action[0] <= '9') {
-    inputCalculatorDigit(action[0]);
-  }
-}
-
-void handleCalculatorButtonEvent(lv_event_t *event)
-{
-  lv_obj_t *button = static_cast<lv_obj_t *>(lv_event_get_target(event));
-  lv_obj_t *label = lv_obj_get_child(button, 0);
-  if (!label) {
-    return;
-  }
-
-  const char *action = lv_label_get_text(label);
-  lv_event_code_t code = lv_event_get_code(event);
-  if (strcmp(action, "BS") == 0 && code == LV_EVENT_LONG_PRESSED) {
-    lv_obj_add_flag(button, LV_OBJ_FLAG_USER_1);
-    resetCalculator();
-    return;
-  }
-
-  if (code != LV_EVENT_CLICKED) {
-    return;
-  }
-
-  if (lv_obj_has_flag(button, LV_OBJ_FLAG_USER_1)) {
-    lv_obj_clear_flag(button, LV_OBJ_FLAG_USER_1);
-    return;
-  }
-
-  handleCalculatorAction(action);
-}
-
-int calculatorButtonIndex(lv_obj_t *button)
-{
-  for (size_t i = 0; i < kCalculatorButtonCount; ++i) {
-    if (calculatorUi.buttons[i] == button) {
-      return static_cast<int>(i);
-    }
-  }
-
-  return -1;
-}
-
-void clearCalculatorButtonDecorations(lv_obj_t *button)
-{
-  while (lv_obj_get_child_count(button) > 1) {
-    lv_obj_delete(lv_obj_get_child(button, lv_obj_get_child_count(button) - 1));
-  }
-}
-
-void addCalculatorIconLine(lv_obj_t *button,
-                           int buttonIndex,
-                           int slot,
-                           float x1,
-                           float y1,
-                           float x2,
-                           float y2,
-                           int width,
-                           lv_color_t color)
-{
-  setLinePoints(calculatorUi.iconLinePoints[buttonIndex][slot], x1, y1, x2, y2);
-  lv_obj_t *line = lv_line_create(button);
-  lv_line_set_points(line, calculatorUi.iconLinePoints[buttonIndex][slot], 2);
-  lv_obj_set_style_line_width(line, width, 0);
-  lv_obj_set_style_line_rounded(line, true, 0);
-  lv_obj_set_style_line_color(line, color, 0);
-  lv_obj_center(line);
-}
-
-void addCalculatorIconDot(lv_obj_t *button, int size, int x, int y, lv_color_t color)
-{
-  lv_obj_t *dot = lv_obj_create(button);
-  lv_obj_set_size(dot, size, size);
-  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(dot, color, 0);
-  lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(dot, 0, 0);
-  lv_obj_set_style_pad_all(dot, 0, 0);
-  lv_obj_align(dot, LV_ALIGN_CENTER, x, y);
-}
-
-void addCalculatorButtonIcon(lv_obj_t *button, const char *labelText, lv_color_t color)
-{
-  int buttonIndex = calculatorButtonIndex(button);
-  if (buttonIndex < 0) {
-    return;
-  }
-
-  if (strcmp(labelText, "x") == 0) {
-    addCalculatorIconLine(button, buttonIndex, 0, 8, 8, 26, 26, 3, color);
-    addCalculatorIconLine(button, buttonIndex, 1, 26, 8, 8, 26, 3, color);
-    return;
-  }
-
-  if (strcmp(labelText, "/") == 0) {
-    addCalculatorIconDot(button, 6, 0, -11, color);
-    addCalculatorIconLine(button, buttonIndex, 0, 6, 16, 28, 16, 3, color);
-    addCalculatorIconDot(button, 6, 0, 11, color);
-    return;
-  }
-
-  if (strcmp(labelText, "BS") == 0) {
-    addCalculatorIconLine(button, buttonIndex, 0, 3, 16, 12, 6, 3, color);
-    addCalculatorIconLine(button, buttonIndex, 1, 3, 16, 12, 26, 3, color);
-    addCalculatorIconLine(button, buttonIndex, 2, 16, 10, 28, 22, 3, color);
-    addCalculatorIconLine(button, buttonIndex, 3, 28, 10, 16, 22, 3, color);
-  }
-}
-
-void styleCalculatorButton(lv_obj_t *button, const char *labelText)
-{
-  lv_color_t bg = lvColor(18, 24, 30);
-  lv_color_t border = lvColor(36, 44, 54);
-  lv_color_t text = lvColor(248, 250, 252);
-
-  if (strcmp(labelText, "C") == 0 || strcmp(labelText, "BS") == 0) {
-    bg = lvColor(44, 22, 24);
-    border = lvColor(92, 46, 52);
-  } else if (strcmp(labelText, "fn") == 0 || strcmp(labelText, "123") == 0 ||
-             strcmp(labelText, "+/-") == 0 || strcmp(labelText, "%") == 0 || isCalculatorFunctionLabel(labelText)) {
-    bg = lvColor(28, 34, 42);
-    border = lvColor(58, 72, 88);
-  } else if (strcmp(labelText, "x") == 0 || strcmp(labelText, "/") == 0 ||
-             (strlen(labelText) == 1 && strchr("+-=", labelText[0]))) {
-    bg = lvColor(12, 68, 142);
-    border = lvColor(52, 126, 212);
-  }
-
-  lv_obj_set_size(button, kCalculatorButtonWidth, kCalculatorButtonHeight);
-  lv_obj_set_style_radius(button, 20, 0);
-  lv_obj_set_style_bg_color(button, bg, 0);
-  lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(button, 1, 0);
-  lv_obj_set_style_border_color(button, border, 0);
-  lv_obj_set_style_shadow_width(button, 0, 0);
-  lv_obj_set_style_pad_all(button, 0, 0);
-  lv_obj_set_style_bg_color(button, lvColor(24, 92, 182), LV_STATE_PRESSED);
-
-  lv_obj_t *label = lv_obj_get_child(button, 0);
-  if (!label) {
-    label = lv_label_create(button);
-  }
-  const lv_font_t *font = &lv_font_montserrat_24;
-  size_t length = strlen(labelText);
-  if (length > 6) {
-    font = &lv_font_montserrat_14;
-  } else if (length > 4) {
-    font = &lv_font_montserrat_16;
-  } else if (length > 3) {
-    font = &lv_font_montserrat_18;
-  } else if (length > 2) {
-    font = &lv_font_montserrat_20;
-  }
-  lv_obj_set_style_text_font(label, font, 0);
-  lv_obj_set_style_text_color(label, text, 0);
-  lv_label_set_text(label, labelText);
-  lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_center(label);
-
-  clearCalculatorButtonDecorations(button);
-  if (strcmp(labelText, "BS") == 0 || strcmp(labelText, "x") == 0 || strcmp(labelText, "/") == 0) {
-    lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
-    addCalculatorButtonIcon(button, labelText, text);
-  }
-}
-
-lv_obj_t *buildCalculatorScreen()
-{
-  calculatorUi.screen = lv_obj_create(nullptr);
-  applyRootStyle(calculatorUi.screen);
-
-  lv_obj_t *card = lv_obj_create(calculatorUi.screen);
-  lv_obj_set_size(card, kCalculatorCardWidth, LCD_HEIGHT - 32);
-  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_radius(card, 28, 0);
-  lv_obj_set_style_bg_color(card, lvColor(6, 10, 16), 0);
-  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(card, 1, 0);
-  lv_obj_set_style_border_color(card, lvColor(24, 34, 46), 0);
-  lv_obj_set_style_pad_all(card, 18, 0);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
-  calculatorUi.historyLabel = lv_label_create(card);
-  lv_obj_set_width(calculatorUi.historyLabel, kCalculatorCardWidth - 36);
-  lv_obj_set_style_text_font(calculatorUi.historyLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(calculatorUi.historyLabel, lvColor(112, 124, 140), 0);
-  lv_obj_set_style_text_align(calculatorUi.historyLabel, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_label_set_long_mode(calculatorUi.historyLabel, LV_LABEL_LONG_CLIP);
-  lv_obj_align(calculatorUi.historyLabel, LV_ALIGN_TOP_RIGHT, 0, 6);
-
-  calculatorUi.displayLabel = lv_label_create(card);
-  lv_obj_set_width(calculatorUi.displayLabel, kCalculatorCardWidth - 36);
-  lv_obj_set_style_text_color(calculatorUi.displayLabel, lvColor(250, 252, 255), 0);
-  lv_obj_set_style_text_align(calculatorUi.displayLabel, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_label_set_long_mode(calculatorUi.displayLabel, LV_LABEL_LONG_CLIP);
-  lv_obj_align(calculatorUi.displayLabel, LV_ALIGN_TOP_RIGHT, 0, 10);
-
-  lv_obj_t *divider = lv_obj_create(card);
-  lv_obj_set_size(divider, kCalculatorCardWidth - 36, 1);
-  lv_obj_align(divider, LV_ALIGN_TOP_MID, 0, 84);
-  lv_obj_set_style_bg_color(divider, lvColor(22, 30, 40), 0);
-  lv_obj_set_style_border_width(divider, 0, 0);
-  lv_obj_set_style_pad_all(divider, 0, 0);
-
-  lv_obj_t *grid = lv_obj_create(card);
-  lv_obj_set_size(grid, kCalculatorCardWidth - 36, 282);
-  lv_obj_align(grid, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_set_layout(grid, LV_LAYOUT_FLEX);
-  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-  lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-  lv_obj_set_style_pad_all(grid, 0, 0);
-  lv_obj_set_style_pad_row(grid, kCalculatorButtonGap, 0);
-  lv_obj_set_style_pad_column(grid, kCalculatorButtonGap, 0);
-  lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(grid, 0, 0);
-  lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
-
-  for (size_t i = 0; i < kCalculatorButtonCount; ++i) {
-    lv_obj_t *button = lv_button_create(grid);
-    styleCalculatorButton(button, kCalculatorBasicLabels[i]);
-    calculatorUi.buttons[i] = button;
-    calculatorUi.buttonLabels[i] = lv_obj_get_child(button, 0);
-    lv_indev_set_long_press_time(touchInput, kCalculatorClearLongPressMs);
-    lv_obj_add_event_cb(button, handleCalculatorButtonEvent, LV_EVENT_LONG_PRESSED, nullptr);
-    lv_obj_add_event_cb(button, handleCalculatorButtonEvent, LV_EVENT_CLICKED, nullptr);
-  }
-
-  calculatorUi.showingFunctionSet = false;
-  resetCalculator();
-  return calculatorUi.screen;
-}
-
-void buildWeatherScreen()
-{
-  screenRoots[static_cast<size_t>(ScreenId::Weather)] = buildCurrentWeatherScreen(weatherUi);
-}
-
-void buildCalculatorScreenRoot()
-{
-  screenRoots[static_cast<size_t>(ScreenId::Calculator)] = buildCalculatorScreen();
-}
 
 void buildOtaOverlay()
 {
@@ -3407,286 +1983,14 @@ void buildPowerHoldOverlay()
 
 void buildUi()
 {
-  buildWatchfaceScreen();
-  buildMotionScreen();
-  buildWeatherScreen();
   buildOtaOverlay();
   buildPowerHoldOverlay();
 }
 
-void refreshWatchface()
-{
-  if (!watchfaceBuilt) {
-    return;
-  }
 
-  lv_label_set_text(watchTimeLabel, timeText().c_str());
-  lv_label_set_text(watchDateLabel, dateText().c_str());
-  lv_label_set_text(watchTimezoneLabel, timezoneText().c_str());
 
-  int percent = batteryPercentValue();
-  int fillWidth = 0;
-  if (percent < 0) {
-    fillWidth = kBatteryTrackWidth / 3;
-  } else {
-    fillWidth = max(10, (kBatteryTrackWidth * percent) / 100);
-  }
 
-  lv_obj_set_width(watchBatteryFill, fillWidth);
-  lv_obj_set_style_bg_color(watchBatteryFill, batteryIndicatorColor(percent, batteryIsCharging()), 0);
 
-  lv_obj_set_style_text_color(watchWifiIcon,
-                              networkIsOnline() ? lvColor(255, 255, 255) : lvColor(72, 82, 96),
-                              0);
-  lv_obj_set_style_text_color(watchBluetoothIcon, lvColor(72, 82, 96), 0);
-  lv_obj_set_style_text_color(watchUsbIcon,
-                              usbIsConnected() ? (batteryIsCharging() ? lvColor(0, 120, 255) : lvColor(255, 255, 255))
-                                               : lvColor(72, 82, 96),
-                              0);
-
-  String status;
-  if (connectivityState == ConnectivityState::Connecting) {
-    status = "Connecting to Wi-Fi";
-  } else if (networkIsOnline()) {
-    status = WiFi.SSID() + "  " + WiFi.localIP().toString();
-  } else {
-    status = "Offline-first mode";
-  }
-
-  if (usbIsConnected()) {
-    status += "  •  USB power";
-  }
-
-  if (expanderReady) {
-    status += "  •  B4:";
-    status += (expander.digitalRead(TOP_BUTTON_PIN) == HIGH) ? "H" : "L";
-  }
-
-  lv_label_set_text(watchStatusLabel, status.c_str());
-}
-
-void setMotionViewVisibility()
-{
-  if (renderedMotionViewMode != motionViewMode) {
-    showMotionViewInstant(motionViewMode);
-  }
-}
-
-void updateMotionDot()
-{
-  if (!motionState.valid) {
-    return;
-  }
-
-  if (!motionReferenceReady) {
-    if (!motionReferenceCapturePending) {
-      captureMotionReference();
-    }
-  }
-
-  const MotionState &displayState = motionState;
-  Vec3 currentDown = normalizedDownVector(displayState);
-
-  lv_area_t boundary = {};
-  lv_obj_get_coords(motionDotBoundary, &boundary);
-  int centerX = (boundary.x1 + boundary.x2) / 2;
-  int centerY = (boundary.y1 + boundary.y2) / 2;
-
-  if (motionReferenceCapturePending) {
-    motionPitchZero = displayState.pitch;
-    motionRollZero = displayState.roll;
-    motionReferenceDown = currentDown;
-    motionReferenceAxisA = stablePerpendicular(motionReferenceDown, vec3(1.0f, 0.0f, 0.0f));
-    motionReferenceAxisB = normalizeVec3(crossVec3(motionReferenceDown, motionReferenceAxisA));
-    if (lengthVec3(motionReferenceAxisB) < 0.1f) {
-      motionReferenceAxisB = stablePerpendicular(motionReferenceDown, vec3(0.0f, 1.0f, 0.0f));
-    }
-    motionReferenceReady = true;
-    motionReferenceCapturePending = false;
-    motionDotPitch = 0.0f;
-    motionDotRoll = 0.0f;
-    motionFilterReady = true;
-    lv_obj_set_pos(motionDot, centerX - (kDotDiameter / 2), centerY - (kDotDiameter / 2));
-    return;
-  }
-
-  if (!motionReferenceReady) {
-    return;
-  }
-
-  Vec3 downDelta = subtractVec3(currentDown, motionReferenceDown);
-  float horizontalOffset = dotVec3(downDelta, motionReferenceAxisA);
-  float verticalOffset = dotVec3(downDelta, motionReferenceAxisB);
-
-  if (!motionFilterReady) {
-    motionDotPitch = verticalOffset;
-    motionDotRoll = horizontalOffset;
-    motionFilterReady = true;
-  } else {
-    motionDotPitch += (verticalOffset - motionDotPitch) * kMotionIndicatorSmoothingAlpha;
-    motionDotRoll += (horizontalOffset - motionDotRoll) * kMotionIndicatorSmoothingAlpha;
-  }
-
-  int travel = ((boundary.x2 - boundary.x1) / 2) - 22;
-  float normalizedX = normalizeMotionIndicatorOffset(motionDotRoll);
-  float normalizedY = normalizeMotionIndicatorOffset(motionDotPitch);
-  int x = centerX + static_cast<int>(normalizedX * travel) - (kDotDiameter / 2);
-  int y = centerY - static_cast<int>(normalizedY * travel) - (kDotDiameter / 2);
-  x = constrain(x, 0, LCD_WIDTH - kDotDiameter);
-  y = constrain(y, 0, LCD_HEIGHT - kDotDiameter);
-  lv_obj_set_pos(motionDot, x, y);
-
-}
-
-void updateMotionRaw()
-{
-  if (!motionDisplayState.valid) {
-    lv_label_set_text(motionRawOrientation, "Unavailable");
-    lv_label_set_text(motionRawPitch, "--.-");
-    lv_label_set_text(motionRawRoll, "--.-");
-    lv_label_set_text(motionRawAccel, "X  --.-\nY  --.-\nZ  --.-");
-    lv_label_set_text(motionRawGyro, "X  ---\nY  ---\nZ  ---");
-    return;
-  }
-
-  char line[80];
-  lv_label_set_text(motionRawOrientation, motionDisplayState.orientation);
-
-  snprintf(line, sizeof(line), "%+.0f°", motionDisplayState.pitch);
-  lv_label_set_text(motionRawPitch, line);
-  snprintf(line, sizeof(line), "%+.0f°", motionDisplayState.roll);
-  lv_label_set_text(motionRawRoll, line);
-  snprintf(line,
-           sizeof(line),
-           "X  %+0.1f\nY  %+0.1f\nZ  %+0.1f",
-           motionDisplayState.ax,
-           motionDisplayState.ay,
-           motionDisplayState.az);
-  lv_label_set_text(motionRawAccel, line);
-  snprintf(line,
-           sizeof(line),
-           "X  %+0.0f\nY  %+0.0f\nZ  %+0.0f",
-           motionDisplayState.gx,
-           motionDisplayState.gy,
-           motionDisplayState.gz);
-  lv_label_set_text(motionRawGyro, line);
-}
-
-void setLinePoints(lv_point_precise_t points[2], float x1, float y1, float x2, float y2)
-{
-  points[0].x = x1;
-  points[0].y = y1;
-  points[1].x = x2;
-  points[1].y = y2;
-}
-
-void updateMotionCube()
-{
-  if (!motionDisplayState.valid) {
-    return;
-  }
-
-  Vec3 down;
-  Vec3 axisA;
-  Vec3 axisB;
-  motionCubeBasis(motionDisplayState, down, axisA, axisB);
-
-  constexpr Vec3 corners[8] = {
-      {-1.0f, -1.0f, -1.0f},
-      {1.0f, -1.0f, -1.0f},
-      {1.0f, 1.0f, -1.0f},
-      {-1.0f, 1.0f, -1.0f},
-      {-1.0f, -1.0f, 1.0f},
-      {1.0f, -1.0f, 1.0f},
-      {1.0f, 1.0f, 1.0f},
-      {-1.0f, 1.0f, 1.0f},
-  };
-
-  const uint8_t edges[kCubeEdgeCount][2] = {
-      {0, 1}, {1, 2}, {2, 3}, {3, 0},
-      {4, 5}, {5, 6}, {6, 7}, {7, 4},
-      {0, 4}, {1, 5}, {2, 6}, {3, 7},
-  };
-
-  lv_point_precise_t projected[8];
-  int centerX = LCD_WIDTH / 2;
-  int centerY = LCD_HEIGHT / 2;
-  float scale = 78.0f;
-
-  for (size_t i = 0; i < 8; ++i) {
-    const Vec3 &corner = corners[i];
-    float px = (corner.x * axisA.x + corner.y * axisB.x + corner.z * down.x);
-    float py = (corner.x * axisA.y + corner.y * axisB.y + corner.z * down.y);
-    float pz = (corner.x * axisA.z + corner.y * axisB.z + corner.z * down.z);
-    float perspective = 1.0f + (pz * 0.28f);
-    projected[i].x = centerX + (px * scale * perspective);
-    projected[i].y = centerY - (py * scale * perspective);
-  }
-
-  for (size_t i = 0; i < kCubeEdgeCount; ++i) {
-    setLinePoints(motionCubeEdgePoints[i],
-                  projected[edges[i][0]].x,
-                  projected[edges[i][0]].y,
-                  projected[edges[i][1]].x,
-                  projected[edges[i][1]].y);
-    lv_obj_invalidate(motionCubeEdges[i]);
-  }
-
-  Vec3 arrows[kCubeArrowCount] = {scaleVec3(down, -1.0f), axisA, axisB};
-  for (size_t i = 0; i < kCubeArrowCount; ++i) {
-    Vec3 d = normalizeVec3(arrows[i]);
-    float tipX = centerX + (d.x * 112.0f);
-    float tipY = centerY - (d.y * 112.0f);
-    float leftX = tipX - (d.x * 14.0f) - (d.y * 9.0f);
-    float leftY = tipY + (d.y * 14.0f) - (d.x * 9.0f);
-    float rightX = tipX - (d.x * 14.0f) + (d.y * 9.0f);
-    float rightY = tipY + (d.y * 14.0f) + (d.x * 9.0f);
-
-    size_t base = i * kCubeArrowSegmentCount;
-    setLinePoints(motionCubeArrowPoints[base], centerX, centerY, tipX, tipY);
-    setLinePoints(motionCubeArrowPoints[base + 1], tipX, tipY, leftX, leftY);
-    setLinePoints(motionCubeArrowPoints[base + 2], tipX, tipY, rightX, rightY);
-    lv_obj_invalidate(motionCubeArrows[base]);
-    lv_obj_invalidate(motionCubeArrows[base + 1]);
-    lv_obj_invalidate(motionCubeArrows[base + 2]);
-  }
-}
-
-void refreshMotionScreen()
-{
-  if (!motionBuilt) {
-    return;
-  }
-
-  setMotionViewVisibility();
-  switch (motionViewMode) {
-    case MotionViewMode::Dot:
-      updateMotionDot();
-      break;
-    case MotionViewMode::Cube:
-      if (touchPressed) {
-        break;
-      }
-      updateMotionCube();
-      break;
-    case MotionViewMode::Raw:
-      updateMotionRaw();
-      break;
-    default:
-      break;
-  }
-}
-
-void refreshWeatherScreen()
-{
-  refreshCurrentWeatherScreen(weatherUi, weatherState, networkIsOnline(), weatherDebugOverrideEnabled, weatherDebugScene);
-  updateWeatherHero();
-}
-
-void updateWeatherHero()
-{
-  ::updateWeatherHero(weatherUi, weatherState, weatherDebugOverrideEnabled, weatherDebugScene, millis());
-}
 
 void setupLvgl()
 {
@@ -3713,13 +2017,20 @@ void setupLvgl()
 
 void refreshUi()
 {
-  refreshWatchface();
-  refreshMotionScreen();
-  refreshWeatherScreen();
-  refreshCalculatorScreen();
+  refreshManagedScreen(static_cast<ScreenId>(currentScreenIndex));
 }
 
-} // namespace
+bool refreshManagedScreen(ScreenId id)
+{
+  if (!screenManagerRefresh(id)) {
+    if (static_cast<ScreenId>(currentScreenIndex) == id) {
+      screenManagerShowFallback(id, screenManagerFailureReason(id));
+    }
+    return false;
+  }
+
+  return true;
+}
 
 void setup()
 {
@@ -3727,7 +2038,20 @@ void setup()
   delay(250);
   randomSeed(static_cast<unsigned long>(micros()));
   preferences.begin(kPreferencesNamespace, false);
-  restoreWeatherCache();
+  weatherModuleConfigure({
+      &preferences,
+      kPrefWeatherCacheKey,
+      kWeatherRefreshIntervalMs,
+      kWeatherRetryIntervalMs,
+      kWeatherFetchTimeoutMs,
+      kWeatherFetchEnabled,
+      networkIsOnline,
+      otaUpdateInProgress,
+      lightSleepActive,
+      weatherApiUrl,
+      weatherUpdatedLabel,
+  });
+  weatherModuleRestoreCache();
 
   setenv("TZ", TIMEZONE_POSIX, 1);
   tzset();
@@ -3740,7 +2064,6 @@ void setup()
   initRtc();
   initTouch();
   initImu();
-  // Temporary isolation: skip SD init while debugging black-screen boot.
   sdMounted = false;
 
   if (!gfx->begin()) {
@@ -3753,6 +2076,7 @@ void setup()
   gfx->setBrightness(kActiveBrightness);
   gfx->fillScreen(kBackgroundColor);
   gfx->displayOn();
+  initSdCard();
 
 #ifdef WAVEFORM_DIAG_DISPLAY
   gfx->fillScreen(0xFFFF);
@@ -3761,10 +2085,16 @@ void setup()
 #endif
 
   configuredNetworkCount = countConfiguredNetworks();
-  if (configuredNetworkCount == 0 && !weatherState.hasData) {
-    setWeatherUnavailableState("Offline - no Wi-Fi configured");
+  if (configuredNetworkCount == 0 && !weatherModuleHasData()) {
+    weatherModuleSetUnavailable("Offline - no Wi-Fi configured");
   }
-  nextWeatherRefreshAtMs = millis() + 1000;
+  if (configuredNetworkCount == 0) {
+    setGeoUnavailableState("Offline - no Wi-Fi configured");
+    setSolarUnavailableState("Offline - no Wi-Fi configured");
+  }
+  weatherModuleScheduleRefreshIn(1000);
+  nextGeoRefreshAtMs = 0;
+  nextSolarRefreshAtMs = 0;
   nextWifiRetryAtMs = 0;
   lastActivityAtMs = millis();
 
@@ -3777,13 +2107,22 @@ void setup()
 
   setupLvgl();
   buildUi();
-  showScreen(0);
+  uint8_t savedScreen = preferences.getUChar(kPrefScreenKey, 0);
+  if (savedScreen >= kScreenCount) {
+    savedScreen = 0;
+  }
+
+  if (!showScreen(savedScreen) && savedScreen != static_cast<uint8_t>(ScreenId::Watchface)) {
+    showScreen(static_cast<size_t>(ScreenId::Watchface));
+  }
   refreshUi();
   lv_obj_invalidate(lv_screen_active());
   lv_refr_now(display);
   lastStatusRefreshAtMs = millis();
   lastMotionRefreshAtMs = millis();
   lastWeatherAnimAtMs = millis();
+  lastRecorderVisualRefreshAtMs = millis();
+  lastSkyRefreshAtMs = millis();
 }
 
 void loop()
@@ -3800,8 +2139,11 @@ void loop()
     lastWifiServiceAtMs = now;
     updateWiFi();
   }
-  updateWeather();
+  weatherModuleUpdate();
+  updateGeo();
+  updateSolarSystem();
   updateImuState();
+  updateRecorderAudio();
   updateTopButton();
   updatePowerKey();
   updatePowerButtonHold();
@@ -3816,19 +2158,50 @@ void loop()
     hideOtaOverlay();
   }
 
+  ScreenId activeScreen = static_cast<ScreenId>(currentScreenIndex);
+
   if (now - lastStatusRefreshAtMs >= kStatusRefreshMs) {
     lastStatusRefreshAtMs = now;
-    refreshWatchface();
+    if (activeScreen != ScreenId::Motion && activeScreen != ScreenId::Weather && activeScreen != ScreenId::Sky) {
+      refreshManagedScreen(activeScreen);
+    }
+  }
+
+  if (screenRefreshPending[currentScreenIndex]) {
+    screenRefreshPending[currentScreenIndex] = false;
+    if (refreshManagedScreen(activeScreen) && screenPreferenceSavePending &&
+        pendingScreenPreferenceIndex == currentScreenIndex) {
+      saveScreenPreference(currentScreenIndex);
+      screenPreferenceSavePending = false;
+    }
   }
 
   if (now - lastMotionRefreshAtMs >= kMotionRefreshMs) {
     lastMotionRefreshAtMs = now;
-    refreshMotionScreen();
+    if (activeScreen == ScreenId::Motion) {
+      refreshManagedScreen(activeScreen);
+    }
+  }
+
+  if (now - lastRecorderVisualRefreshAtMs >= kRecorderVisualRefreshMs) {
+    lastRecorderVisualRefreshAtMs = now;
+    if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Recorder) {
+      updateRecorderVisuals();
+    }
   }
 
   if (now - lastWeatherAnimAtMs >= kWeatherAnimRefreshMs) {
     lastWeatherAnimAtMs = now;
-    updateWeatherHero();
+    if (activeScreen == ScreenId::Weather) {
+      screenManagerTick(activeScreen, now);
+    }
+  }
+
+  if (now - lastSkyRefreshAtMs >= kSkyRefreshMs) {
+    lastSkyRefreshAtMs = now;
+    if (activeScreen == ScreenId::Sky) {
+      refreshManagedScreen(activeScreen);
+    }
   }
 
   lv_timer_handler();

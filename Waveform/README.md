@@ -15,11 +15,22 @@ Current screens:
 - Motion / IMU
 - Weather
 
-Project root:
+Project structure:
+- `config/`
 - `platformio.ini`
-- `include/pin_config.h`
 - `include/lv_conf.h`
 - `src/main.cpp`
+- `include/config/`
+- `include/core/`
+- `include/modules/`
+- `include/screens/`
+- `include/state/`
+- `src/core/`
+- `src/drivers/`
+- `src/modules/`
+- `src/screens/`
+- `src/support/`
+- `src/tools/`
 
 Build:
 - USB: `pio run -e waveform_usb`
