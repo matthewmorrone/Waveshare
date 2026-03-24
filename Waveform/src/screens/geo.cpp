@@ -1,5 +1,6 @@
 #include "config/screen_constants.h"
 #include "core/screen_manager.h"
+#ifdef SCREEN_GEO
 #include "modules/weather_module.h"
 #include "modules/wifi_manager.h"
 #include "screens/screen_callbacks.h"
@@ -13,8 +14,8 @@ extern lv_obj_t *screenRoots[];
 void applyRootStyle(lv_obj_t *obj);
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b);
 void scheduleScreenRefresh(ScreenId id);
-extern bool otaInProgress;
-extern bool inLightSleep;
+bool otaUpdateInProgress();
+bool lightSleepActive();
 extern size_t currentScreenIndex;
 void refreshGeoScreen();
 
@@ -151,7 +152,7 @@ void updateGeo()
     return;
   }
 
-  if (geoFetchInProgress || otaInProgress || inLightSleep) {
+  if (geoFetchInProgress || otaUpdateInProgress() || lightSleepActive()) {
     return;
   }
 
@@ -323,7 +324,7 @@ bool waveformRefreshGeoScreen()
 void waveformEnterGeoScreen()
 {
   if ((!geoState.hasData || geoState.stale || static_cast<int32_t>(millis() - nextGeoRefreshAtMs) >= 0) &&
-      networkIsOnline() && !geoFetchInProgress && !otaInProgress && !inLightSleep) {
+      networkIsOnline() && !geoFetchInProgress && !otaUpdateInProgress() && !lightSleepActive()) {
     fetchGeoData();
   }
 }
@@ -337,3 +338,5 @@ void waveformTickGeoScreen(uint32_t nowMs)
   (void)nowMs;
   refreshGeoScreen();
 }
+
+#endif // SCREEN_GEO

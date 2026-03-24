@@ -3,6 +3,46 @@
 #include "config/pin_config.h"
 #include "core/screen_modules.h"
 
+// --- Active screens --- controlled by #defines in screen_manager.h
+static const ScreenModule *const kModulesArr[] = {
+#ifdef SCREEN_WATCH
+    &watchScreenModule(),
+#endif
+#ifdef SCREEN_MOON
+    &moonScreenModule(),
+#endif
+#ifdef SCREEN_MOTION
+    &motionScreenModule(),
+#endif
+#ifdef SCREEN_WEATHER
+    &weatherScreenModule(),
+#endif
+#ifdef SCREEN_GEO
+    &geoScreenModule(),
+#endif
+#ifdef SCREEN_SOLAR
+    &solarScreenModule(),
+#endif
+#ifdef SCREEN_SKY
+    &skyScreenModule(),
+#endif
+#ifdef SCREEN_RECORDER
+    &recorderScreenModule(),
+#endif
+#ifdef SCREEN_QR
+    &qrScreenModule(),
+#endif
+#ifdef SCREEN_CALCULATOR
+    &calculatorScreenModule(),
+#endif
+#ifdef SCREEN_STOPWATCH
+    &stopwatchScreenModule(),
+#endif
+#ifdef SCREEN_TIMER
+    &timerScreenModule(),
+#endif
+};
+
 #include <stdio.h>
 #include <string.h>
 
@@ -15,24 +55,12 @@ struct ScreenRuntime
   char failureReason[96] = "";
 };
 
-ScreenRuntime gScreenRuntimes[kScreenCount] = {};
+ScreenRuntime gScreenRuntimes[sizeof(kModulesArr) / sizeof(kModulesArr[0])] = {};
 
 lv_obj_t *gFallbackScreen = nullptr;
 lv_obj_t *gFallbackTitleLabel = nullptr;
 lv_obj_t *gFallbackBodyLabel = nullptr;
 lv_obj_t *gFallbackFooterLabel = nullptr;
-
-const ScreenModule *const kModules[kScreenCount] = {
-    &watchScreenModule(),
-    &motionScreenModule(),
-    &weatherScreenModule(),
-    &geoScreenModule(),
-    &solarScreenModule(),
-    &skyScreenModule(),
-    &recorderScreenModule(),
-    &qrScreenModule(),
-    &calculatorScreenModule(),
-};
 
 size_t screenIndex(ScreenId id)
 {
@@ -107,14 +135,16 @@ void ensureFallbackScreen()
 }
 } // namespace
 
+const size_t kScreenCount = sizeof(kModulesArr) / sizeof(kModulesArr[0]);
+
 const ScreenModule &screenModule(ScreenId id)
 {
-  return *kModules[screenIndex(id)];
+  return *kModulesArr[screenIndex(id)];
 }
 
 const ScreenModule &screenModuleByIndex(size_t index)
 {
-  return *kModules[index];
+  return *kModulesArr[index];
 }
 
 bool screenManagerEnsureBuilt(ScreenId id)

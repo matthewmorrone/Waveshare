@@ -5,20 +5,61 @@
 
 #include "state/runtime_state.h"
 
-enum class ScreenId : uint8_t
-{
+// Comment/uncomment to enable or disable screens at compile time.
+// Matching entry in screen_manager.cpp must also be commented out.
+#define SCREEN_WATCH
+#define SCREEN_MOON
+#define SCREEN_MOTION
+#define SCREEN_WEATHER
+// #define SCREEN_GEO
+// #define SCREEN_SOLAR
+// #define SCREEN_SKY
+// #define SCREEN_RECORDER
+// #define SCREEN_QR
+#define SCREEN_CALCULATOR
+#define SCREEN_STOPWATCH
+#define SCREEN_TIMER
+
+enum class ScreenId : uint8_t {
+#ifdef SCREEN_WATCH
   Watch,
+#endif
+#ifdef SCREEN_MOON
+  Moon,
+#endif
+#ifdef SCREEN_MOTION
   Motion,
+#endif
+#ifdef SCREEN_WEATHER
   Weather,
+#endif
+#ifdef SCREEN_GEO
   Geo,
+#endif
+#ifdef SCREEN_SOLAR
   Solar,
+#endif
+#ifdef SCREEN_SKY
   Sky,
+#endif
+#ifdef SCREEN_RECORDER
   Recorder,
+#endif
+#ifdef SCREEN_QR
   Qr,
+#endif
+#ifdef SCREEN_CALCULATOR
   Calculator,
+#endif
+#ifdef SCREEN_STOPWATCH
+  Stopwatch,
+#endif
+#ifdef SCREEN_TIMER
+  Timer,
+#endif
 };
 
-constexpr size_t kScreenCount = 9;
+extern const size_t kScreenCount;
 
 struct ScreenModule
 {

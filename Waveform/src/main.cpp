@@ -1,7 +1,6 @@
 #include <Adafruit_XCA9554.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <ArduinoOTA.h>
 #include <Arduino_DriveBus_Library.h>
 #include <Arduino_GFX_Library.h>
 #include <ESP_I2S.h>
@@ -11,7 +10,6 @@
 #include <qrcode.h>
 #include <SD_MMC.h>
 #include <SensorPCF85063.hpp>
-#include <SensorQMI8658.hpp>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
@@ -19,7 +17,6 @@
 #include <esp_heap_caps.h>
 #include <esp_sleep.h>
 #include <lvgl.h>
-#include <math.h>
 #include <memory>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +28,10 @@
 #include "config/screen_constants.h"
 #include "core/screen_manager.h"
 #include "drivers/es8311.h"
+#include "modules/battery.h"
+#include "modules/imu_module.h"
+#include "modules/math_utils.h"
+#include "modules/ota_module.h"
 #include "modules/storage.h"
 #include "modules/weather_module.h"
 #include "modules/wifi_manager.h"
@@ -38,14 +39,15 @@
 
 #include <XPowersLib.h>
 
-constexpr uint16_t kBackgroundColor = 0x0000;
 constexpr uint8_t kActiveBrightness = 255;
 constexpr uint8_t kDimBrightness = 26;
+constexpr uint16_t kBackgroundColor = 0x0000;
 constexpr uint32_t kButtonDebounceMs = 180;
 constexpr uint32_t kStatusRefreshMs = 250;
 constexpr uint32_t kRecorderVisualRefreshMs = 33;
 constexpr uint32_t kWeatherAnimRefreshMs = 90;
 constexpr uint32_t kSkyRefreshMs = 1000;
+constexpr uint32_t kAutoCycleMs = 5000;
 constexpr bool kWeatherFetchEnabled = true;
 constexpr uint32_t kWifiConnectTimeoutMs = 12000;
 constexpr uint32_t kWifiRetryIntervalMs = 30000;
@@ -54,16 +56,18 @@ constexpr uint32_t kWifiServiceConnectingIntervalMs = 250;
 constexpr uint32_t kRtcWriteIntervalSeconds = 60;
 constexpr uint32_t kDimAfterMs = 30000;
 constexpr uint32_t kSleepAfterMs = 5UL * 60UL * 1000UL;
-constexpr uint32_t kImuSampleIntervalMs = 20;
 constexpr uint32_t kTapMaxDurationMs = 350;
 constexpr uint32_t kShutdownHoldArmMs = 450;
+constexpr uint32_t kSideButtonLongPressMs = 1200;
 constexpr uint32_t kPowerButtonShutdownHoldMs = 4000;
 constexpr uint32_t kLvglBufferRows = 40;
 constexpr time_t kMinValidEpoch = 1704067200;
 constexpr int kMotionSwipeMinDistancePx = 8;
 constexpr int kMotionSwipeMinDominancePx = -6;
+#ifdef SCREEN_QR
 constexpr int kQrSwipeMinDistancePx = 18;
 constexpr int kQrSwipeMinDominancePx = 2;
+#endif
 constexpr int kScreenNavSwipeMinDistancePx = 20;
 constexpr int kScreenNavSwipeMinDominancePx = 4;
 constexpr int kTapMaxTravelPx = 12;
@@ -101,30 +105,35 @@ Arduino_SH8601 *gfx = new Arduino_SH8601(
 XPowersPMU power;
 Adafruit_XCA9554 expander;
 SensorPCF85063 rtc;
-SensorQMI8658 imu;
 std::shared_ptr<Arduino_IIC_DriveBus> touchBus = std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
 Preferences preferences;
 I2SClass audioI2s;
+#ifdef SCREEN_GEO
 extern uint32_t nextGeoRefreshAtMs;
+void setGeoUnavailableState(const char *updatedLabel);
+void updateGeo();
+#endif
+#ifdef SCREEN_SOLAR
 extern uint32_t nextSolarRefreshAtMs;
+void setSolarUnavailableState(const char *updatedLabel);
+void updateSolarSystem();
+#endif
+#ifdef SCREEN_QR
 extern size_t currentQrIndex;
 extern bool qrNeedsRender;
-void setGeoUnavailableState(const char *updatedLabel);
-void setSolarUnavailableState(const char *updatedLabel);
-void updateGeo();
-void updateSolarSystem();
+#endif
+#ifdef SCREEN_RECORDER
+void updateRecorderAudio();
+extern bool audioRecordingActive;
+extern bool audioPlaybackActive;
+#endif
 void handleTouchInterrupt();
-void captureMotionReference();
 bool refreshManagedScreen(ScreenId id);
 void saveMotionViewPreference();
 void saveScreenPreference(size_t screenIndex);
 void showNextScreen();
 void showPreviousScreen();
-void updateRecorderAudio();
 void initRtc();
-void updateRecorderVisuals();
-extern bool audioRecordingActive;
-extern bool audioPlaybackActive;
 std::unique_ptr<Arduino_IIC> touchController(
     new Arduino_FT3x68(touchBus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, handleTouchInterrupt));
 
@@ -132,54 +141,24 @@ lv_display_t *display = nullptr;
 lv_indev_t *touchInput = nullptr;
 static uint8_t *lvBuffer = nullptr;
 
-lv_obj_t *screenRoots[kScreenCount] = {};
-bool screenRefreshPending[kScreenCount] = {};
+lv_obj_t *screenRoots[12] = {};  // sized to max possible screens
+bool screenRefreshPending[9] = {};
 size_t currentScreenIndex = 0;
 bool screenPreferenceSavePending = false;
 size_t pendingScreenPreferenceIndex = 0;
 
 lv_obj_t *watchTimeLabel = nullptr;
 lv_obj_t *watchTimeRow = nullptr;
-lv_obj_t *watchTimeGlyphs[5] = {nullptr};
+lv_obj_t *watchTimeGlyphs[5] = {};
 lv_obj_t *watchDateLabel = nullptr;
 lv_obj_t *watchTimezoneLabel = nullptr;
-lv_obj_t *watchFirmwareLabel = nullptr;
 lv_obj_t *watchBatteryTrack = nullptr;
 lv_obj_t *watchBatteryFill = nullptr;
 lv_obj_t *watchWifiIcon = nullptr;
 lv_obj_t *watchBluetoothIcon = nullptr;
 lv_obj_t *watchUsbIcon = nullptr;
-lv_obj_t *watchStatusLabel = nullptr;
 
-lv_obj_t *motionScreen = nullptr;
-lv_obj_t *motionTapOverlay = nullptr;
-lv_obj_t *motionDotView = nullptr;
-lv_obj_t *motionDotBoundary = nullptr;
-lv_obj_t *motionDotCrossH = nullptr;
-lv_obj_t *motionDotCrossV = nullptr;
-lv_obj_t *motionDot = nullptr;
-lv_obj_t *motionCubeView = nullptr;
-lv_obj_t *motionRawView = nullptr;
-lv_obj_t *motionRawCard = nullptr;
-lv_obj_t *motionRawOrientation = nullptr;
-lv_obj_t *motionRawPitch = nullptr;
-lv_obj_t *motionRawRoll = nullptr;
-lv_obj_t *motionRawAccel = nullptr;
-lv_obj_t *motionRawGyro = nullptr;
-lv_obj_t *motionRawPitchCaption = nullptr;
-lv_obj_t *motionRawRollCaption = nullptr;
-lv_obj_t *motionRawAccelCaption = nullptr;
-lv_obj_t *motionRawGyroCaption = nullptr;
-lv_obj_t *motionCubeEdges[kCubeEdgeCount] = {nullptr};
-lv_obj_t *motionCubeArrows[kCubeArrowLineCount] = {nullptr};
-lv_point_precise_t motionCubeEdgePoints[kCubeEdgeCount][2] = {};
-lv_point_precise_t motionCubeArrowPoints[kCubeArrowLineCount][2] = {};
-
-lv_obj_t *otaOverlay = nullptr;
-lv_obj_t *otaStatusLabel = nullptr;
-lv_obj_t *otaFooterLabel = nullptr;
-lv_obj_t *otaPercentLabel = nullptr;
-lv_obj_t *otaBar = nullptr;
+lv_obj_t *cycleCountdownLabel = nullptr;
 lv_obj_t *powerHoldOverlay = nullptr;
 lv_obj_t *powerHoldStatusLabel = nullptr;
 lv_obj_t *powerHoldFooterLabel = nullptr;
@@ -190,7 +169,6 @@ bool expanderReady = false;
 bool powerReady = false;
 bool rtcReady = false;
 bool touchReady = false;
-bool imuReady = false;
 bool displayDimmed = false;
 bool inLightSleep = false;
 bool touchPressed = false;
@@ -200,40 +178,15 @@ bool sideButtonReleaseArmed = false;
 bool powerButtonPressed = false;
 bool powerButtonReleaseArmed = false;
 bool wifiAttemptInProgress = false;
-bool otaReady = false;
-bool otaInProgress = false;
-bool otaOverlaySticky = false;
 bool ntpConfigured = false;
-bool motionReferenceReady = false;
-bool motionReferenceCapturePending = false;
-bool motionDisplayValid = false;
-bool motionFilterReady = false;
-bool haveLastAccelSample = false;
-bool motionBuilt = false;
 bool sdMounted = false;
 bool touchTapTracking = false;
 bool powerButtonHoldActive = false;
 bool powerButtonShutdownTriggered = false;
 ConnectivityState connectivityState = ConnectivityState::Offline;
-MotionViewMode motionViewMode = MotionViewMode::Dot;
-MotionViewMode renderedMotionViewMode = MotionViewMode::Count;
-MotionState motionState;
-MotionState motionDisplayState;
-Vec3 motionReferenceDown = {0.0f, 0.0f, 1.0f};
-Vec3 motionReferenceAxisA = {1.0f, 0.0f, 0.0f};
-Vec3 motionReferenceAxisB = {0.0f, 1.0f, 0.0f};
-
-float motionPitchZero = 0.0f;
-float motionRollZero = 0.0f;
-float motionDotPitch = 0.0f;
-float motionDotRoll = 0.0f;
-float lastAccelX = 0.0f;
-float lastAccelY = 0.0f;
-float lastAccelZ = 0.0f;
 
 int16_t touchLastX = LCD_WIDTH / 2;
 int16_t touchLastY = LCD_HEIGHT / 2;
-int renderedMotionTransitionDirection = 0;
 size_t configuredNetworkCount = 0;
 size_t currentCredentialIndex = 0;
 size_t nextCredentialIndex = 0;
@@ -246,15 +199,15 @@ uint32_t lastStatusRefreshAtMs = 0;
 uint32_t lastMotionRefreshAtMs = 0;
 uint32_t lastWeatherAnimAtMs = 0;
 uint32_t lastRecorderVisualRefreshAtMs = 0;
-uint32_t lastImuSampleAtMs = 0;
 uint32_t wifiConnectStartedMs = 0;
 uint32_t nextWifiRetryAtMs = 0;
 uint32_t lastWifiServiceAtMs = 0;
 uint32_t lastActivityAtMs = 0;
-uint32_t otaOverlayHideAtMs = 0;
 time_t lastRtcWriteEpoch = 0;
 uint32_t touchTapStartedAtMs = 0;
 uint32_t lastSkyRefreshAtMs = 0;
+uint32_t lastAutoCycleAtMs = 0;
+bool autoCycleEnabled = false;
 
 int16_t touchTapStartX = LCD_WIDTH / 2;
 int16_t touchTapStartY = LCD_HEIGHT / 2;
@@ -286,7 +239,7 @@ void noteActivity()
 
 void saveMotionViewPreference()
 {
-  preferences.putUChar(kPrefMotionViewKey, static_cast<uint8_t>(motionViewMode));
+  preferences.putUChar(kPrefMotionViewKey, static_cast<uint8_t>(motionGetViewMode()));
 }
 
 void saveScreenPreference(size_t screenIndex)
@@ -308,46 +261,42 @@ String firmwareUpdatedText()
 
 void advanceMotionView()
 {
-  renderedMotionTransitionDirection = -1;
-  motionViewMode = static_cast<MotionViewMode>((static_cast<uint8_t>(motionViewMode) + 1) %
-                                               static_cast<uint8_t>(MotionViewMode::Count));
+  motionAdvanceView();
   saveMotionViewPreference();
 }
 
 void reverseMotionView()
 {
-  renderedMotionTransitionDirection = 1;
-  motionViewMode = static_cast<MotionViewMode>(
-      (static_cast<uint8_t>(motionViewMode) + static_cast<uint8_t>(MotionViewMode::Count) - 1) %
-      static_cast<uint8_t>(MotionViewMode::Count));
+  motionReverseView();
   saveMotionViewPreference();
-}
-
-void centerMotionDot()
-{
-  if (!motionDot) {
-    return;
-  }
-
-  if (motionDotBoundary) {
-    lv_obj_align_to(motionDot, motionDotBoundary, LV_ALIGN_CENTER, 0, 0);
-    return;
-  }
-
-  lv_obj_align(motionDot, LV_ALIGN_CENTER, 0, 0);
 }
 
 void handleScreenTap()
 {
   ScreenId currentScreen = static_cast<ScreenId>(currentScreenIndex);
   if (currentScreen == ScreenId::Motion) {
-    if (motionViewMode == MotionViewMode::Dot) {
-      captureMotionReference();
-      centerMotionDot();
+    MotionViewMode mode = motionGetViewMode();
+    if (mode == MotionViewMode::Dot) {
+      imuModuleCaptureReference();
+      motionCenterDot();
+    } else if (mode == MotionViewMode::Cube) {
+      imuModuleCaptureReference();
     }
     noteActivity();
     return;
   }
+#ifdef SCREEN_RECORDER
+  if (currentScreen == ScreenId::Recorder) {
+    recorderHandleTap();
+    return;
+  }
+#endif
+#ifdef SCREEN_STOPWATCH
+  if (currentScreen == ScreenId::Stopwatch) {
+    stopwatchHandleTap();
+    return;
+  }
+#endif
 }
 
 void handleMotionSwipe(int deltaY)
@@ -366,10 +315,20 @@ void handleMotionSwipe(int deltaY)
 
 bool isWeatherStackScreen(ScreenId screen)
 {
-  return screen == ScreenId::Weather || screen == ScreenId::Geo ||
-         screen == ScreenId::Solar || screen == ScreenId::Sky;
+  return screen == ScreenId::Weather
+#ifdef SCREEN_GEO
+         || screen == ScreenId::Geo
+#endif
+#ifdef SCREEN_SOLAR
+         || screen == ScreenId::Solar
+#endif
+#ifdef SCREEN_SKY
+         || screen == ScreenId::Sky
+#endif
+  ;
 }
 
+#ifdef SCREEN_QR
 void handleQrSwipe(int deltaY)
 {
   if (deltaY <= -kQrSwipeMinDistancePx) {
@@ -387,6 +346,7 @@ void handleQrSwipe(int deltaY)
     noteActivity();
   }
 }
+#endif
 
 void handleScreenNavigationSwipe(int deltaX)
 {
@@ -462,6 +422,7 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         touchGestureConsumed = true;
         touchTapTracking = false;
       }
+#ifdef SCREEN_QR
     } else if (pressedNow && !touchGestureConsumed &&
                static_cast<ScreenId>(currentScreenIndex) == ScreenId::Qr) {
       int deltaX = touchLastX - touchTapStartX;
@@ -474,6 +435,7 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         touchGestureConsumed = true;
         touchTapTracking = false;
       }
+#endif
     } else if (pressedNow && !touchGestureConsumed &&
                isWeatherStackScreen(static_cast<ScreenId>(currentScreenIndex))) {
       int deltaX = touchLastX - touchTapStartX;
@@ -498,8 +460,13 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
       int deltaY = touchLastY - touchTapStartY;
       int absDx = abs(deltaX);
       int absDy = abs(deltaY);
-      if (absDx >= kScreenNavSwipeMinDistancePx &&
-          absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+      if (absDy >= kScreenNavSwipeMinDistancePx && absDy >= (absDx + kMotionSwipeMinDominancePx)) {
+        if (watchCalendarIsVisible()) { watchDismissCalendar(); } else { watchShowCalendar(); }
+        noteActivity();
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      } else if (absDx >= kScreenNavSwipeMinDistancePx &&
+                 absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
         handleScreenNavigationSwipe(deltaX);
         touchGestureConsumed = true;
         touchTapTracking = false;
@@ -520,10 +487,12 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
                  absDy >= kMotionSwipeMinDistancePx &&
                  absDy >= (absDx + kMotionSwipeMinDominancePx)) {
         handleMotionSwipe(deltaY);
+#ifdef SCREEN_QR
       } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Qr &&
                  absDy >= kQrSwipeMinDistancePx &&
                  absDy >= (absDx + kQrSwipeMinDominancePx)) {
         handleQrSwipe(deltaY);
+#endif
       } else if (isWeatherStackScreen(static_cast<ScreenId>(currentScreenIndex)) &&
                  absDy >= kWeatherNavSwipeMinDistancePx &&
                  absDy >= (absDx + kWeatherNavSwipeMinDominancePx)) {
@@ -532,6 +501,10 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
                  absDx >= kWeatherSwipeMinDistancePx &&
                  absDx >= (absDy + 10)) {
         handleWeatherSwipe(deltaX);
+      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watch &&
+                 absDy >= kScreenNavSwipeMinDistancePx && absDy >= (absDx + kMotionSwipeMinDominancePx)) {
+        if (watchCalendarIsVisible()) { watchDismissCalendar(); } else { watchShowCalendar(); }
+        noteActivity();
       } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watch &&
                  absDx >= kScreenNavSwipeMinDistancePx &&
                  absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
@@ -544,6 +517,16 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
       if (dx > kTapMaxTravelPx || dy > kTapMaxTravelPx) {
         touchTapTracking = false;
       }
+#ifdef SCREEN_STOPWATCH
+      else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Stopwatch) {
+        uint32_t held = millis() - touchTapStartedAtMs;
+        if (held >= kStopwatchLongPressMs) {
+          stopwatchHandleLongPress();
+          touchTapTracking = false;
+          touchGestureConsumed = true;
+        }
+      }
+#endif
     }
 
     touchPressed = pressedNow;
@@ -685,52 +668,6 @@ bool hasValidTime()
   return time(nullptr) >= kMinValidEpoch;
 }
 
-bool batteryIsAvailable()
-{
-  return powerReady && power.isBatteryConnect();
-}
-
-int batteryPercentValue()
-{
-  if (!batteryIsAvailable()) {
-    return -1;
-  }
-
-  int percent = power.getBatteryPercent();
-  return percent < 0 ? -1 : constrain(percent, 0, 100);
-}
-
-bool usbIsConnected()
-{
-  return powerReady && power.isVbusIn();
-}
-
-bool batteryIsCharging()
-{
-  if (!powerReady || !usbIsConnected()) {
-    return false;
-  }
-
-  int percent = power.getBatteryPercent();
-  if (percent >= 100) {
-    return true;
-  }
-
-  if (power.isCharging()) {
-    return true;
-  }
-
-  switch (power.getChargerStatus()) {
-    case XPOWERS_AXP2101_CHG_PRE_STATE:
-    case XPOWERS_AXP2101_CHG_CC_STATE:
-    case XPOWERS_AXP2101_CHG_CV_STATE:
-    case XPOWERS_AXP2101_CHG_TRI_STATE:
-      return true;
-    default:
-      return false;
-  }
-}
-
 String timeText()
 {
   if (!hasValidTime()) {
@@ -773,31 +710,6 @@ String timezoneText()
   return String(buffer);
 }
 
-lv_color_t batteryIndicatorColor(int percent, bool charging)
-{
-  if (charging) {
-    return lvColor(0, 120, 255);
-  }
-
-  if (percent < 0) {
-    return lvColor(88, 88, 96);
-  }
-
-  int clamped = constrain(percent, 0, 100);
-  uint8_t red = 0;
-  uint8_t green = 0;
-
-  if (clamped <= 50) {
-    red = 255;
-    green = static_cast<uint8_t>((clamped * 255) / 50);
-  } else {
-    red = static_cast<uint8_t>(((100 - clamped) * 255) / 50);
-    green = 255;
-  }
-
-  return lvColor(red, green, 0);
-}
-
 void persistTimeToRtc()
 {
   if (!rtcReady || !hasValidTime()) {
@@ -815,130 +727,6 @@ void persistTimeToRtc()
   lastRtcWriteEpoch = now;
 }
 
-float degreesToRadians(float degrees)
-{
-  return degrees * (PI / 180.0f);
-}
-
-float radiansToDegrees(float radians)
-{
-  return radians * (180.0f / PI);
-}
-
-float normalizeDegrees(float degrees)
-{
-  while (degrees < 0.0f) {
-    degrees += 360.0f;
-  }
-  while (degrees >= 360.0f) {
-    degrees -= 360.0f;
-  }
-  return degrees;
-}
-
-double julianDateFromUnix(time_t unixTime)
-{
-  return (static_cast<double>(unixTime) / 86400.0) + 2440587.5;
-}
-
-double localSiderealTimeDegrees(time_t unixTime, float longitudeDegrees)
-{
-  double jd = julianDateFromUnix(unixTime);
-  double t = (jd - 2451545.0) / 36525.0;
-  double gmst = 280.46061837 +
-                (360.98564736629 * (jd - 2451545.0)) +
-                (0.000387933 * t * t) -
-                (t * t * t / 38710000.0);
-  return normalizeDegrees(static_cast<float>(gmst + longitudeDegrees));
-}
-
-bool equatorialToHorizontal(float raHours,
-                            float decDegrees,
-                            float latitudeDegrees,
-                            float longitudeDegrees,
-                            time_t unixTime,
-                            float &altitudeDegrees,
-                            float &azimuthDegrees)
-{
-  double raDegrees = static_cast<double>(raHours) * 15.0;
-  double decRadians = degreesToRadians(decDegrees);
-  double latRadians = degreesToRadians(latitudeDegrees);
-  double hourAngleDegrees = localSiderealTimeDegrees(unixTime, longitudeDegrees) - raDegrees;
-  while (hourAngleDegrees < -180.0) {
-    hourAngleDegrees += 360.0;
-  }
-  while (hourAngleDegrees > 180.0) {
-    hourAngleDegrees -= 360.0;
-  }
-
-  double hourAngleRadians = degreesToRadians(static_cast<float>(hourAngleDegrees));
-  double sinAltitude = (sin(decRadians) * sin(latRadians)) +
-                       (cos(decRadians) * cos(latRadians) * cos(hourAngleRadians));
-  sinAltitude = fmax(-1.0, fmin(1.0, sinAltitude));
-  double altitudeRadians = asin(sinAltitude);
-  double cosAltitude = cos(altitudeRadians);
-
-  if (fabs(cosAltitude) < 0.000001) {
-    altitudeDegrees = 90.0f;
-    azimuthDegrees = 0.0f;
-    return true;
-  }
-
-  double cosAzimuth = (sin(decRadians) - (sin(altitudeRadians) * sin(latRadians))) /
-                      (cosAltitude * cos(latRadians));
-  cosAzimuth = fmax(-1.0, fmin(1.0, cosAzimuth));
-  double azimuthRadians = acos(cosAzimuth);
-  if (sin(hourAngleRadians) > 0.0) {
-    azimuthRadians = (2.0 * PI) - azimuthRadians;
-  }
-
-  altitudeDegrees = radiansToDegrees(static_cast<float>(altitudeRadians));
-  azimuthDegrees = radiansToDegrees(static_cast<float>(azimuthRadians));
-  return true;
-}
-
-float compressedOrbitRadius(float distanceAu)
-{
-  return sqrtf(fmaxf(distanceAu, 0.0f));
-}
-
-bool parseHorizonsVectorRow(const String &result, float &xAu, float &yAu, float &zAu)
-{
-  int startIndex = result.indexOf("$$SOE");
-  if (startIndex < 0) {
-    return false;
-  }
-
-  startIndex = result.indexOf('\n', startIndex);
-  if (startIndex < 0) {
-    return false;
-  }
-  ++startIndex;
-
-  int endIndex = result.indexOf('\n', startIndex);
-  if (endIndex < 0) {
-    return false;
-  }
-
-  String row = result.substring(startIndex, endIndex);
-  row.trim();
-  if (row.length() == 0) {
-    return false;
-  }
-
-  float parsedX = 0.0f;
-  float parsedY = 0.0f;
-  float parsedZ = 0.0f;
-  if (sscanf(row.c_str(), " %*[^,], %*[^,], %f, %f, %f", &parsedX, &parsedY, &parsedZ) != 3) {
-    return false;
-  }
-
-  xAu = parsedX;
-  yAu = parsedY;
-  zAu = parsedZ;
-  return true;
-}
-
 void setOfflineMode(const char *reason)
 {
   if (WiFi.status() == WL_CONNECTED) {
@@ -947,7 +735,6 @@ void setOfflineMode(const char *reason)
 
   connectivityState = ConnectivityState::Offline;
   wifiAttemptInProgress = false;
-  otaReady = false;
   ntpConfigured = false;
 
   weatherModuleMarkOffline();
@@ -957,7 +744,7 @@ void setOfflineMode(const char *reason)
 
 bool otaUpdateInProgress()
 {
-  return otaInProgress;
+  return otaModuleIsInProgress();
 }
 
 bool lightSleepActive()
@@ -1098,99 +885,6 @@ void updatePowerButtonHold()
   updatePowerHoldOverlay("Power Off", "release to cancel", remainingTenths);
 }
 
-void updateOtaOverlay(const String &status, const String &footer, int percent)
-{
-  if (!otaOverlay) {
-    return;
-  }
-
-  lv_obj_clear_flag(otaOverlay, LV_OBJ_FLAG_HIDDEN);
-  lv_label_set_text(otaStatusLabel, status.c_str());
-  lv_label_set_text(otaFooterLabel, footer.c_str());
-  String percentText = String(percent) + "%";
-  lv_label_set_text(otaPercentLabel, percentText.c_str());
-  lv_bar_set_value(otaBar, percent, LV_ANIM_OFF);
-  if (display) {
-    lv_timer_handler();
-  }
-}
-
-void scheduleOtaOverlayHide(uint32_t delayMs)
-{
-  otaOverlaySticky = true;
-  otaOverlayHideAtMs = millis() + delayMs;
-}
-
-void hideOtaOverlay()
-{
-  if (!otaOverlay) {
-    return;
-  }
-
-  lv_obj_add_flag(otaOverlay, LV_OBJ_FLAG_HIDDEN);
-  otaOverlaySticky = false;
-  otaOverlayHideAtMs = 0;
-}
-
-void startOta()
-{
-  if (otaReady || !networkIsOnline()) {
-    return;
-  }
-
-  ArduinoOTA.setHostname(OTA_HOSTNAME);
-  if (strlen(OTA_PASSWORD) > 0) {
-    ArduinoOTA.setPassword(OTA_PASSWORD);
-  }
-
-  ArduinoOTA
-      .onStart([]() {
-        Serial.println("OTA start");
-        otaInProgress = true;
-        otaOverlaySticky = false;
-        otaOverlayHideAtMs = 0;
-        updateOtaOverlay("Receiving firmware", "do not power off", 0);
-      })
-      .onEnd([]() {
-        Serial.println("\nOTA complete");
-        updateOtaOverlay("Finishing update", "restarting", 100);
-        delay(350);
-      })
-      .onProgress([](unsigned int progress, unsigned int total) {
-        int percent = static_cast<int>((progress * 100U) / total);
-        updateOtaOverlay("Receiving firmware", "do not power off", percent);
-      })
-      .onError([](ota_error_t error) {
-        Serial.printf("OTA error[%u]\n", error);
-        otaInProgress = false;
-
-        String status = "Update failed";
-        switch (error) {
-          case OTA_AUTH_ERROR:
-            status = "Auth failed";
-            break;
-          case OTA_BEGIN_ERROR:
-            status = "Begin failed";
-            break;
-          case OTA_CONNECT_ERROR:
-            status = "Connect failed";
-            break;
-          case OTA_RECEIVE_ERROR:
-            status = "Receive failed";
-            break;
-          case OTA_END_ERROR:
-            status = "Finalize failed";
-            break;
-        }
-        updateOtaOverlay(status, "returning to app", 0);
-        scheduleOtaOverlayHide(1600);
-      });
-
-  ArduinoOTA.begin();
-  otaReady = true;
-  Serial.printf("OTA ready at %s.local (%s)\n", OTA_HOSTNAME, WiFi.localIP().toString().c_str());
-}
-
 void updateWiFi()
 {
   if (!hasConfiguredNetworks()) {
@@ -1207,7 +901,7 @@ void updateWiFi()
                     WiFi.localIP().toString().c_str());
     }
     requestNtpSync();
-    startOta();
+    otaModuleStart();
     return;
   }
 
@@ -1244,328 +938,6 @@ void updateWiFi()
   beginNextWifiCycle();
 }
 
-
-Vec3 vec3(float x, float y, float z)
-{
-  return {x, y, z};
-}
-
-Vec3 addVec3(const Vec3 &a, const Vec3 &b)
-{
-  return {a.x + b.x, a.y + b.y, a.z + b.z};
-}
-
-Vec3 subtractVec3(const Vec3 &a, const Vec3 &b)
-{
-  return {a.x - b.x, a.y - b.y, a.z - b.z};
-}
-
-Vec3 scaleVec3(const Vec3 &value, float scalar)
-{
-  return {value.x * scalar, value.y * scalar, value.z * scalar};
-}
-
-float lengthVec3(const Vec3 &value)
-{
-  return sqrtf(value.x * value.x + value.y * value.y + value.z * value.z);
-}
-
-Vec3 normalizeVec3(const Vec3 &value)
-{
-  float length = lengthVec3(value);
-  if (length < 0.0001f) {
-    return {0.0f, 0.0f, 0.0f};
-  }
-
-  return {value.x / length, value.y / length, value.z / length};
-}
-
-Vec3 crossVec3(const Vec3 &a, const Vec3 &b)
-{
-  return {
-      a.y * b.z - a.z * b.y,
-      a.z * b.x - a.x * b.z,
-      a.x * b.y - a.y * b.x,
-  };
-}
-
-float dotVec3(const Vec3 &a, const Vec3 &b)
-{
-  return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-Vec3 projectOntoPlane(const Vec3 &vector, const Vec3 &normal)
-{
-  return subtractVec3(vector, scaleVec3(normal, dotVec3(vector, normal)));
-}
-
-Vec3 stablePerpendicular(const Vec3 &base, const Vec3 &fallback)
-{
-  Vec3 perpendicular = normalizeVec3(projectOntoPlane(fallback, base));
-  if (lengthVec3(perpendicular) >= 0.1f) {
-    return perpendicular;
-  }
-
-  Vec3 alternate = fabsf(base.x) < 0.85f ? vec3(1.0f, 0.0f, 0.0f) : vec3(0.0f, 1.0f, 0.0f);
-  perpendicular = normalizeVec3(projectOntoPlane(alternate, base));
-  if (lengthVec3(perpendicular) >= 0.1f) {
-    return perpendicular;
-  }
-
-  return {1.0f, 0.0f, 0.0f};
-}
-
-Vec3 normalizedDownVector(const MotionState &state)
-{
-  return normalizeVec3(vec3(state.ax, state.ay, state.az));
-}
-
-const char *dominantPhysicalDirection(float ax, float ay, float az)
-{
-  float absX = fabsf(ax);
-  float absY = fabsf(ay);
-  float absZ = fabsf(az);
-
-  if (absZ >= absX && absZ >= absY) {
-    return az >= 0.0f ? "FACE DOWN" : "FACE UP";
-  }
-
-  if (absX >= absY) {
-    return ax >= 0.0f ? "USB SIDE" : "LEFT EDGE";
-  }
-
-  return ay >= 0.0f ? "TOP EDGE" : "BOTTOM EDGE";
-}
-
-void remapImuAxes(float rawAx, float rawAy, float rawAz,
-                  float rawGx, float rawGy, float rawGz,
-                  float &ax, float &ay, float &az,
-                  float &gx, float &gy, float &gz)
-{
-  // Board orientation: sensor X maps to watch "top", sensor Y maps to watch "right".
-  ax = -rawAy;
-  ay = -rawAx;
-  az = -rawAz;
-  gx = -rawGy;
-  gy = -rawGx;
-  gz = -rawGz;
-}
-
-void setOrientationLabel(float ax, float ay, float az)
-{
-  float absX = fabsf(ax);
-  float absY = fabsf(ay);
-  float absZ = fabsf(az);
-
-  const char *label = "Moving";
-  if (absZ >= absX && absZ >= absY) {
-    label = az >= 0.0f ? "Face Up" : "Face Down";
-  } else if (absX >= absY) {
-    label = ax >= 0.0f ? "Left Up" : "Right Up";
-  } else {
-    label = ay >= 0.0f ? "Bottom Up" : "Top Up";
-  }
-
-  snprintf(motionState.orientation, sizeof(motionState.orientation), "%s", label);
-}
-
-bool initImu()
-{
-  imuReady = imu.begin(Wire, QMI8658_L_SLAVE_ADDRESS, IIC_SDA, IIC_SCL);
-  if (!imuReady) {
-    Serial.println("QMI8658 not found");
-    motionState.valid = false;
-    return false;
-  }
-
-  if (!imu.configAccelerometer(SensorQMI8658::ACC_RANGE_4G,
-                               SensorQMI8658::ACC_ODR_125Hz,
-                               SensorQMI8658::LPF_MODE_0)) {
-    Serial.println("QMI8658 accelerometer configuration failed");
-    imuReady = false;
-    motionState.valid = false;
-    return false;
-  }
-
-  imu.configGyroscope(SensorQMI8658::GYR_RANGE_512DPS,
-                      SensorQMI8658::GYR_ODR_112_1Hz,
-                      SensorQMI8658::LPF_MODE_3);
-
-  if (!imu.enableAccelerometer()) {
-    Serial.println("QMI8658 accelerometer enable failed");
-    imuReady = false;
-    motionState.valid = false;
-    return false;
-  }
-
-  imu.enableGyroscope();
-  pinMode(IMU_IRQ, INPUT_PULLUP);
-
-  motionState.valid = false;
-  motionDisplayValid = false;
-  motionFilterReady = false;
-  haveLastAccelSample = false;
-  lastImuSampleAtMs = 0;
-  return true;
-}
-
-bool configureImuWakeOnMotion()
-{
-  if (!imuReady) {
-    return false;
-  }
-
-  if (!imu.configWakeOnMotion(100,
-                              SensorQMI8658::ACC_ODR_LOWPOWER_128Hz,
-                              SensorQMI8658::INTERRUPT_PIN_2)) {
-    Serial.println("QMI8658 wake-on-motion configuration failed");
-    return false;
-  }
-
-  pinMode(IMU_IRQ, INPUT_PULLUP);
-  return true;
-}
-
-float blendMotionValue(float current, float target, float alpha)
-{
-  return current + ((target - current) * alpha);
-}
-
-float normalizeMotionIndicatorOffset(float offset)
-{
-  float magnitude = fabsf(offset);
-  if (magnitude <= kMotionIndicatorDeadzoneVector) {
-    return 0.0f;
-  }
-
-  float adjustedMagnitude = (magnitude - kMotionIndicatorDeadzoneVector) /
-                            (kMotionIndicatorFullScaleVector - kMotionIndicatorDeadzoneVector);
-  adjustedMagnitude = constrain(adjustedMagnitude, 0.0f, 1.0f);
-  return copysignf(adjustedMagnitude, offset);
-}
-
-void updateImuState()
-{
-  if (!imuReady || inLightSleep) {
-    return;
-  }
-
-  uint32_t now = millis();
-  if (now - lastImuSampleAtMs < kImuSampleIntervalMs) {
-    return;
-  }
-  lastImuSampleAtMs = now;
-
-  if (!imu.getDataReady()) {
-    return;
-  }
-
-  float ax = 0.0f;
-  float ay = 0.0f;
-  float az = 0.0f;
-  if (!imu.getAccelerometer(ax, ay, az)) {
-    return;
-  }
-  float rawAx = ax;
-  float rawAy = ay;
-  float rawAz = az;
-
-  float gx = 0.0f;
-  float gy = 0.0f;
-  float gz = 0.0f;
-  imu.getGyroscope(gx, gy, gz);
-  float rawGx = gx;
-  float rawGy = gy;
-  float rawGz = gz;
-
-  remapImuAxes(rawAx, rawAy, rawAz,
-               rawGx, rawGy, rawGz,
-               ax, ay, az,
-               gx, gy, gz);
-
-  if (motionState.valid) {
-    ax = blendMotionValue(motionState.ax, ax, kMotionSensorSmoothingAlpha);
-    ay = blendMotionValue(motionState.ay, ay, kMotionSensorSmoothingAlpha);
-    az = blendMotionValue(motionState.az, az, kMotionSensorSmoothingAlpha);
-    gx = blendMotionValue(motionState.gx, gx, kMotionSensorSmoothingAlpha);
-    gy = blendMotionValue(motionState.gy, gy, kMotionSensorSmoothingAlpha);
-    gz = blendMotionValue(motionState.gz, gz, kMotionSensorSmoothingAlpha);
-  }
-
-  motionState.valid = true;
-  motionState.ax = ax;
-  motionState.ay = ay;
-  motionState.az = az;
-  motionState.gx = gx;
-  motionState.gy = gy;
-  motionState.gz = gz;
-  motionState.pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
-  motionState.roll = atan2f(ay, az) * 180.0f / PI;
-  setOrientationLabel(ax, ay, az);
-
-  if (!motionDisplayValid) {
-    motionDisplayState = motionState;
-    motionDisplayValid = true;
-  } else {
-    motionDisplayState.ax = blendMotionValue(motionDisplayState.ax, motionState.ax, kMotionReadoutSmoothingAlpha);
-    motionDisplayState.ay = blendMotionValue(motionDisplayState.ay, motionState.ay, kMotionReadoutSmoothingAlpha);
-    motionDisplayState.az = blendMotionValue(motionDisplayState.az, motionState.az, kMotionReadoutSmoothingAlpha);
-    motionDisplayState.gx = blendMotionValue(motionDisplayState.gx, motionState.gx, kMotionReadoutSmoothingAlpha);
-    motionDisplayState.gy = blendMotionValue(motionDisplayState.gy, motionState.gy, kMotionReadoutSmoothingAlpha);
-    motionDisplayState.gz = blendMotionValue(motionDisplayState.gz, motionState.gz, kMotionReadoutSmoothingAlpha);
-    motionDisplayState.pitch = blendMotionValue(motionDisplayState.pitch, motionState.pitch, kMotionReadoutSmoothingAlpha);
-    motionDisplayState.roll = blendMotionValue(motionDisplayState.roll, motionState.roll, kMotionReadoutSmoothingAlpha);
-    motionDisplayState.valid = true;
-    snprintf(motionDisplayState.orientation, sizeof(motionDisplayState.orientation), "%s", motionState.orientation);
-  }
-
-  if (!haveLastAccelSample) {
-    lastAccelX = rawAx;
-    lastAccelY = rawAy;
-    lastAccelZ = rawAz;
-    haveLastAccelSample = true;
-    return;
-  }
-
-  float delta = fabsf(rawAx - lastAccelX) + fabsf(rawAy - lastAccelY) + fabsf(rawAz - lastAccelZ);
-  lastAccelX = rawAx;
-  lastAccelY = rawAy;
-  lastAccelZ = rawAz;
-  if (delta >= kMotionDeltaThreshold) {
-    noteActivity();
-  }
-}
-
-void captureMotionReference()
-{
-  motionDotPitch = 0.0f;
-  motionDotRoll = 0.0f;
-  motionFilterReady = false;
-  motionReferenceReady = false;
-  motionReferenceCapturePending = true;
-}
-
-void motionCubeBasis(const MotionState &state, Vec3 &down, Vec3 &axisA, Vec3 &axisB)
-{
-  down = normalizedDownVector(state);
-  if (!motionReferenceReady) {
-    captureMotionReference();
-  }
-
-  if (!motionReferenceReady) {
-    axisA = vec3(1.0f, 0.0f, 0.0f);
-    axisB = vec3(0.0f, 1.0f, 0.0f);
-    return;
-  }
-
-  axisA = stablePerpendicular(down, motionReferenceAxisA);
-  axisB = normalizeVec3(crossVec3(down, axisA));
-  if (lengthVec3(axisB) < 0.1f) {
-    axisB = stablePerpendicular(down, motionReferenceAxisB);
-    axisA = normalizeVec3(crossVec3(axisB, down));
-  }
-}
-
 void enableWakeOnPinChange(uint8_t pin)
 {
   pinMode(pin, INPUT_PULLUP);
@@ -1587,7 +959,7 @@ void restoreFromLightSleep()
   displayDimmed = false;
 
   initTouch();
-  initImu();
+  imuModuleInit();
   noteActivity();
 
   if (hasConfiguredNetworks()) {
@@ -1604,7 +976,7 @@ void restoreFromLightSleep()
 
 void enterLightSleep()
 {
-  if (inLightSleep || otaInProgress || usbIsConnected()) {
+  if (inLightSleep || otaModuleIsInProgress() || usbIsConnected()) {
     return;
   }
 
@@ -1615,7 +987,7 @@ void enterLightSleep()
   WiFi.mode(WIFI_OFF);
 
   enableWakeOnPinChange(TP_INT);
-  if (configureImuWakeOnMotion()) {
+  if (imuModuleConfigureWakeOnMotion()) {
     enableWakeOnPinChange(IMU_IRQ);
   }
 
@@ -1631,7 +1003,11 @@ void enterLightSleep()
 
 void updateIdleState()
 {
-  if (otaInProgress || inLightSleep || audioRecordingActive || audioPlaybackActive) {
+  if (otaModuleIsInProgress() || inLightSleep
+#ifdef SCREEN_RECORDER
+      || audioRecordingActive || audioPlaybackActive
+#endif
+  ) {
     return;
   }
 
@@ -1689,73 +1065,6 @@ void setObjYOffset(void *obj, int32_t value)
   lv_obj_set_y(static_cast<lv_obj_t *>(obj), static_cast<lv_coord_t>(value));
 }
 
-lv_obj_t *motionViewObject(MotionViewMode mode)
-{
-  switch (mode) {
-    case MotionViewMode::Dot:
-      return motionDotView;
-    case MotionViewMode::Cube:
-      return motionCubeView;
-    case MotionViewMode::Raw:
-      return motionRawView;
-    default:
-      return nullptr;
-  }
-}
-
-void showMotionViewInstant(MotionViewMode mode)
-{
-  if (!motionDotView || !motionCubeView || !motionRawView) {
-    return;
-  }
-
-  lv_obj_add_flag(motionDotView, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(motionCubeView, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(motionRawView, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_set_y(motionDotView, 0);
-  lv_obj_set_y(motionCubeView, 0);
-  lv_obj_set_y(motionRawView, 0);
-
-  lv_obj_t *target = motionViewObject(mode);
-  if (target) {
-    lv_obj_clear_flag(target, LV_OBJ_FLAG_HIDDEN);
-  }
-  renderedMotionViewMode = mode;
-}
-
-void animateMotionViewTo(MotionViewMode mode)
-{
-  lv_obj_t *target = motionViewObject(mode);
-  if (!target) {
-    return;
-  }
-
-  if (renderedMotionViewMode == MotionViewMode::Count || renderedMotionViewMode == mode) {
-    showMotionViewInstant(mode);
-    return;
-  }
-
-  lv_obj_t *previous = motionViewObject(renderedMotionViewMode);
-  if (previous) {
-    lv_obj_add_flag(previous, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_y(previous, 0);
-  }
-
-  lv_obj_clear_flag(target, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_set_y(target, renderedMotionTransitionDirection * kMotionViewAnimOffsetPx);
-
-  lv_anim_t anim;
-  lv_anim_init(&anim);
-  lv_anim_set_var(&anim, target);
-  lv_anim_set_values(&anim, renderedMotionTransitionDirection * kMotionViewAnimOffsetPx, 0);
-  lv_anim_set_time(&anim, kMotionViewAnimMs);
-  lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
-  lv_anim_set_exec_cb(&anim, setObjYOffset);
-  lv_anim_start(&anim);
-
-  renderedMotionViewMode = mode;
-}
-
 void enableTapBubbling(lv_obj_t *obj)
 {
   lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
@@ -1782,10 +1091,10 @@ bool showScreen(size_t index)
 
   size_t previousScreenIndex = currentScreenIndex;
   currentScreenIndex = index;
+  screenManagerEnter(nextScreen);
+  screenManagerRefresh(nextScreen);
   lv_screen_load(screenManagerRoot(nextScreen));
   lv_refr_now(display);
-
-  screenManagerEnter(nextScreen);
   scheduleScreenRefresh(nextScreen);
   pendingScreenPreferenceIndex = currentScreenIndex;
   screenPreferenceSavePending = true;
@@ -1795,11 +1104,13 @@ bool showScreen(size_t index)
 
 void showNextScreen()
 {
+  if (watchCalendarIsVisible()) watchDismissCalendarSilent();
   showScreen(screenManagerNextEnabledIndex(currentScreenIndex));
 }
 
 void showPreviousScreen()
 {
+  if (watchCalendarIsVisible()) watchDismissCalendarSilent();
   showScreen(screenManagerPreviousEnabledIndex(currentScreenIndex));
 }
 
@@ -1819,15 +1130,22 @@ void updateTopButton()
       noteActivity();
       if (now - lastTopButtonEdgeAtMs >= kButtonDebounceMs) {
         lastTopButtonEdgeAtMs = now;
-        showNextScreen();
       }
     }
     return;
   }
 
   if (sideButtonPressed) {
+    uint32_t heldMs = now - sideButtonPressedAtMs;
     sideButtonPressed = false;
     sideButtonReleaseArmed = false;
+    if (heldMs >= kSideButtonLongPressMs) {
+      autoCycleEnabled = !autoCycleEnabled;
+      lastAutoCycleAtMs = now;
+    } else {
+      showNextScreen();
+      noteActivity();
+    }
   }
 }
 
@@ -1843,16 +1161,24 @@ void updatePowerKey()
 
   power.getIrqStatus();
   bool shortPress = power.isPekeyShortPressIrq();
+  bool longPress = power.isPekeyLongPressIrq();
   bool releasedEdge = power.isPekeyNegativeIrq();
+
+  if (longPress && !powerButtonShutdownTriggered) {
+    autoCycleEnabled = !autoCycleEnabled;
+    lastAutoCycleAtMs = millis();
+    cancelPowerButtonHold();
+    noteActivity();
+  }
 
   if (shortPress) {
     powerButtonPressed = false;
-    bool shouldNavigate = !powerButtonShutdownTriggered &&
-                          millis() - lastPowerButtonEdgeAtMs >= kButtonDebounceMs;
+    bool shouldAct = !powerButtonShutdownTriggered &&
+                     millis() - lastPowerButtonEdgeAtMs >= kButtonDebounceMs;
     cancelPowerButtonHold();
-    if (shouldNavigate) {
+    if (shouldAct) {
       lastPowerButtonEdgeAtMs = millis();
-      showPreviousScreen();
+      showNextScreen();
     }
     powerButtonReleaseArmed = false;
   }
@@ -1864,64 +1190,6 @@ void updatePowerKey()
   }
 
   power.clearIrqStatus();
-}
-
-
-void buildOtaOverlay()
-{
-  otaOverlay = lv_obj_create(lv_layer_top());
-  lv_obj_set_size(otaOverlay, LCD_WIDTH, LCD_HEIGHT);
-  lv_obj_set_style_bg_color(otaOverlay, lvColor(0, 0, 0), 0);
-  lv_obj_set_style_bg_opa(otaOverlay, LV_OPA_90, 0);
-  lv_obj_set_style_border_width(otaOverlay, 0, 0);
-  lv_obj_clear_flag(otaOverlay, LV_OBJ_FLAG_SCROLLABLE);
-
-  lv_obj_t *card = lv_obj_create(otaOverlay);
-  lv_obj_set_size(card, 280, 212);
-  lv_obj_center(card);
-  lv_obj_set_style_radius(card, 24, 0);
-  lv_obj_set_style_bg_color(card, lvColor(8, 12, 18), 0);
-  lv_obj_set_style_border_width(card, 1, 0);
-  lv_obj_set_style_border_color(card, lvColor(34, 60, 96), 0);
-  lv_obj_set_style_pad_all(card, 18, 0);
-
-  lv_obj_t *title = lv_label_create(card);
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-  lv_label_set_text(title, "Firmware Update");
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
-
-  otaStatusLabel = lv_label_create(card);
-  lv_obj_set_width(otaStatusLabel, 244);
-  lv_obj_set_style_text_font(otaStatusLabel, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_align(otaStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_long_mode(otaStatusLabel, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(otaStatusLabel, "Ready");
-  lv_obj_align(otaStatusLabel, LV_ALIGN_TOP_MID, 0, 48);
-
-  otaPercentLabel = lv_label_create(card);
-  lv_obj_set_style_text_font(otaPercentLabel, &lv_font_montserrat_48, 0);
-  lv_label_set_text(otaPercentLabel, "0%");
-  lv_obj_align(otaPercentLabel, LV_ALIGN_CENTER, 0, -8);
-
-  otaBar = lv_bar_create(card);
-  lv_obj_set_size(otaBar, 224, 10);
-  lv_obj_align(otaBar, LV_ALIGN_CENTER, 0, 44);
-  lv_bar_set_range(otaBar, 0, 100);
-  lv_bar_set_value(otaBar, 0, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(otaBar, lvColor(28, 34, 40), 0);
-  lv_obj_set_style_bg_color(otaBar, lvColor(52, 132, 255), LV_PART_INDICATOR);
-  lv_obj_set_style_radius(otaBar, LV_RADIUS_CIRCLE, 0);
-
-  otaFooterLabel = lv_label_create(card);
-  lv_obj_set_width(otaFooterLabel, 244);
-  lv_obj_set_style_text_font(otaFooterLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(otaFooterLabel, lvColor(168, 178, 194), 0);
-  lv_obj_set_style_text_align(otaFooterLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_long_mode(otaFooterLabel, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(otaFooterLabel, "do not power off");
-  lv_obj_align(otaFooterLabel, LV_ALIGN_BOTTOM_MID, 0, -6);
-
-  hideOtaOverlay();
 }
 
 void buildPowerHoldOverlay()
@@ -1981,16 +1249,26 @@ void buildPowerHoldOverlay()
   hidePowerHoldOverlay();
 }
 
-void buildUi()
+void buildCycleCountdown()
 {
-  buildOtaOverlay();
-  buildPowerHoldOverlay();
+  cycleCountdownLabel = lv_label_create(lv_layer_top());
+  lv_obj_set_style_text_font(cycleCountdownLabel, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(cycleCountdownLabel, lvColor(255, 255, 255), 0);
+  lv_obj_set_style_text_opa(cycleCountdownLabel, LV_OPA_70, 0);
+  lv_label_set_text(cycleCountdownLabel, "");
+  lv_obj_align(cycleCountdownLabel, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_obj_add_flag(cycleCountdownLabel, LV_OBJ_FLAG_HIDDEN);
 }
 
-
-
-
-
+void buildUi()
+{
+  otaModuleBuildOverlay();
+  buildPowerHoldOverlay();
+  buildCycleCountdown();
+  for (size_t i = 0; i < kScreenCount; ++i) {
+    screenManagerEnsureBuilt(static_cast<ScreenId>(i));
+  }
+}
 
 void setupLvgl()
 {
@@ -2063,7 +1341,7 @@ void setup()
   initPower();
   initRtc();
   initTouch();
-  initImu();
+  imuModuleInit();
   sdMounted = false;
 
   if (!gfx->begin()) {
@@ -2088,21 +1366,27 @@ void setup()
   if (configuredNetworkCount == 0 && !weatherModuleHasData()) {
     weatherModuleSetUnavailable("Offline - no Wi-Fi configured");
   }
+#ifdef SCREEN_GEO
   if (configuredNetworkCount == 0) {
     setGeoUnavailableState("Offline - no Wi-Fi configured");
+  }
+  nextGeoRefreshAtMs = 0;
+#endif
+#ifdef SCREEN_SOLAR
+  if (configuredNetworkCount == 0) {
     setSolarUnavailableState("Offline - no Wi-Fi configured");
   }
-  weatherModuleScheduleRefreshIn(1000);
-  nextGeoRefreshAtMs = 0;
   nextSolarRefreshAtMs = 0;
+#endif
+  weatherModuleScheduleRefreshIn(1000);
   nextWifiRetryAtMs = 0;
   lastActivityAtMs = millis();
 
   uint8_t savedMotionView = preferences.getUChar(kPrefMotionViewKey, static_cast<uint8_t>(MotionViewMode::Dot));
   if (savedMotionView < static_cast<uint8_t>(MotionViewMode::Count)) {
-    motionViewMode = static_cast<MotionViewMode>(savedMotionView);
+    motionSetViewMode(static_cast<MotionViewMode>(savedMotionView));
   } else {
-    motionViewMode = MotionViewMode::Dot;
+    motionSetViewMode(MotionViewMode::Dot);
   }
 
   setupLvgl();
@@ -2140,29 +1424,34 @@ void loop()
     updateWiFi();
   }
   weatherModuleUpdate();
+#ifdef SCREEN_GEO
   updateGeo();
+#endif
+#ifdef SCREEN_SOLAR
   updateSolarSystem();
-  updateImuState();
+#endif
+  imuModuleUpdate();
+#ifdef SCREEN_RECORDER
   updateRecorderAudio();
+#endif
   updateTopButton();
   updatePowerKey();
   updatePowerButtonHold();
   updateIdleState();
   persistTimeToRtc();
 
-  if (otaReady) {
-    ArduinoOTA.handle();
-  }
-
-  if (!otaInProgress && otaOverlaySticky && static_cast<int32_t>(millis() - otaOverlayHideAtMs) >= 0) {
-    hideOtaOverlay();
-  }
+  otaModuleHandle();
+  otaModuleUpdate();
 
   ScreenId activeScreen = static_cast<ScreenId>(currentScreenIndex);
 
   if (now - lastStatusRefreshAtMs >= kStatusRefreshMs) {
     lastStatusRefreshAtMs = now;
-    if (activeScreen != ScreenId::Motion && activeScreen != ScreenId::Weather && activeScreen != ScreenId::Sky) {
+    if (activeScreen != ScreenId::Motion && activeScreen != ScreenId::Weather
+#ifdef SCREEN_SKY
+        && activeScreen != ScreenId::Sky
+#endif
+    ) {
       refreshManagedScreen(activeScreen);
     }
   }
@@ -2183,12 +1472,6 @@ void loop()
     }
   }
 
-  if (now - lastRecorderVisualRefreshAtMs >= kRecorderVisualRefreshMs) {
-    lastRecorderVisualRefreshAtMs = now;
-    if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Recorder) {
-      updateRecorderVisuals();
-    }
-  }
 
   if (now - lastWeatherAnimAtMs >= kWeatherAnimRefreshMs) {
     lastWeatherAnimAtMs = now;
@@ -2197,10 +1480,41 @@ void loop()
     }
   }
 
+#ifdef SCREEN_STOPWATCH
+  if (activeScreen == ScreenId::Stopwatch) {
+    screenManagerTick(activeScreen, now);
+  }
+#endif
+#ifdef SCREEN_TIMER
+  if (activeScreen == ScreenId::Timer) {
+    screenManagerTick(activeScreen, now);
+  }
+#endif
+
+#ifdef SCREEN_SKY
   if (now - lastSkyRefreshAtMs >= kSkyRefreshMs) {
     lastSkyRefreshAtMs = now;
     if (activeScreen == ScreenId::Sky) {
       refreshManagedScreen(activeScreen);
+    }
+  }
+#endif
+
+  if (autoCycleEnabled && now - lastAutoCycleAtMs >= kAutoCycleMs) {
+    lastAutoCycleAtMs = now;
+    showNextScreen();
+  }
+
+  if (cycleCountdownLabel) {
+    if (autoCycleEnabled) {
+      uint32_t elapsed = now - lastAutoCycleAtMs;
+      uint32_t remaining = elapsed < kAutoCycleMs ? (kAutoCycleMs - elapsed + 999) / 1000 : 1;
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%u", remaining);
+      lv_label_set_text(cycleCountdownLabel, buf);
+      lv_obj_clear_flag(cycleCountdownLabel, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(cycleCountdownLabel, LV_OBJ_FLAG_HIDDEN);
     }
   }
 

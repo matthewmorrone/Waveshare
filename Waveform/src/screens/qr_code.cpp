@@ -1,5 +1,6 @@
 #include "config/screen_constants.h"
 #include "core/screen_manager.h"
+#ifdef SCREEN_QR
 #include "modules/wifi_manager.h"
 #include "screens/screen_callbacks.h"
 #include <qrcode.h>
@@ -154,11 +155,8 @@ void refreshQrScreen()
 
   const QrEntry &entry = currentQrEntry();
   lv_label_set_text(qrUi.titleLabel, entry.title);
-  lv_label_set_text(qrUi.contentLabel, entry.payload);
-
-  String indexText = String(currentQrIndex + 1) + " / " + String(kQrEntryCount) +
-                     "  swipe up/down";
-  lv_label_set_text(qrUi.indexLabel, indexText.c_str());
+  lv_label_set_text(qrUi.contentLabel, "");
+  lv_label_set_text(qrUi.indexLabel, "");
 
   if (!qrNeedsRender && renderedQrIndex == currentQrIndex) {
     return;
@@ -208,7 +206,6 @@ bool waveformRefreshQrScreen()
 
 void waveformEnterQrScreen()
 {
-  qrNeedsRender = true;
 }
 
 void waveformLeaveQrScreen()
@@ -219,3 +216,5 @@ void waveformTickQrScreen(uint32_t nowMs)
 {
   (void)nowMs;
 }
+
+#endif // SCREEN_QR

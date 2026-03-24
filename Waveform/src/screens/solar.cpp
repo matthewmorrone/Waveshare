@@ -1,5 +1,6 @@
 #include "config/screen_constants.h"
 #include "core/screen_manager.h"
+#ifdef SCREEN_SOLAR
 #include "modules/weather_module.h"
 #include "modules/wifi_manager.h"
 #include "screens/screen_callbacks.h"
@@ -7,6 +8,9 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 extern lv_obj_t *screenRoots[];
 bool hasValidTime();
@@ -14,8 +18,8 @@ void applyRootStyle(lv_obj_t *obj);
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b);
 float compressedOrbitRadius(float distanceAu);
 bool parseHorizonsVectorRow(const String &result, float &xAu, float &yAu, float &zAu);
-extern bool otaInProgress;
-extern bool inLightSleep;
+bool otaUpdateInProgress();
+bool lightSleepActive();
 extern int currentScreenIndex;
 void refreshSolarScreen();
 
@@ -98,6 +102,15 @@ SolarUi solarUi;
 bool solarBuilt = false;
 bool solarFetchInProgress = false;
 uint32_t nextSolarRefreshAtMs = 0;
+TaskHandle_t solarFetchTaskHandle = nullptr;
+SemaphoreHandle_t solarResultMutex = nullptr;
+struct SolarFetchResult {
+  bool success = false;
+  bool done = false;
+  SolarPlanetState planets[kSolarPlanetCount] = {};
+  String updated;
+};
+SolarFetchResult solarFetchResult;
 
 void setSolarUnavailableState(const char *updatedLabel)
 {
@@ -187,6 +200,41 @@ bool fetchSolarPlanetVector(const char *command, float &xAu, float &yAu, float &
 }
 
 
+void solarFetchTask(void *param)
+{
+  SolarFetchResult result;
+  result.success = false;
+  result.done = false;
+
+  for (size_t i = 0; i < kSolarPlanetCount; ++i) {
+    float xAu = 0.0f, yAu = 0.0f, zAu = 0.0f;
+    if (!fetchSolarPlanetVector(kSolarPlanets[i].command, xAu, yAu, zAu)) {
+      result.success = false;
+      result.done = true;
+      if (xSemaphoreTake(solarResultMutex, portMAX_DELAY)) {
+        solarFetchResult = result;
+        xSemaphoreGive(solarResultMutex);
+      }
+      solarFetchTaskHandle = nullptr;
+      vTaskDelete(nullptr);
+      return;
+    }
+    result.planets[i].valid = true;
+    result.planets[i].xAu = xAu;
+    result.planets[i].yAu = yAu;
+    result.planets[i].zAu = zAu;
+  }
+
+  result.success = true;
+  result.done = true;
+  if (xSemaphoreTake(solarResultMutex, portMAX_DELAY)) {
+    solarFetchResult = result;
+    xSemaphoreGive(solarResultMutex);
+  }
+  solarFetchTaskHandle = nullptr;
+  vTaskDelete(nullptr);
+}
+
 void startSolarSystemFetch()
 {
   if (solarFetchInProgress) {
@@ -203,37 +251,43 @@ void startSolarSystemFetch()
     return;
   }
 
-  solarFetchInProgress = true;
-  solarSystemState.fetchIndex = 0;
-  solarSystemState.updated = "Fetching Mercury";
-  for (size_t i = 0; i < kSolarPlanetCount; ++i) {
-    solarSystemState.planets[i] = {};
+  if (!solarResultMutex) {
+    solarResultMutex = xSemaphoreCreateMutex();
   }
+
+  solarFetchInProgress = true;
+  solarSystemState.updated = "Fetching solar data...";
+  solarFetchResult = {};
+
+  xTaskCreatePinnedToCore(solarFetchTask, "solarFetch", 8192, nullptr, 1, &solarFetchTaskHandle, 0);
 }
 
 void serviceSolarSystemFetch()
 {
-  if (!solarFetchInProgress) {
+  if (!solarFetchInProgress || !solarResultMutex) {
     return;
   }
 
-  if (solarSystemState.fetchIndex >= kSolarPlanetCount) {
-    solarFetchInProgress = false;
-    solarSystemState.hasData = true;
-    solarSystemState.stale = false;
-    solarSystemState.updated = weatherUpdatedLabel() + "  JPL Horizons";
-    nextSolarRefreshAtMs = millis() + kSolarRefreshIntervalMs;
-    refreshSolarScreen();
+  bool done = false;
+  bool success = false;
+  SolarFetchResult result;
+
+  if (xSemaphoreTake(solarResultMutex, 0)) {
+    done = solarFetchResult.done;
+    if (done) {
+      success = solarFetchResult.success;
+      result = solarFetchResult;
+    }
+    xSemaphoreGive(solarResultMutex);
+  }
+
+  if (!done) {
     return;
   }
 
-  size_t index = solarSystemState.fetchIndex;
-  solarSystemState.updated = String("Fetching ") + kSolarPlanets[index].name;
-  float xAu = 0.0f;
-  float yAu = 0.0f;
-  float zAu = 0.0f;
-  if (!fetchSolarPlanetVector(kSolarPlanets[index].command, xAu, yAu, zAu)) {
-    solarFetchInProgress = false;
+  solarFetchInProgress = false;
+
+  if (!success) {
     if (solarSystemState.hasData) {
       solarSystemState.stale = true;
       solarSystemState.updated = networkIsOnline() ? "Retrying with cached solar data" : "Offline - cached solar data";
@@ -241,31 +295,31 @@ void serviceSolarSystemFetch()
       setSolarUnavailableState(networkIsOnline() ? "Retrying shortly" : "Waiting for Wi-Fi");
     }
     nextSolarRefreshAtMs = millis() + kSolarRetryIntervalMs;
-    refreshSolarScreen();
-    return;
+  } else {
+    for (size_t i = 0; i < kSolarPlanetCount; ++i) {
+      solarSystemState.planets[i] = result.planets[i];
+    }
+    solarSystemState.hasData = true;
+    solarSystemState.stale = false;
+    solarSystemState.updated = weatherUpdatedLabel() + "  JPL Horizons";
+    nextSolarRefreshAtMs = millis() + kSolarRefreshIntervalMs;
   }
-
-  solarSystemState.planets[index].valid = true;
-  solarSystemState.planets[index].xAu = xAu;
-  solarSystemState.planets[index].yAu = yAu;
-  solarSystemState.planets[index].zAu = zAu;
-  ++solarSystemState.fetchIndex;
   refreshSolarScreen();
 }
 
 void updateSolarSystem()
 {
-  ScreenId currentScreen = static_cast<ScreenId>(currentScreenIndex);
-  if (currentScreen != ScreenId::Solar) {
-    return;
-  }
-
   if (solarFetchInProgress) {
     serviceSolarSystemFetch();
     return;
   }
 
-  if (otaInProgress || inLightSleep) {
+  ScreenId currentScreen = static_cast<ScreenId>(currentScreenIndex);
+  if (currentScreen != ScreenId::Solar) {
+    return;
+  }
+
+  if (otaUpdateInProgress() || lightSleepActive()) {
     return;
   }
 
@@ -333,11 +387,13 @@ lv_obj_t *buildSolarScreen()
     lv_obj_set_style_pad_all(solarUi.planetDots[i], 0, 0);
     lv_obj_clear_flag(solarUi.planetDots[i], LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(solarUi.planetDots[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(solarUi.planetDots[i], LV_OBJ_FLAG_HIDDEN);
 
     solarUi.planetLabels[i] = lv_label_create(solarUi.panel);
     lv_obj_set_style_text_font(solarUi.planetLabels[i], &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(solarUi.planetLabels[i], lvColor(228, 234, 242), 0);
     lv_label_set_text(solarUi.planetLabels[i], kSolarPlanets[i].shortLabel);
+    lv_obj_add_flag(solarUi.planetLabels[i], LV_OBJ_FLAG_HIDDEN);
   }
 
   solarUi.sun = lv_obj_create(solarUi.panel);
@@ -469,3 +525,5 @@ void waveformTickSolarScreen(uint32_t nowMs)
   (void)nowMs;
   refreshSolarScreen();
 }
+
+#endif // SCREEN_SOLAR

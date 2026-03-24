@@ -96,7 +96,7 @@ lv_obj_t *createCloud(lv_obj_t *parent, lv_coord_t width, lv_coord_t height)
   return cloud;
 }
 
-void setLinePoints(lv_point_precise_t points[2], float x1, float y1, float x2, float y2)
+static void setLinePoints(lv_point_precise_t points[2], float x1, float y1, float x2, float y2)
 {
   points[0].x = x1;
   points[0].y = y1;
@@ -420,6 +420,8 @@ lv_obj_t *buildCurrentWeatherScreen(WeatherUi &ui)
   lv_obj_set_style_border_width(ui.hero, 0, 0);
   lv_obj_set_style_pad_all(ui.hero, 0, 0);
   lv_obj_set_style_radius(ui.hero, 0, 0);
+  lv_obj_set_style_bg_color(ui.hero, lvColor(24, 34, 52), 0);
+  lv_obj_set_style_bg_opa(ui.hero, LV_OPA_COVER, 0);
 
   for (size_t i = 0; i < kWeatherSunRayCount; ++i) {
     ui.sunRays[i] = lv_line_create(ui.hero);

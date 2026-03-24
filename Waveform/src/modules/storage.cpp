@@ -7,10 +7,16 @@
 
 extern Adafruit_XCA9554 expander;
 extern bool sdMounted;
+extern bool expanderReady;
+#include "core/screen_manager.h"
+#ifdef SCREEN_RECORDER
 extern uint8_t sdCardType;
 extern uint64_t sdCardSizeMb;
-extern bool expanderReady;
 void refreshRecorderClipState();
+#else
+static uint8_t sdCardType = CARD_NONE;
+static uint64_t sdCardSizeMb = 0;
+#endif
 
 const char *sdCardTypeLabel(uint8_t cardType)
 {
@@ -39,7 +45,9 @@ void ensureSdDirectories()
 void initSdCard()
 {
   if (sdMounted) {
+#ifdef SCREEN_RECORDER
     refreshRecorderClipState();
+#endif
     return;
   }
 
@@ -74,7 +82,9 @@ void initSdCard()
     sdCardType = cardType;
     sdCardSizeMb = SD_MMC.cardSize() / (1024 * 1024);
     ensureSdDirectories();
+#ifdef SCREEN_RECORDER
     refreshRecorderClipState();
+#endif
 
     Serial.printf("SD mounted: %s, %llu MB\n", sdCardTypeLabel(sdCardType), sdCardSizeMb);
     return;

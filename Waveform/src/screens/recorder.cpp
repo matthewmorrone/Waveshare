@@ -1,6 +1,7 @@
 #include "config/pin_config.h"
 #include "config/screen_constants.h"
 #include "core/screen_manager.h"
+#ifdef SCREEN_RECORDER
 #include "drivers/es8311.h"
 #include <ESP_I2S.h>
 #include <SD_MMC.h>
@@ -11,45 +12,11 @@
 constexpr es8311_mic_gain_t kRecorderMicGain = ES8311_MIC_GAIN_18DB;
 
 extern I2SClass audioI2s;
-void refreshRecorderScreen();
 extern bool sdMounted;
 extern lv_obj_t *screenRoots[];
 void applyRootStyle(lv_obj_t *obj);
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b);
 void noteActivity();
-
-struct RecorderUi
-{
-  lv_obj_t *screen = nullptr;
-  lv_obj_t *statusLabel = nullptr;
-  lv_obj_t *detailLabel = nullptr;
-  lv_obj_t *button = nullptr;
-  lv_obj_t *buttonLabel = nullptr;
-  lv_obj_t *spinnerSegments[kRecorderSpinnerSegmentCount] = {};
-  lv_obj_t *waveformPanel = nullptr;
-  lv_obj_t *waveformBars[kRecorderWaveformBarCount] = {};
-};
-
-RecorderUi recorderUi;
-bool recorderBuilt = false;
-String recorderStatusText = "Insert SD card to record";
-String recorderDetailText = "The last take is overwritten every time.";
-bool audioHardwareReady = false;
-bool audioClipAvailable = false;
-bool audioRecordingActive = false;
-bool audioPlaybackActive = false;
-uint8_t sdCardType = CARD_NONE;
-uint64_t sdCardSizeMb = 0;
-uint32_t audioClipBytes = 0;
-uint32_t audioRecordedBytes = 0;
-uint32_t audioPlaybackBytes = 0;
-es8311_handle_t audioCodec = nullptr;
-File audioRecordingFile;
-File audioPlaybackFile;
-uint8_t audioBuffer[kRecorderAudioChunkBytes] = {};
-uint8_t recorderWaveformLevels[kRecorderWaveformBarCount] = {};
-float recorderLiveLevel = 0.0f;
-float recorderDisplayLevel = 0.0f;
 
 namespace
 {
@@ -70,106 +37,73 @@ const ScreenModule &recorderScreenModule()
   return kModule;
 }
 
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
-String recorderClipFullPath()
+struct RecorderUi
+{
+  lv_obj_t *screen      = nullptr;
+  lv_obj_t *button      = nullptr;
+  lv_obj_t *statusLabel = nullptr;
+};
+
+static RecorderUi rec;
+static bool recorderBuilt = false;
+
+static bool audioHardwareReady  = false;
+bool audioRecordingActive = false;
+bool audioPlaybackActive  = false;
+bool audioClipAvailable   = false;
+static uint32_t audioRecordedBytes = 0;
+static uint32_t audioPlaybackBytes = 0;
+uint32_t audioClipBytes     = 0;
+uint8_t  sdCardType         = CARD_NONE;
+uint64_t sdCardSizeMb       = 0;
+static es8311_handle_t audioCodec  = nullptr;
+static File audioRecordingFile;
+static File audioPlaybackFile;
+static uint8_t audioBuffer[kRecorderAudioChunkBytes] = {};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static String clipPath()
 {
   return String(kSdMountPath) + kRecorderClipPath;
 }
 
-String formatRecorderDuration(uint32_t bytes)
+static String fmtDuration(uint32_t bytes)
 {
-  uint32_t totalSeconds = bytes / kRecorderBytesPerSecond;
-  char text[12];
-  snprintf(text, sizeof(text), "%02lu:%02lu",
-           static_cast<unsigned long>(totalSeconds / 60U),
-           static_cast<unsigned long>(totalSeconds % 60U));
-  return String(text);
+  uint32_t secs = bytes / kRecorderBytesPerSecond;
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu",
+           (unsigned long)(secs / 60), (unsigned long)(secs % 60));
+  return String(buf);
 }
 
-float recorderSampleLevel(const uint8_t *buffer, size_t bytes)
+static void setStatus(const char *text)
 {
-  if (!buffer || bytes < sizeof(int16_t)) {
-    return 0.0f;
-  }
-
-  const int16_t *samples = reinterpret_cast<const int16_t *>(buffer);
-  size_t sampleCount = bytes / sizeof(int16_t);
-  int32_t peak = 0;
-  for (size_t i = 0; i < sampleCount; i += 2) {
-    int32_t value = samples[i];
-    if (value < 0) {
-      value = -value;
-    }
-    if (value > peak) {
-      peak = value;
-    }
-  }
-
-  return fminf(static_cast<float>(peak) / 32767.0f, 1.0f);
-}
-
-void pushRecorderWaveformLevel(float normalizedLevel)
-{
-  normalizedLevel = fminf(fmaxf(normalizedLevel, 0.0f), 1.0f);
-  memmove(recorderWaveformLevels,
-          recorderWaveformLevels + 1,
-          sizeof(recorderWaveformLevels) - sizeof(recorderWaveformLevels[0]));
-  recorderWaveformLevels[kRecorderWaveformBarCount - 1] =
-      static_cast<uint8_t>(roundf(normalizedLevel * 255.0f));
-}
-
-void updateRecorderLevelFromSamples(const uint8_t *buffer, size_t bytes)
-{
-  float level = recorderSampleLevel(buffer, bytes);
-  recorderLiveLevel = level;
-  recorderDisplayLevel = fmaxf(level, recorderDisplayLevel * 0.72f);
-  pushRecorderWaveformLevel(level);
-}
-
-void clearRecorderVisualState()
-{
-  memset(recorderWaveformLevels, 0, sizeof(recorderWaveformLevels));
-  recorderLiveLevel = 0.0f;
-  recorderDisplayLevel = 0.0f;
-}
-
-void refreshRecorderClipState()
-{
-  audioClipAvailable = false;
-  audioClipBytes = 0;
-  if (!sdMounted) {
-    return;
-  }
-
-  File clip = SD_MMC.open(recorderClipFullPath().c_str(), FILE_READ);
-  if (!clip) {
-    return;
-  }
-
-  audioClipBytes = static_cast<uint32_t>(clip.size());
-  audioClipAvailable = audioClipBytes > 0;
-  clip.close();
-}
-
-void closeRecorderFiles()
-{
-  if (audioRecordingFile) {
-    audioRecordingFile.close();
-  }
-  if (audioPlaybackFile) {
-    audioPlaybackFile.close();
+  if (rec.statusLabel) {
+    lv_label_set_text(rec.statusLabel, text);
   }
 }
 
-
-bool ensureAudioHardwareReady()
+static void setButtonColor(lv_color_t bg, lv_color_t border)
 {
-  if (audioHardwareReady) {
-    return true;
-  }
+  if (!rec.button) return;
+  lv_obj_set_style_bg_color(rec.button, bg, 0);
+  lv_obj_set_style_border_color(rec.button, border, 0);
+}
 
-  recorderStatusText = "Starting audio...";
-  recorderDetailText = "Bringing up microphone and speaker.";
+// ---------------------------------------------------------------------------
+// Audio hardware
+// ---------------------------------------------------------------------------
+
+static bool ensureAudioReady()
+{
+  if (audioHardwareReady) return true;
 
   audioI2s.end();
   audioI2s.setPins(AUDIO_I2S_BCLK, AUDIO_I2S_WS, AUDIO_I2S_DOUT, AUDIO_I2S_DIN, AUDIO_I2S_MCLK);
@@ -179,8 +113,7 @@ bool ensureAudioHardwareReady()
                       I2S_DATA_BIT_WIDTH_16BIT,
                       I2S_SLOT_MODE_STEREO,
                       I2S_STD_SLOT_BOTH)) {
-    recorderStatusText = "Audio bus failed";
-    recorderDetailText = "I2S did not start.";
+    setStatus("I2S failed");
     return false;
   }
 
@@ -188,179 +121,126 @@ bool ensureAudioHardwareReady()
     audioCodec = es8311_create(0, ES8311_ADDRRES_0);
   }
   if (!audioCodec) {
-    recorderStatusText = "Codec missing";
-    recorderDetailText = "ES8311 was not detected.";
+    setStatus("No codec");
     audioI2s.end();
     return false;
   }
 
-  const es8311_clock_config_t clockConfig = {
-      .mclk_inverted = false,
-      .sclk_inverted = false,
-      .mclk_from_mclk_pin = true,
-      .mclk_frequency = static_cast<int>(kRecorderSampleRate * 256U),
-      .sample_frequency = static_cast<int>(kRecorderSampleRate),
+  const es8311_clock_config_t clk = {
+      .mclk_inverted       = false,
+      .sclk_inverted       = false,
+      .mclk_from_mclk_pin  = true,
+      .mclk_frequency      = (int)(kRecorderSampleRate * 256U),
+      .sample_frequency    = (int)(kRecorderSampleRate),
   };
 
-  esp_err_t result = es8311_init(audioCodec, &clockConfig, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
-  if (result == ESP_OK) {
-    result = es8311_sample_frequency_config(audioCodec, clockConfig.mclk_frequency, clockConfig.sample_frequency);
-  }
-  if (result == ESP_OK) {
-    result = es8311_microphone_config(audioCodec, false);
-  }
-  if (result == ESP_OK) {
-    result = es8311_voice_volume_set(audioCodec, kRecorderCodecVolume, nullptr);
-  }
-  if (result == ESP_OK) {
-    result = es8311_microphone_gain_set(audioCodec, kRecorderMicGain);
-  }
-  if (result == ESP_OK) {
-    result = es8311_voice_mute(audioCodec, false);
-  }
+  esp_err_t err = es8311_init(audioCodec, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
+  if (err == ESP_OK) err = es8311_sample_frequency_config(audioCodec, clk.mclk_frequency, clk.sample_frequency);
+  if (err == ESP_OK) err = es8311_microphone_config(audioCodec, false);
+  if (err == ESP_OK) err = es8311_voice_volume_set(audioCodec, kRecorderCodecVolume, nullptr);
+  if (err == ESP_OK) err = es8311_microphone_gain_set(audioCodec, kRecorderMicGain);
+  if (err == ESP_OK) err = es8311_voice_mute(audioCodec, false);
 
-  if (result != ESP_OK) {
-    recorderStatusText = "Codec init failed";
-    recorderDetailText = esp_err_to_name(result);
+  if (err != ESP_OK) {
+    char msg[48];
+    snprintf(msg, sizeof(msg), "Codec err: %s", esp_err_to_name(err));
+    setStatus(msg);
     audioI2s.end();
     return false;
   }
 
   audioHardwareReady = true;
-  recorderStatusText = "Ready to record";
-  recorderDetailText = "The last take is overwritten every time.";
   return true;
 }
 
-void stopPlayback()
-{
-  if (!audioPlaybackActive) {
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Playback
+// ---------------------------------------------------------------------------
 
+static void stopPlayback()
+{
+  if (!audioPlaybackActive) return;
   audioPlaybackActive = false;
-  audioPlaybackBytes = 0;
-  if (audioPlaybackFile) {
-    audioPlaybackFile.close();
-  }
-  clearRecorderVisualState();
-  refreshRecorderClipState();
-  recorderStatusText = audioClipAvailable ? "Ready to record" : "No clip saved";
-  recorderDetailText = audioClipAvailable ? "Hold to replace the last take." : "Hold to record a clip.";
+  audioPlaybackBytes  = 0;
+  if (audioPlaybackFile) audioPlaybackFile.close();
 }
 
-bool startPlayback()
+void refreshRecorderClipState()
 {
-  if (!sdMounted) {
-    recorderStatusText = "Insert SD card";
-    recorderDetailText = "Recording and playback use the SD card.";
-    return false;
-  }
+  audioClipAvailable = false;
+  audioClipBytes     = 0;
+  if (!sdMounted) return;
+  File f = SD_MMC.open(clipPath().c_str(), FILE_READ);
+  if (!f) return;
+  audioClipBytes     = (uint32_t)f.size();
+  audioClipAvailable = audioClipBytes > 0;
+  f.close();
+}
 
-  if (!audioClipAvailable) {
-    refreshRecorderClipState();
-  }
-  if (!audioClipAvailable) {
-    recorderStatusText = "No clip saved";
-    recorderDetailText = "Record something first.";
-    return false;
-  }
+static bool startPlayback()
+{
+  if (!sdMounted) { setStatus("No SD card"); return false; }
+  refreshRecorderClipState();
+  if (!audioClipAvailable) { setStatus("No clip"); return false; }
+  if (!ensureAudioReady()) return false;
+  if (audioRecordingActive) return false;
+  stopPlayback();
 
-  if (!ensureAudioHardwareReady()) {
-    return false;
-  }
+  audioPlaybackFile = SD_MMC.open(clipPath().c_str(), FILE_READ);
+  if (!audioPlaybackFile) { setStatus("Open failed"); return false; }
 
-  if (audioRecordingActive) {
-    return false;
-  }
-
-  if (audioPlaybackActive) {
-    stopPlayback();
-  }
-
-  audioPlaybackFile = SD_MMC.open(recorderClipFullPath().c_str(), FILE_READ);
-  if (!audioPlaybackFile) {
-    recorderStatusText = "Playback open failed";
-    recorderDetailText = "The saved clip could not be read.";
-    return false;
-  }
-
-  audioPlaybackBytes = 0;
+  audioPlaybackBytes  = 0;
   audioPlaybackActive = true;
-  clearRecorderVisualState();
-  recorderStatusText = "Playing back";
-  recorderDetailText = "Listening to the last take.";
+  setStatus(("Playing " + fmtDuration(audioClipBytes)).c_str());
+  setButtonColor(lvColor(26, 82, 154), lvColor(76, 138, 214));
   return true;
 }
 
-void stopRecording(bool playAfterStop)
-{
-  if (!audioRecordingActive) {
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Recording
+// ---------------------------------------------------------------------------
 
+static void stopRecording(bool playAfter)
+{
+  if (!audioRecordingActive) return;
   audioRecordingActive = false;
-  if (audioRecordingFile) {
-    audioRecordingFile.close();
-  }
+  if (audioRecordingFile) audioRecordingFile.close();
   refreshRecorderClipState();
 
   if (audioRecordedBytes == 0) {
-    recorderStatusText = "No audio captured";
-    recorderDetailText = "Hold again to retry.";
+    setStatus("Nothing captured");
+    setButtonColor(lvColor(154, 24, 30), lvColor(214, 84, 90));
     return;
   }
 
-  audioClipBytes = audioRecordedBytes;
-  recorderStatusText = "Saved " + formatRecorderDuration(audioRecordedBytes);
-  recorderDetailText = "Playing the latest take.";
-  if (playAfterStop) {
-    if (!startPlayback()) {
-      recorderDetailText = "Hold to replace the last take.";
-    }
-  } else {
-    recorderDetailText = "Hold to replace the last take.";
-  }
+  setStatus(("Saved " + fmtDuration(audioRecordedBytes)).c_str());
+  setButtonColor(lvColor(154, 24, 30), lvColor(214, 84, 90));
+  if (playAfter) startPlayback();
 }
 
-bool startRecording()
+static bool startRecording()
 {
-  if (!sdMounted) {
-    initSdCard();
-  }
-  if (!sdMounted) {
-    recorderStatusText = "Insert SD card";
-    recorderDetailText = "Recording and playback use the SD card.";
-    return false;
-  }
+  if (!sdMounted) initSdCard();
+  if (!sdMounted) { setStatus("No SD card"); return false; }
+  if (!ensureAudioReady()) return false;
+  stopPlayback();
 
-  if (!ensureAudioHardwareReady()) {
-    return false;
-  }
+  if (SD_MMC.exists(clipPath().c_str())) SD_MMC.remove(clipPath().c_str());
 
-  if (audioPlaybackActive) {
-    stopPlayback();
-  }
+  audioRecordingFile = SD_MMC.open(clipPath().c_str(), FILE_WRITE);
+  if (!audioRecordingFile) { setStatus("File open failed"); return false; }
 
-  if (SD_MMC.exists(recorderClipFullPath().c_str())) {
-    SD_MMC.remove(recorderClipFullPath().c_str());
-  }
-
-  audioRecordingFile = SD_MMC.open(recorderClipFullPath().c_str(), FILE_WRITE);
-  if (!audioRecordingFile) {
-    recorderStatusText = "Record open failed";
-    recorderDetailText = "Could not create the clip on SD.";
-    return false;
-  }
-
-  audioRecordedBytes = 0;
+  audioRecordedBytes  = 0;
   audioRecordingActive = true;
-  audioClipAvailable = false;
-  clearRecorderVisualState();
-  recorderStatusText = "Recording";
-  recorderDetailText = "Release to stop and play it back.";
+  audioClipAvailable   = false;
+  setStatus("Recording...");
+  setButtonColor(lvColor(184, 38, 44), lvColor(240, 98, 104));
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// Audio pump — called from main.cpp loop
+// ---------------------------------------------------------------------------
 
 void updateRecorderAudio()
 {
@@ -368,22 +248,25 @@ void updateRecorderAudio()
     noteActivity();
     size_t bytesRead = audioI2s.readBytes(reinterpret_cast<char *>(audioBuffer), sizeof(audioBuffer));
     if (bytesRead == 0) {
-      recorderStatusText = "Mic read failed";
-      recorderDetailText = "Recording stopped before playback.";
       stopRecording(false);
+      setStatus("Mic read failed");
       return;
     }
-
-    size_t bytesWritten = audioRecordingFile.write(audioBuffer, bytesRead);
-    if (bytesWritten != bytesRead) {
-      recorderStatusText = "SD write failed";
-      recorderDetailText = "Recording stopped before playback.";
+    size_t written = audioRecordingFile.write(audioBuffer, bytesRead);
+    if (written != bytesRead) {
       stopRecording(false);
+      setStatus("SD write failed");
       return;
     }
+    audioRecordedBytes += (uint32_t)written;
 
-    updateRecorderLevelFromSamples(audioBuffer, bytesRead);
-    audioRecordedBytes += static_cast<uint32_t>(bytesWritten);
+    // Update status periodically with elapsed duration
+    static uint32_t lastStatusUpdateMs = 0;
+    uint32_t now = millis();
+    if (now - lastStatusUpdateMs >= 500) {
+      lastStatusUpdateMs = now;
+      setStatus(("Recording " + fmtDuration(audioRecordedBytes)).c_str());
+    }
     return;
   }
 
@@ -392,125 +275,34 @@ void updateRecorderAudio()
     int bytesRead = audioPlaybackFile.read(audioBuffer, sizeof(audioBuffer));
     if (bytesRead <= 0) {
       stopPlayback();
+      refreshRecorderClipState();
+      setStatus("Done");
+      setButtonColor(lvColor(154, 24, 30), lvColor(214, 84, 90));
       return;
     }
-
-    size_t bytesWritten = audioI2s.write(audioBuffer, static_cast<size_t>(bytesRead));
-    if (bytesWritten != static_cast<size_t>(bytesRead)) {
-      recorderStatusText = "Speaker write failed";
-      recorderDetailText = "Playback stopped early.";
+    size_t written = audioI2s.write(audioBuffer, (size_t)bytesRead);
+    if (written != (size_t)bytesRead) {
       stopPlayback();
+      setStatus("Speaker failed");
+      setButtonColor(lvColor(154, 24, 30), lvColor(214, 84, 90));
       return;
     }
-
-    updateRecorderLevelFromSamples(audioBuffer, static_cast<size_t>(bytesRead));
-    audioPlaybackBytes += static_cast<uint32_t>(bytesRead);
+    audioPlaybackBytes += (uint32_t)bytesRead;
   }
 }
 
-void applyRecorderButtonPulse(bool active)
-{
-  if (!recorderUi.button) {
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Button event
+// ---------------------------------------------------------------------------
 
-  if (active) {
-    recorderDisplayLevel = fmaxf(recorderLiveLevel, recorderDisplayLevel * 0.82f);
-  } else {
-    recorderDisplayLevel *= 0.76f;
-    if (recorderDisplayLevel < 0.01f) {
-      recorderDisplayLevel = 0.0f;
-    }
-  }
-
-  int pulseOffset = static_cast<int>(roundf(recorderDisplayLevel * 28.0f));
-  int diameter = static_cast<int>(kRecorderButtonDiameter) + pulseOffset;
-  lv_obj_set_size(recorderUi.button, diameter, diameter);
-  lv_obj_align(recorderUi.button, LV_ALIGN_CENTER, 0, kRecorderButtonCenterYOffset);
-}
-
-void updateRecorderVisuals()
-{
-  if (!recorderBuilt || !recorderUi.button) {
-    return;
-  }
-
-  bool active = audioRecordingActive || audioPlaybackActive;
-  applyRecorderButtonPulse(active);
-
-  lv_color_t activeColor = audioPlaybackActive ? lvColor(88, 164, 255) : lvColor(255, 96, 104);
-  int centerX = LCD_WIDTH / 2;
-  int centerY = (LCD_HEIGHT / 2) + kRecorderButtonCenterYOffset;
-  float orbitRadius = (static_cast<float>(lv_obj_get_width(recorderUi.button)) * 0.5f) + 22.0f + (recorderDisplayLevel * 8.0f);
-  uint32_t spinnerHead = (millis() / kRecorderPulseStepMs) % kRecorderSpinnerSegmentCount;
-
-  for (size_t i = 0; i < kRecorderSpinnerSegmentCount; ++i) {
-    lv_obj_t *segment = recorderUi.spinnerSegments[i];
-    if (!segment) {
-      continue;
-    }
-
-    float angle = ((360.0f / static_cast<float>(kRecorderSpinnerSegmentCount)) * static_cast<float>(i)) - 90.0f;
-    float radians = angle * (PI / 180.0f);
-    int x = centerX + static_cast<int>(roundf(cosf(radians) * orbitRadius)) - 5;
-    int y = centerY + static_cast<int>(roundf(sinf(radians) * orbitRadius)) - 5;
-    lv_obj_set_pos(segment, x, y);
-
-    uint8_t opacity = 0;
-    if (active) {
-      size_t distance = (i + kRecorderSpinnerSegmentCount - spinnerHead) % kRecorderSpinnerSegmentCount;
-      if (distance == 0) {
-        opacity = 255;
-      } else if (distance == 1) {
-        opacity = 200;
-      } else if (distance == 2) {
-        opacity = 132;
-      } else if (distance == 3) {
-        opacity = 88;
-      } else {
-        opacity = 34;
-      }
-    }
-
-    lv_obj_set_style_bg_color(segment, activeColor, 0);
-    lv_obj_set_style_bg_opa(segment, opacity, 0);
-  }
-
-  if (!recorderUi.waveformPanel) {
-    return;
-  }
-
-  lv_color_t waveformColor = audioPlaybackActive ? lvColor(90, 170, 255) : lvColor(244, 98, 106);
-  int panelHeight = kRecorderWaveformHeight;
-  int barWidth = 6;
-  int gap = 3;
-  int baseY = panelHeight / 2;
-  for (size_t i = 0; i < kRecorderWaveformBarCount; ++i) {
-    lv_obj_t *bar = recorderUi.waveformBars[i];
-    if (!bar) {
-      continue;
-    }
-
-    float normalized = static_cast<float>(recorderWaveformLevels[i]) / 255.0f;
-    int barHeight = active ? max(6, static_cast<int>(roundf(8.0f + (normalized * 64.0f)))) : 6;
-    int x = static_cast<int>(i) * (barWidth + gap);
-    int y = baseY - (barHeight / 2);
-    lv_obj_set_pos(bar, x, y);
-    lv_obj_set_size(bar, barWidth, barHeight);
-    lv_obj_set_style_bg_color(bar, waveformColor, 0);
-    lv_obj_set_style_bg_opa(bar, active ? static_cast<lv_opa_t>(90 + static_cast<int>(normalized * 165.0f)) : LV_OPA_20, 0);
-  }
-}
-
-void handleRecorderButtonEvent(lv_event_t *event)
+static void onButtonEvent(lv_event_t *e)
 {
   noteActivity();
-  lv_event_code_t code = lv_event_get_code(event);
+  lv_event_code_t code = lv_event_get_code(e);
 
   if (code == LV_EVENT_PRESSED) {
     if (!audioPlaybackActive && !audioRecordingActive) {
       startRecording();
-      refreshRecorderScreen();
     }
     return;
   }
@@ -518,128 +310,81 @@ void handleRecorderButtonEvent(lv_event_t *event)
   if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
     if (audioRecordingActive) {
       stopRecording(true);
-      refreshRecorderScreen();
+    } else if (audioPlaybackActive) {
+      stopPlayback();
+      refreshRecorderClipState();
+      setStatus(audioClipAvailable ? "Tap to play" : "Ready");
+      setButtonColor(lvColor(154, 24, 30), lvColor(214, 84, 90));
     }
   }
 }
 
-lv_obj_t *buildRecorderScreen()
+// ---------------------------------------------------------------------------
+// Tap handler (screen-level, for play)
+// ---------------------------------------------------------------------------
+
+void recorderHandleTap()
 {
-  recorderUi.screen = lv_obj_create(nullptr);
-  applyRootStyle(recorderUi.screen);
+  if (!recorderBuilt) return;
+  if (audioRecordingActive) return;  // button handles record stop on release
 
-  recorderUi.button = lv_button_create(recorderUi.screen);
-  lv_obj_set_size(recorderUi.button, kRecorderButtonDiameter, kRecorderButtonDiameter);
-  lv_obj_align(recorderUi.button, LV_ALIGN_CENTER, 0, kRecorderButtonCenterYOffset);
-  lv_obj_set_style_radius(recorderUi.button, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(recorderUi.button, lvColor(154, 24, 30), 0);
-  lv_obj_set_style_bg_color(recorderUi.button, lvColor(184, 38, 44), LV_STATE_PRESSED);
-  lv_obj_set_style_bg_color(recorderUi.button, lvColor(34, 42, 54), LV_STATE_DISABLED);
-  lv_obj_set_style_border_width(recorderUi.button, 2, 0);
-  lv_obj_set_style_border_color(recorderUi.button, lvColor(214, 84, 90), 0);
-  lv_obj_set_style_border_color(recorderUi.button, lvColor(56, 68, 82), LV_STATE_DISABLED);
-  lv_obj_set_style_shadow_width(recorderUi.button, 28, 0);
-  lv_obj_set_style_shadow_color(recorderUi.button, lvColor(154, 24, 30), 0);
-  lv_obj_set_style_shadow_opa(recorderUi.button, LV_OPA_40, 0);
-  lv_obj_add_event_cb(recorderUi.button, handleRecorderButtonEvent, LV_EVENT_ALL, nullptr);
-
-  for (size_t i = 0; i < kRecorderSpinnerSegmentCount; ++i) {
-    recorderUi.spinnerSegments[i] = lv_obj_create(recorderUi.screen);
-    lv_obj_set_size(recorderUi.spinnerSegments[i], 10, 10);
-    lv_obj_set_style_radius(recorderUi.spinnerSegments[i], LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(recorderUi.spinnerSegments[i], 0, 0);
-    lv_obj_set_style_pad_all(recorderUi.spinnerSegments[i], 0, 0);
-    lv_obj_set_style_bg_opa(recorderUi.spinnerSegments[i], LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(recorderUi.spinnerSegments[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(recorderUi.spinnerSegments[i], LV_OBJ_FLAG_CLICKABLE);
-  }
-
-  recorderUi.waveformPanel = lv_obj_create(recorderUi.screen);
-  lv_obj_set_size(recorderUi.waveformPanel, kRecorderWaveformWidth, kRecorderWaveformHeight);
-  lv_obj_align(recorderUi.waveformPanel, LV_ALIGN_CENTER, 0, kRecorderWaveformYOffset);
-  lv_obj_set_style_bg_color(recorderUi.waveformPanel, lvColor(8, 12, 18), 0);
-  lv_obj_set_style_bg_opa(recorderUi.waveformPanel, LV_OPA_30, 0);
-  lv_obj_set_style_radius(recorderUi.waveformPanel, 20, 0);
-  lv_obj_set_style_border_width(recorderUi.waveformPanel, 1, 0);
-  lv_obj_set_style_border_color(recorderUi.waveformPanel, lvColor(20, 26, 34), 0);
-  lv_obj_set_style_pad_all(recorderUi.waveformPanel, 0, 0);
-  lv_obj_clear_flag(recorderUi.waveformPanel, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(recorderUi.waveformPanel, LV_OBJ_FLAG_CLICKABLE);
-
-  for (size_t i = 0; i < kRecorderWaveformBarCount; ++i) {
-    recorderUi.waveformBars[i] = lv_obj_create(recorderUi.waveformPanel);
-    lv_obj_set_size(recorderUi.waveformBars[i], 6, 6);
-    lv_obj_set_style_radius(recorderUi.waveformBars[i], LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(recorderUi.waveformBars[i], 0, 0);
-    lv_obj_set_style_pad_all(recorderUi.waveformBars[i], 0, 0);
-    lv_obj_clear_flag(recorderUi.waveformBars[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(recorderUi.waveformBars[i], LV_OBJ_FLAG_CLICKABLE);
-  }
-
-  recorderUi.statusLabel = nullptr;
-  recorderUi.detailLabel = nullptr;
-  recorderUi.buttonLabel = nullptr;
-  clearRecorderVisualState();
-  applyRecorderButtonPulse(false);
-  updateRecorderVisuals();
-  recorderBuilt = true;
-  return recorderUi.screen;
-}
-
-void buildRecorderScreenRoot()
-{
-  screenRoots[static_cast<size_t>(ScreenId::Recorder)] = buildRecorderScreen();
-}
-
-void refreshRecorderScreen()
-{
-  if (!recorderBuilt || !recorderUi.button) {
+  if (audioPlaybackActive) {
+    stopPlayback();
+    refreshRecorderClipState();
+    setStatus(audioClipAvailable ? "Hold to record  •  Tap to play" : "Ready");
+    setButtonColor(lvColor(154, 24, 30), lvColor(214, 84, 90));
+    noteActivity();
     return;
   }
 
-  if (!sdMounted) {
-    recorderStatusText = "Insert SD card";
-    recorderDetailText = "Recording and playback use the SD card.";
-  } else if (!audioRecordingActive && !audioPlaybackActive) {
-    refreshRecorderClipState();
-    if (audioClipAvailable && recorderStatusText == "Ready to record") {
-      recorderDetailText = "Last take length " + formatRecorderDuration(audioClipBytes);
-    }
+  if (audioClipAvailable) {
+    startPlayback();
+    noteActivity();
   }
-
-  bool disableButton = false;
-  lv_color_t buttonColor = lvColor(154, 24, 30);
-  lv_color_t borderColor = lvColor(214, 84, 90);
-  bool shouldPulse = false;
-
-  if (!sdMounted) {
-    disableButton = true;
-    buttonColor = lvColor(34, 42, 54);
-    borderColor = lvColor(56, 68, 82);
-  } else if (audioPlaybackActive) {
-    buttonColor = lvColor(26, 82, 154);
-    borderColor = lvColor(76, 138, 214);
-    shouldPulse = true;
-  } else if (audioRecordingActive) {
-    buttonColor = lvColor(184, 38, 44);
-    borderColor = lvColor(240, 98, 104);
-    shouldPulse = true;
-    recorderStatusText = "Recording " + formatRecorderDuration(audioRecordedBytes);
-    recorderDetailText = "Release to stop and play it back.";
-  }
-
-  lv_obj_set_style_bg_color(recorderUi.button, buttonColor, 0);
-  lv_obj_set_style_border_color(recorderUi.button, borderColor, 0);
-  lv_obj_set_style_shadow_color(recorderUi.button, buttonColor, 0);
-  lv_obj_set_style_shadow_opa(recorderUi.button, shouldPulse ? LV_OPA_70 : LV_OPA_40, 0);
-
-  if (disableButton) {
-    lv_obj_add_state(recorderUi.button, LV_STATE_DISABLED);
-  } else {
-    lv_obj_clear_state(recorderUi.button, LV_STATE_DISABLED);
-  }
-  updateRecorderVisuals();
 }
+
+// ---------------------------------------------------------------------------
+// Build
+// ---------------------------------------------------------------------------
+
+static void buildRecorderScreen()
+{
+  rec.screen = lv_obj_create(nullptr);
+  applyRootStyle(rec.screen);
+
+  rec.button = lv_button_create(rec.screen);
+  lv_obj_set_size(rec.button, kRecorderButtonDiameter, kRecorderButtonDiameter);
+  lv_obj_align(rec.button, LV_ALIGN_CENTER, 0, -40);
+  lv_obj_set_style_radius(rec.button, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(rec.button, lvColor(154, 24, 30), 0);
+  lv_obj_set_style_bg_color(rec.button, lvColor(184, 38, 44), LV_STATE_PRESSED);
+  lv_obj_set_style_border_width(rec.button, 2, 0);
+  lv_obj_set_style_border_color(rec.button, lvColor(214, 84, 90), 0);
+  lv_obj_add_event_cb(rec.button, onButtonEvent, LV_EVENT_ALL, nullptr);
+
+  // Mic icon inside button
+  lv_obj_t *icon = lv_label_create(rec.button);
+  lv_obj_set_style_text_font(icon, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(icon, lvColor(255, 255, 255), 0);
+  lv_label_set_text(icon, LV_SYMBOL_AUDIO);
+  lv_obj_center(icon);
+
+  rec.statusLabel = lv_label_create(rec.screen);
+  lv_obj_set_style_text_font(rec.statusLabel, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(rec.statusLabel, lvColor(180, 190, 200), 0);
+  lv_obj_set_width(rec.statusLabel, LCD_WIDTH - 48);
+  lv_obj_set_style_text_align(rec.statusLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(rec.statusLabel, LV_LABEL_LONG_WRAP);
+  lv_obj_align(rec.statusLabel, LV_ALIGN_CENTER, 0, 80);
+
+  screenRoots[static_cast<size_t>(ScreenId::Recorder)] = rec.screen;
+  recorderBuilt = true;
+  setStatus("Hold to record");
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
 
 lv_obj_t *waveformRecorderScreenRoot()
 {
@@ -649,39 +394,40 @@ lv_obj_t *waveformRecorderScreenRoot()
 bool waveformBuildRecorderScreen()
 {
   if (!waveformRecorderScreenRoot()) {
-    buildRecorderScreenRoot();
+    buildRecorderScreen();
   }
-
-  return recorderBuilt && waveformRecorderScreenRoot() && recorderUi.screen && recorderUi.statusLabel &&
-         recorderUi.detailLabel && recorderUi.button;
+  return recorderBuilt && waveformRecorderScreenRoot() && rec.button && rec.statusLabel;
 }
 
 bool waveformRefreshRecorderScreen()
 {
-  if (!recorderBuilt || !recorderUi.screen || !recorderUi.statusLabel || !recorderUi.detailLabel || !recorderUi.button) {
-    return false;
-  }
-
-  refreshRecorderScreen();
-  return true;
+  return recorderBuilt && rec.button && rec.statusLabel;
 }
 
 void waveformEnterRecorderScreen()
 {
+  if (!recorderBuilt) return;
+  refreshRecorderClipState();
+  if (!sdMounted) {
+    setStatus("Insert SD card");
+    lv_obj_add_state(rec.button, LV_STATE_DISABLED);
+  } else {
+    lv_obj_clear_state(rec.button, LV_STATE_DISABLED);
+    setStatus(audioClipAvailable ? "Hold to record  •  Tap to play" : "Hold to record");
+  }
 }
 
 void waveformLeaveRecorderScreen()
 {
-  if (audioRecordingActive) {
-    stopRecording(false);
-  }
-  if (audioPlaybackActive) {
-    stopPlayback();
-  }
+  if (audioRecordingActive) stopRecording(false);
+  if (audioPlaybackActive)  stopPlayback();
+  audioI2s.end();
+  audioHardwareReady = false;
 }
 
 void waveformTickRecorderScreen(uint32_t nowMs)
 {
   (void)nowMs;
-  refreshRecorderScreen();
 }
+
+#endif // SCREEN_RECORDER

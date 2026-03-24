@@ -48,6 +48,9 @@ constexpr int kClockColonWidth           = 22;
 constexpr int kClockGlyphHeight          = 148;
 constexpr int kClockZoom                 = 384;
 
+// --- IMU ---
+constexpr uint32_t kImuSampleIntervalMs      = 20;
+
 // --- Motion screen ---
 constexpr size_t kCubeEdgeCount          = 12;
 constexpr size_t kCubeArrowSegmentCount  = 3;
@@ -98,6 +101,13 @@ constexpr const char *kSdStartupDirs[]   = {
 
 // --- Recorder clip path ---
 constexpr const char *kRecorderClipPath  = "/recordings/last_take.pcm";
+
+// --- Stopwatch screen ---
+constexpr uint32_t kStopwatchLongPressMs     = 600;
+
+// --- Timer screen ---
+constexpr int      kTimerDragThresholdPx     = 30;
+constexpr uint32_t kTimerChimeRepeatCount    = 5;
 
 // --- Weather ---
 constexpr uint32_t kWeatherRefreshIntervalMs = 15UL * 60UL * 1000UL;

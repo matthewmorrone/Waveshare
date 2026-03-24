@@ -1,22 +1,26 @@
 # Waveform TODO
 
+## Notes
+
+- [ ] the dot pauses briefly when on an axis in the level screen
+
 ## Screens
 
 - [ ] Wi-Fi network list
 - [ ] Bluetooth device list
-- [ ] Calendar screen
+- [x] Calendar screen
 - [ ] Moon phase screen
-- [ ] Earth phrase screen (sunrise and sunset)
-- [ ] Solar system screen
-- [ ] Weather screen with nice animations/visuals
+- [ ] Earth phase screen (sunrise and sunset)
+- [x] Solar system screen
+- [x] Weather screen with nice animations/visuals
 - [ ] Audio spectrum visualization
 - [ ] Voice recording and playback
-- [ ] Calculator screen
+- [x] Calculator screen
 - [ ] View contents of SD card
 - [ ] Virtual pet
 - [ ] Settings
-- [ ] Stopwatch
-- [ ] Timer
+- [x] Stopwatch
+- [x] Timer
 
 ## Connectivity And Platform
 

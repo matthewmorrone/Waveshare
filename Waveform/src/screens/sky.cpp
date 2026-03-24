@@ -1,6 +1,7 @@
 #include "config/ota_config.h"
 #include "config/screen_constants.h"
 #include "core/screen_manager.h"
+#ifdef SCREEN_SKY
 #include "modules/weather_module.h"
 #include "screens/screen_callbacks.h"
 #include "state/geo_state.h"
@@ -329,3 +330,5 @@ void waveformTickSkyScreen(uint32_t nowMs)
   (void)nowMs;
   refreshSkyScreen();
 }
+
+#endif // SCREEN_SKY
