@@ -5,7 +5,7 @@ import lvgl as lv
 import prefs
 
 # Screen IDs (order determines navigation order)
-SCREEN_WATCHFACE   = 0
+SCREEN_WATCH   = 0
 SCREEN_WEATHER     = 1
 SCREEN_MOTION      = 2
 SCREEN_GEO         = 3
@@ -17,7 +17,7 @@ SCREEN_CALCULATOR  = 8
 SCREEN_COUNT       = 9
 
 SCREEN_NAMES = [
-    "Watchface", 
+    "Watch", 
     "Weather", 
     "Motion", 
     "Geo",
@@ -66,7 +66,7 @@ class ScreenModule:
 class ScreenManager:
     def __init__(self):
         self._modules = [None] * SCREEN_COUNT
-        self._current_id = SCREEN_WATCHFACE
+        self._current_id = SCREEN_WATCH
         self._error_screen = None
 
     def register(self, module):
@@ -150,11 +150,11 @@ class ScreenManager:
                 print(f"tick error [{m.name}]:", e)
 
     def restore_saved(self):
-        saved = prefs.get_int("last_screen", SCREEN_WATCHFACE)
+        saved = prefs.get_int("last_screen", SCREEN_WATCH)
         if 0 <= saved < SCREEN_COUNT:
             self.go_to(saved, save=False)
         else:
-            self.go_to(SCREEN_WATCHFACE, save=False)
+            self.go_to(SCREEN_WATCH, save=False)
 
 
 # Global singleton

@@ -1,7 +1,7 @@
-# screens/watchface.py - Digital watchface with time, date, battery, status icons
+# screens/watch.py - Digital watch with time, date, battery, status icons
 import lvgl as lv
 import time
-from screen_manager import ScreenModule, SCREEN_WATCHFACE
+from screen_manager import ScreenModule, SCREEN_WATCH
 
 _DAYS   = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 _MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -11,9 +11,9 @@ def _lv_color(r, g, b):
     return lv.color_make(r, g, b)
 
 
-class WatchfaceScreen(ScreenModule):
+class WatchScreen(ScreenModule):
     def __init__(self):
-        super().__init__(SCREEN_WATCHFACE, "Watchface")
+        super().__init__(SCREEN_WATCH, "Watch")
         self._scr = None
         self._time_label = None
         self._date_label = None

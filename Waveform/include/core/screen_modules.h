@@ -2,7 +2,7 @@
 
 #include "core/screen_manager.h"
 
-const ScreenModule &watchfaceScreenModule();
+const ScreenModule &watchScreenModule();
 const ScreenModule &motionScreenModule();
 const ScreenModule &weatherScreenModule();
 const ScreenModule &geoScreenModule();

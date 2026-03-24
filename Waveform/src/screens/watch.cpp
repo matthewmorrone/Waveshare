@@ -25,7 +25,7 @@ extern SensorPCF85063 rtc;
 bool rtcTimeLooksValid(const struct tm &timeInfo);
 bool setSystemTimeFromTm(const struct tm &timeInfo);
 
-bool watchfaceBuilt = false;
+bool watchBuilt = false;
 
 extern lv_obj_t *watchTimeLabel;
 extern lv_obj_t *watchTimeRow;
@@ -43,18 +43,18 @@ extern lv_obj_t *watchStatusLabel;
 namespace
 {
 const ScreenModule kModule = {
-    ScreenId::Watchface,
-    "Watchface",
-    waveformBuildWatchfaceScreen,
-    waveformRefreshWatchfaceScreen,
-    waveformEnterWatchfaceScreen,
-    waveformLeaveWatchfaceScreen,
-    waveformTickWatchfaceScreen,
-    waveformWatchfaceScreenRoot,
+    ScreenId::Watch,
+    "Watch",
+    waveformBuildWatchScreen,
+    waveformRefreshWatchScreen,
+    waveformEnterWatchScreen,
+    waveformLeaveWatchScreen,
+    waveformTickWatchScreen,
+    waveformWatchScreenRoot,
 };
 } // namespace
 
-const ScreenModule &watchfaceScreenModule()
+const ScreenModule &watchScreenModule()
 {
   return kModule;
 }
@@ -96,7 +96,7 @@ void initRtc()
 }
 
 
-void buildWatchfaceScreen()
+void buildWatchScreen()
 {
   lv_obj_t *screen = lv_obj_create(nullptr);
   applyRootStyle(screen);
@@ -179,13 +179,13 @@ void buildWatchfaceScreen()
   lv_label_set_text(watchStatusLabel, "Buttons cycle screens");
   lv_obj_align(watchStatusLabel, LV_ALIGN_BOTTOM_MID, 0, -28);
 
-  screenRoots[static_cast<size_t>(ScreenId::Watchface)] = screen;
-  watchfaceBuilt = true;
+  screenRoots[static_cast<size_t>(ScreenId::Watch)] = screen;
+  watchBuilt = true;
 }
 
-void refreshWatchface()
+void refreshWatch()
 {
-  if (!watchfaceBuilt) {
+  if (!watchBuilt) {
     return;
   }
 
@@ -230,41 +230,41 @@ void refreshWatchface()
   lv_label_set_text(watchStatusLabel, status.c_str());
 }
 
-lv_obj_t *waveformWatchfaceScreenRoot()
+lv_obj_t *waveformWatchScreenRoot()
 {
-  return screenRoots[static_cast<size_t>(ScreenId::Watchface)];
+  return screenRoots[static_cast<size_t>(ScreenId::Watch)];
 }
 
-bool waveformBuildWatchfaceScreen()
+bool waveformBuildWatchScreen()
 {
-  if (!waveformWatchfaceScreenRoot()) {
-    buildWatchfaceScreen();
+  if (!waveformWatchScreenRoot()) {
+    buildWatchScreen();
   }
 
-  return watchfaceBuilt && waveformWatchfaceScreenRoot() && watchTimeLabel && watchDateLabel &&
+  return watchBuilt && waveformWatchScreenRoot() && watchTimeLabel && watchDateLabel &&
          watchTimezoneLabel && watchStatusLabel;
 }
 
-bool waveformRefreshWatchfaceScreen()
+bool waveformRefreshWatchScreen()
 {
-  if (!watchfaceBuilt || !watchTimeLabel || !watchDateLabel || !watchTimezoneLabel || !watchStatusLabel) {
+  if (!watchBuilt || !watchTimeLabel || !watchDateLabel || !watchTimezoneLabel || !watchStatusLabel) {
     return false;
   }
 
-  refreshWatchface();
+  refreshWatch();
   return true;
 }
 
-void waveformEnterWatchfaceScreen()
+void waveformEnterWatchScreen()
 {
 }
 
-void waveformLeaveWatchfaceScreen()
+void waveformLeaveWatchScreen()
 {
 }
 
-void waveformTickWatchfaceScreen(uint32_t nowMs)
+void waveformTickWatchScreen(uint32_t nowMs)
 {
   (void)nowMs;
-  refreshWatchface();
+  refreshWatch();
 }

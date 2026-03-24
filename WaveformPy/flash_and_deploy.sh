@@ -142,7 +142,7 @@ FILES=(
     drivers/qmi8658.py
     drivers/es8311.py
     screens/__init__.py
-    screens/watchface.py
+    screens/watch.py
     screens/weather.py
     screens/motion.py
     screens/geo.py

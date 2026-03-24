@@ -36,7 +36,7 @@ constexpr uint32_t kSolarRefreshIntervalMs = 30UL * 60UL * 1000UL;
 constexpr uint32_t kSolarRetryIntervalMs   = 60UL * 1000UL;
 constexpr uint32_t kSolarFetchTimeoutMs    = 2500;
 
-// --- Watchface screen ---
+// --- Watch screen ---
 constexpr int kBatteryTrackWidth         = 266;
 constexpr int kBatteryTrackHeight        = 12;
 constexpr int kBatteryTrackY             = 358;

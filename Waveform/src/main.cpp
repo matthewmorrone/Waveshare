@@ -493,7 +493,7 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         touchTapTracking = false;
       }
     } else if (pressedNow && !touchGestureConsumed &&
-               static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watchface) {
+               static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watch) {
       int deltaX = touchLastX - touchTapStartX;
       int deltaY = touchLastY - touchTapStartY;
       int absDx = abs(deltaX);
@@ -532,7 +532,7 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
                  absDx >= kWeatherSwipeMinDistancePx &&
                  absDx >= (absDy + 10)) {
         handleWeatherSwipe(deltaX);
-      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watchface &&
+      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watch &&
                  absDx >= kScreenNavSwipeMinDistancePx &&
                  absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
         handleScreenNavigationSwipe(deltaX);
@@ -2112,8 +2112,8 @@ void setup()
     savedScreen = 0;
   }
 
-  if (!showScreen(savedScreen) && savedScreen != static_cast<uint8_t>(ScreenId::Watchface)) {
-    showScreen(static_cast<size_t>(ScreenId::Watchface));
+  if (!showScreen(savedScreen) && savedScreen != static_cast<uint8_t>(ScreenId::Watch)) {
+    showScreen(static_cast<size_t>(ScreenId::Watch));
   }
   refreshUi();
   lv_obj_invalidate(lv_screen_active());

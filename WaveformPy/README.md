@@ -10,7 +10,7 @@ Same feature set as the C++ original, implemented in Python using [lv_micropytho
 
 | Screen | Description |
 |--------|-------------|
-| Watchface | Time, date, battery bar, WiFi/USB/charging status |
+| Watch | Time, date, battery bar, WiFi/USB/charging status |
 | Weather | Animated conditions (rain, snow, storm), 5-day forecast, moon phase, sunrise/sunset |
 | Motion | IMU visualization — Dot (pitch/roll), Cube (3D), Raw (numeric) |
 | Geo | IP-based geolocation with lat/lon, timezone, city |
@@ -98,7 +98,7 @@ WaveformPy/
 │   ├── qmi8658.py       # IMU (accel + gyro)
 │   └── es8311.py        # Audio codec
 ├── screens/
-│   ├── watchface.py     # Clock / battery
+│   ├── watch.py     # Clock / battery
 │   ├── weather.py       # Weather + animations
 │   ├── motion.py        # IMU visualization
 │   ├── geo.py           # Geolocation

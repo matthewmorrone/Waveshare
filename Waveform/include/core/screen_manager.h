@@ -7,7 +7,7 @@
 
 enum class ScreenId : uint8_t
 {
-  Watchface,
+  Watch,
   Motion,
   Weather,
   Geo,

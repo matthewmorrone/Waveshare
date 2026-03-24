@@ -296,7 +296,7 @@ def setup():
 
 
 def _register_screens():
-    from screens.watchface   import WatchfaceScreen
+    from screens.watch   import WatchScreen
     from screens.weather     import WeatherScreen
     from screens.motion      import MotionScreen
     from screens.geo         import GeoScreen
@@ -306,7 +306,7 @@ def _register_screens():
     from screens.qr_code     import QRScreen
     from screens.calculator  import CalculatorScreen
 
-    manager.register(WatchfaceScreen())
+    manager.register(WatchScreen())
     manager.register(WeatherScreen())
     manager.register(MotionScreen(_imu))
     manager.register(GeoScreen())

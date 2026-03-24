@@ -12,12 +12,12 @@ struct QrEntry
 extern const QrEntry kQrEntries[];
 extern const size_t kQrEntryCount;
 
-lv_obj_t *waveformWatchfaceScreenRoot();
-bool waveformBuildWatchfaceScreen();
-bool waveformRefreshWatchfaceScreen();
-void waveformEnterWatchfaceScreen();
-void waveformLeaveWatchfaceScreen();
-void waveformTickWatchfaceScreen(uint32_t nowMs);
+lv_obj_t *waveformWatchScreenRoot();
+bool waveformBuildWatchScreen();
+bool waveformRefreshWatchScreen();
+void waveformEnterWatchScreen();
+void waveformLeaveWatchScreen();
+void waveformTickWatchScreen(uint32_t nowMs);
 
 lv_obj_t *waveformMotionScreenRoot();
 bool waveformBuildMotionScreen();

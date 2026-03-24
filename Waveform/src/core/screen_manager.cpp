@@ -23,7 +23,7 @@ lv_obj_t *gFallbackBodyLabel = nullptr;
 lv_obj_t *gFallbackFooterLabel = nullptr;
 
 const ScreenModule *const kModules[kScreenCount] = {
-    &watchfaceScreenModule(),
+    &watchScreenModule(),
     &motionScreenModule(),
     &weatherScreenModule(),
     &geoScreenModule(),
