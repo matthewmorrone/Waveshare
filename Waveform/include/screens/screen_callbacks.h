@@ -20,6 +20,16 @@ struct QrEntry
 extern const QrEntry kQrEntries[];
 extern const size_t kQrEntryCount;
 
+#ifdef SCREEN_LAUNCHER
+lv_obj_t *waveformLauncherScreenRoot();
+bool waveformBuildLauncherScreen();
+bool waveformRefreshLauncherScreen();
+void waveformEnterLauncherScreen();
+void waveformLeaveLauncherScreen();
+void waveformTickLauncherScreen(uint32_t nowMs);
+void waveformLauncherScrollBy(int dy);
+#endif
+
 lv_obj_t *waveformWatchScreenRoot();
 bool waveformBuildWatchScreen();
 bool waveformRefreshWatchScreen();
@@ -119,3 +129,38 @@ void waveformLeaveTimerScreen();
 void waveformTickTimerScreen(uint32_t nowMs);
 void timerHandleTap();
 #endif
+
+#ifdef SCREEN_SYSTEM
+lv_obj_t *waveformSystemScreenRoot();
+bool waveformBuildSystemScreen();
+bool waveformRefreshSystemScreen();
+void waveformEnterSystemScreen();
+void waveformLeaveSystemScreen();
+void waveformTickSystemScreen(uint32_t nowMs);
+#endif
+
+#ifdef SCREEN_SETTINGS
+lv_obj_t *waveformSettingsScreenRoot();
+bool waveformBuildSettingsScreen();
+bool waveformRefreshSettingsScreen();
+void waveformEnterSettingsScreen();
+void waveformLeaveSettingsScreen();
+void waveformTickSettingsScreen(uint32_t nowMs);
+void waveformDestroySettingsScreen();
+#endif
+
+#ifdef SCREEN_SPECTRUM
+lv_obj_t *waveformSpectrumScreenRoot();
+bool waveformBuildSpectrumScreen();
+bool waveformRefreshSpectrumScreen();
+void waveformEnterSpectrumScreen();
+void waveformLeaveSpectrumScreen();
+void waveformTickSpectrumScreen(uint32_t nowMs);
+void waveformDestroySpectrumScreen();
+#endif
+
+// --- Timezone picker (standalone overlay screen) ---
+void showTimezonePicker();
+void hideTimezonePicker();
+void timezonePickerSetInitial(int utcOffset);
+void timezonePickerHandleSwipe(int deltaX);

@@ -11,9 +11,15 @@ What it does now:
 - Runs an LVGL 9 multi-screen watch UI
 
 Current screens:
+- Launcher / utility deck
 - Watch face
+- Moon phase
 - Motion / IMU
 - Weather
+- Calculator
+- Stopwatch
+- Timer
+- System status
 
 Project structure:
 - `config/`

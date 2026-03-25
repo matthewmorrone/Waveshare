@@ -38,11 +38,11 @@ constexpr uint32_t kSolarFetchTimeoutMs    = 2500;
 
 // --- Watch screen ---
 constexpr int kBatteryTrackWidth         = 266;
-constexpr int kBatteryTrackHeight        = 12;
+constexpr int kBatteryTrackHeight        = 8;
 constexpr int kBatteryTrackY             = 358;
-constexpr int kWatchTimeY                = 58;
-constexpr int kWatchDateY                = 272;
-constexpr int kWatchTimezoneY            = 306;
+constexpr int kWatchTimeY                = 108;
+constexpr int kWatchDateY                = 292;
+constexpr int kWatchTimezoneY            = 330;
 constexpr int kClockDigitWidth           = 50;
 constexpr int kClockColonWidth           = 22;
 constexpr int kClockGlyphHeight          = 148;

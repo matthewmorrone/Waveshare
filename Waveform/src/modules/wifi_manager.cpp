@@ -6,8 +6,7 @@
 extern ConnectivityState connectivityState;
 
 extern const QrEntry kQrEntries[] = {
-    {"Join Wi-Fi", "WIFI:T:WPA;S:" WIFI_SSID_PRIMARY ";P:" WIFI_PASSWORD_PRIMARY ";;"},
-    {"Waveform OTA", "http://waveform.local"},
+    {"Join Wi-Fi", "WIFI:T:WPA;S:" WIFI_SSID_PRIMARY ";P:" WIFI_PASSWORD_PRIMARY ";;"}
 };
 extern const size_t kQrEntryCount = sizeof(kQrEntries) / sizeof(kQrEntries[0]);
 

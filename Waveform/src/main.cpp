@@ -36,6 +36,7 @@
 #include "modules/weather_module.h"
 #include "modules/wifi_manager.h"
 #include "screens/screen_callbacks.h"
+#include "state/settings_state.h"
 
 #include <XPowersLib.h>
 
@@ -141,8 +142,8 @@ lv_display_t *display = nullptr;
 lv_indev_t *touchInput = nullptr;
 static uint8_t *lvBuffer = nullptr;
 
-lv_obj_t *screenRoots[12] = {};  // sized to max possible screens
-bool screenRefreshPending[9] = {};
+lv_obj_t *screenRoots[16] = {};  // sized to max possible screens
+bool screenRefreshPending[16] = {};
 size_t currentScreenIndex = 0;
 bool screenPreferenceSavePending = false;
 size_t pendingScreenPreferenceIndex = 0;
@@ -171,6 +172,7 @@ bool rtcReady = false;
 bool touchReady = false;
 bool displayDimmed = false;
 bool inLightSleep = false;
+bool gFaceDownBlacked = false;
 bool touchPressed = false;
 bool touchGestureConsumed = false;
 bool sideButtonPressed = false;
@@ -187,6 +189,7 @@ ConnectivityState connectivityState = ConnectivityState::Offline;
 
 int16_t touchLastX = LCD_WIDTH / 2;
 int16_t touchLastY = LCD_HEIGHT / 2;
+int16_t touchPrevY = LCD_HEIGHT / 2;
 size_t configuredNetworkCount = 0;
 size_t currentCredentialIndex = 0;
 size_t nextCredentialIndex = 0;
@@ -397,6 +400,7 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
     bool pressedNow = fingers > 0;
 
     if (pressedNow) {
+      touchPrevY = touchLastY;
       touchLastX = static_cast<int16_t>(touchController->IIC_Read_Device_Value(
           touchController->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X));
       touchLastY = static_cast<int16_t>(touchController->IIC_Read_Device_Value(
@@ -410,6 +414,25 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
       touchTapStartedAtMs = millis();
       touchTapStartX = touchLastX;
       touchTapStartY = touchLastY;
+#ifdef SCREEN_LAUNCHER
+    } else if (pressedNow &&
+               static_cast<ScreenId>(currentScreenIndex) == ScreenId::Launcher &&
+               touchGestureConsumed) {
+      // Continue scrolling after gesture was committed
+      waveformLauncherScrollBy(touchPrevY - touchLastY);
+    } else if (pressedNow && !touchGestureConsumed &&
+               static_cast<ScreenId>(currentScreenIndex) == ScreenId::Launcher) {
+      int deltaX = touchLastX - touchTapStartX;
+      int deltaY = touchLastY - touchTapStartY;
+      int absDx = abs(deltaX);
+      int absDy = abs(deltaY);
+      if (absDy >= kMotionSwipeMinDistancePx &&
+          absDy >= (absDx + kMotionSwipeMinDominancePx)) {
+        waveformLauncherScrollBy(touchPrevY - touchLastY);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      }
+#endif
     } else if (pressedNow && !touchGestureConsumed &&
                static_cast<ScreenId>(currentScreenIndex) == ScreenId::Motion) {
       int deltaX = touchLastX - touchTapStartX;
@@ -957,6 +980,7 @@ void restoreFromLightSleep()
   delay(120);
   setDisplayBrightness(kActiveBrightness);
   displayDimmed = false;
+  gFaceDownBlacked = false;
 
   initTouch();
   imuModuleInit();
@@ -1011,14 +1035,41 @@ void updateIdleState()
     return;
   }
 
+  // Face-down blackout — runs before USB check so it works while charging
+  if (settingsState().faceDownBlackout && imuModuleIsReady()) {
+    const MotionState &ms = imuModuleState();
+    bool faceDown = ms.valid && strcmp(ms.orientation, "Face Down") == 0;
+    if (faceDown && !gFaceDownBlacked) {
+      gFaceDownBlacked = true;
+      gfx->displayOff();
+      setDisplayBrightness(0);
+    } else if (!faceDown && gFaceDownBlacked) {
+      gFaceDownBlacked = false;
+      displayDimmed = false;
+      gfx->displayOn();
+      setDisplayBrightness(settingsState().brightness);
+      noteActivity();
+    }
+  } else if (gFaceDownBlacked) {
+    gFaceDownBlacked = false;
+    displayDimmed = false;
+    gfx->displayOn();
+    setDisplayBrightness(settingsState().brightness);
+    noteActivity();
+  }
+
   if (usbIsConnected()) {
     if (displayDimmed) {
       gfx->displayOn();
-      setDisplayBrightness(kActiveBrightness);
+      setDisplayBrightness(settingsState().brightness);
       displayDimmed = false;
     }
     lastActivityAtMs = millis();
     return;
+  }
+
+  if (gFaceDownBlacked) {
+    return;  // don't advance dim/sleep timers while blacked out
   }
 
   uint32_t idleMs = millis() - lastActivityAtMs;
@@ -1027,7 +1078,8 @@ void updateIdleState()
     displayDimmed = true;
   }
 
-  if (idleMs >= kSleepAfterMs) {
+  uint32_t sleepMs = settingsState().sleepAfterMs;
+  if (sleepMs > 0 && idleMs >= sleepMs) {
     enterLightSleep();
   }
 }
@@ -1095,11 +1147,33 @@ bool showScreen(size_t index)
   screenManagerRefresh(nextScreen);
   lv_screen_load(screenManagerRoot(nextScreen));
   lv_refr_now(display);
+
+  // Free the previous screen after the new one is rendered to avoid mid-frame deletion.
+  // Keep Watch and Launcher cached for instant switching.
+  if (previousScreen != nextScreen) {
+#ifdef SCREEN_WATCH
+    if (previousScreen != ScreenId::Watch)
+#endif
+    {
+#ifdef SCREEN_LAUNCHER
+      if (previousScreen != ScreenId::Launcher)
+#endif
+      {
+        screenManagerDestroy(previousScreen);
+      }
+    }
+  }
+
   scheduleScreenRefresh(nextScreen);
   pendingScreenPreferenceIndex = currentScreenIndex;
   screenPreferenceSavePending = true;
   (void)previousScreenIndex;
   return true;
+}
+
+bool showScreenById(ScreenId id)
+{
+  return showScreen(static_cast<size_t>(id));
 }
 
 void showNextScreen()
@@ -1139,7 +1213,7 @@ void updateTopButton()
     uint32_t heldMs = now - sideButtonPressedAtMs;
     sideButtonPressed = false;
     sideButtonReleaseArmed = false;
-    if (heldMs >= kSideButtonLongPressMs) {
+    if (heldMs >= kSideButtonLongPressMs && settingsState().autoCycleEnabled) {
       autoCycleEnabled = !autoCycleEnabled;
       lastAutoCycleAtMs = now;
     } else {
@@ -1164,7 +1238,7 @@ void updatePowerKey()
   bool longPress = power.isPekeyLongPressIrq();
   bool releasedEdge = power.isPekeyNegativeIrq();
 
-  if (longPress && !powerButtonShutdownTriggered) {
+  if (longPress && !powerButtonShutdownTriggered && settingsState().autoCycleEnabled) {
     autoCycleEnabled = !autoCycleEnabled;
     lastAutoCycleAtMs = millis();
     cancelPowerButtonHold();
@@ -1265,9 +1339,6 @@ void buildUi()
   otaModuleBuildOverlay();
   buildPowerHoldOverlay();
   buildCycleCountdown();
-  for (size_t i = 0; i < kScreenCount; ++i) {
-    screenManagerEnsureBuilt(static_cast<ScreenId>(i));
-  }
 }
 
 void setupLvgl()
@@ -1316,6 +1387,7 @@ void setup()
   delay(250);
   randomSeed(static_cast<unsigned long>(micros()));
   preferences.begin(kPreferencesNamespace, false);
+  settingsLoad(preferences);
   weatherModuleConfigure({
       &preferences,
       kPrefWeatherCacheKey,
@@ -1391,6 +1463,8 @@ void setup()
 
   setupLvgl();
   buildUi();
+  setDisplayBrightness(settingsState().brightness);
+  autoCycleEnabled = settingsState().autoCycleEnabled;
   uint8_t savedScreen = preferences.getUChar(kPrefScreenKey, 0);
   if (savedScreen >= kScreenCount) {
     savedScreen = 0;
@@ -1451,6 +1525,9 @@ void loop()
 #ifdef SCREEN_SKY
         && activeScreen != ScreenId::Sky
 #endif
+#ifdef SCREEN_SPECTRUM
+        && activeScreen != ScreenId::Spectrum
+#endif
     ) {
       refreshManagedScreen(activeScreen);
     }
@@ -1480,6 +1557,11 @@ void loop()
     }
   }
 
+#ifdef SCREEN_SPECTRUM
+  if (activeScreen == ScreenId::Spectrum) {
+    screenManagerTick(activeScreen, now);
+  }
+#endif
 #ifdef SCREEN_STOPWATCH
   if (activeScreen == ScreenId::Stopwatch) {
     screenManagerTick(activeScreen, now);
@@ -1500,7 +1582,8 @@ void loop()
   }
 #endif
 
-  if (autoCycleEnabled && now - lastAutoCycleAtMs >= kAutoCycleMs) {
+  uint32_t autoCycleIntervalMs = settingsState().autoCycleIntervalMs;
+  if (autoCycleEnabled && now - lastAutoCycleAtMs >= autoCycleIntervalMs) {
     lastAutoCycleAtMs = now;
     showNextScreen();
   }
@@ -1508,7 +1591,7 @@ void loop()
   if (cycleCountdownLabel) {
     if (autoCycleEnabled) {
       uint32_t elapsed = now - lastAutoCycleAtMs;
-      uint32_t remaining = elapsed < kAutoCycleMs ? (kAutoCycleMs - elapsed + 999) / 1000 : 1;
+      uint32_t remaining = elapsed < autoCycleIntervalMs ? (autoCycleIntervalMs - elapsed + 999) / 1000 : 1;
       char buf[4];
       snprintf(buf, sizeof(buf), "%u", remaining);
       lv_label_set_text(cycleCountdownLabel, buf);

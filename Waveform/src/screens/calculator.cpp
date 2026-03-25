@@ -2,6 +2,7 @@
 #include "core/screen_manager.h"
 #include "screens/screen_callbacks.h"
 
+extern const lv_font_t calc_symbols_24;
 extern lv_obj_t *screenRoots[];
 extern lv_indev_t *touchInput;
 void applyRootStyle(lv_obj_t *obj);
@@ -741,6 +742,15 @@ void addCalculatorButtonIcon(lv_obj_t *button, const char *labelText, lv_color_t
     addCalculatorIconLine(button, buttonIndex, 1, 3, 16, 12, 26, 3, color);
     addCalculatorIconLine(button, buttonIndex, 2, 16, 10, 28, 22, 3, color);
     addCalculatorIconLine(button, buttonIndex, 3, 28, 10, 16, 22, 3, color);
+    return;
+  }
+
+  if (strcmp(labelText, "+/-") == 0) {
+    // ± icon: plus sign on top, minus bar on bottom
+    addCalculatorIconLine(button, buttonIndex, 0, 8, 12, 26, 12, 3, color); // horizontal of +
+    addCalculatorIconLine(button, buttonIndex, 1, 17, 5, 17, 19, 3, color); // vertical of +
+    addCalculatorIconLine(button, buttonIndex, 2, 8, 22, 26, 22, 3, color); // minus bar
+    return;
   }
 }
 
@@ -795,9 +805,18 @@ void styleCalculatorButton(lv_obj_t *button, const char *labelText)
   lv_obj_center(label);
 
   clearCalculatorButtonDecorations(button);
-  if (strcmp(labelText, "BS") == 0 || strcmp(labelText, "x") == 0 || strcmp(labelText, "/") == 0) {
-    lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
-    addCalculatorButtonIcon(button, labelText, text);
+  // Use dedicated symbol glyphs for operator buttons
+  const char *glyph = nullptr;
+  if      (strcmp(labelText, "x")   == 0) glyph = "\xC3\x97";      // ×
+  else if (strcmp(labelText, "/")   == 0) glyph = "\xC3\xB7";      // ÷
+  else if (strcmp(labelText, "+/-") == 0) glyph = "\xC2\xB1";      // ±
+  else if (strcmp(labelText, "BS")  == 0) glyph = "\xEF\x95\x9A";  // ⌫ (FA5 backspace)
+
+  if (glyph) {
+    lv_obj_set_style_text_font(label, &calc_symbols_24, 0);
+    lv_label_set_text(label, glyph);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_center(label);
   }
 }
 

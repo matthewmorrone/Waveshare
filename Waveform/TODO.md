@@ -8,17 +8,18 @@
 
 - [ ] Wi-Fi network list
 - [ ] Bluetooth device list
-- [x] Calendar screen
 - [ ] Moon phase screen
 - [ ] Earth phase screen (sunrise and sunset)
-- [x] Solar system screen
-- [x] Weather screen with nice animations/visuals
 - [ ] Audio spectrum visualization
 - [ ] Voice recording and playback
-- [x] Calculator screen
 - [ ] View contents of SD card
 - [ ] Virtual pet
 - [ ] Settings
+- [ ] Bruce
+- [x] Calendar screen
+- [x] Solar system screen
+- [x] Weather screen with nice animations/visuals
+- [x] Calculator screen
 - [x] Stopwatch
 - [x] Timer
 

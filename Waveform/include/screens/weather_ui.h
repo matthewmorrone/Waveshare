@@ -68,11 +68,7 @@ struct WeatherUi
   lv_obj_t *cityLabel = nullptr;
   lv_obj_t *tempLabel = nullptr;
   lv_obj_t *tempMeta = nullptr;
-  lv_obj_t *highOpenLabel = nullptr;
-  lv_obj_t *highLabel = nullptr;
-  lv_obj_t *rangeDividerLabel = nullptr;
-  lv_obj_t *lowLabel = nullptr;
-  lv_obj_t *highCloseLabel = nullptr;
+  lv_obj_t *rangeLine = nullptr;
   lv_obj_t *sunEventIcon = nullptr;
   lv_obj_t *sunEventHorizon = nullptr;
   lv_obj_t *sunEventSun = nullptr;
@@ -85,8 +81,9 @@ struct WeatherUi
   lv_obj_t *sun = nullptr;
   lv_obj_t *sunRays[kWeatherSunRayCount] = {nullptr};
   lv_point_precise_t sunRayPoints[kWeatherSunRayCount][2] = {};
-  lv_obj_t *moon = nullptr;
-  lv_obj_t *moonShadow = nullptr;
+  lv_obj_t *moon = nullptr;         // canvas replacing the old circle pair
+  lv_draw_buf_t *moonBuf = nullptr;
+  lv_obj_t *moonShadow = nullptr;   // unused, kept nil
   lv_obj_t *clouds[3] = {nullptr};
   lv_obj_t *particles[kWeatherParticleCount] = {nullptr};
   lv_obj_t *bolt = nullptr;

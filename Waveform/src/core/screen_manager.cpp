@@ -3,8 +3,13 @@
 #include "config/pin_config.h"
 #include "core/screen_modules.h"
 
+extern lv_obj_t *screenRoots[];
+
 // --- Active screens --- controlled by #defines in screen_manager.h
 static const ScreenModule *const kModulesArr[] = {
+#ifdef SCREEN_LAUNCHER
+    &launcherScreenModule(),
+#endif
 #ifdef SCREEN_WATCH
     &watchScreenModule(),
 #endif
@@ -40,6 +45,15 @@ static const ScreenModule *const kModulesArr[] = {
 #endif
 #ifdef SCREEN_TIMER
     &timerScreenModule(),
+#endif
+#ifdef SCREEN_SYSTEM
+    &systemScreenModule(),
+#endif
+#ifdef SCREEN_SETTINGS
+    &settingsScreenModule(),
+#endif
+#ifdef SCREEN_SPECTRUM
+    &spectrumScreenModule(),
 #endif
 };
 
@@ -161,12 +175,12 @@ bool screenManagerEnsureBuilt(ScreenId id)
 
   const ScreenModule &module = screenModule(id);
   if (!module.build || !module.build()) {
-    disableScreen(id, "The screen module could not build its LVGL root.");
+    snprintf(runtime.failureReason, sizeof(runtime.failureReason), "The screen module could not build its LVGL root.");
     return false;
   }
 
   if (!screenManagerRoot(id)) {
-    disableScreen(id, "The screen module built without returning a usable root.");
+    snprintf(runtime.failureReason, sizeof(runtime.failureReason), "The screen module built without returning a usable root.");
     return false;
   }
 
@@ -276,6 +290,28 @@ size_t screenManagerPreviousEnabledIndex(size_t fromIndex)
   }
 
   return fromIndex;
+}
+
+void screenManagerDestroy(ScreenId id)
+{
+  ScreenRuntime &runtime = screenRuntime(id);
+  if (!runtime.built) return;
+
+  const ScreenModule &module = screenModule(id);
+  lv_obj_t *root = module.root ? module.root() : nullptr;
+
+  if (module.destroy) {
+    // Screen handles its own teardown (nulls internal pointers, deletes object)
+    module.destroy();
+  } else if (root) {
+    // Generic teardown: delete the LVGL tree and null the screenRoots entry
+    // so the build() function will recreate it on next visit
+    lv_obj_delete(root);
+    screenRoots[static_cast<size_t>(id)] = nullptr;
+  }
+
+  runtime.built = false;
+  runtime.failureReason[0] = '\0';
 }
 
 void screenManagerShowFallback(ScreenId id, const char *reason)

@@ -1,5 +1,7 @@
 #include "config/screen_constants.h"
 #include "core/screen_manager.h"
+
+extern const lv_font_t montserrat_bold_128;
 #include "modules/wifi_manager.h"
 #include "screens/screen_callbacks.h"
 #include <SensorPCF85063.hpp>
@@ -266,16 +268,16 @@ void buildWatchScreen()
   lv_obj_align(watchBatteryFill, LV_ALIGN_LEFT_MID, 0, 0);
 
   watchTimeLabel = lv_label_create(screen);
-  lv_obj_set_width(watchTimeLabel, LCD_WIDTH - 24);
-  lv_obj_set_style_text_font(watchTimeLabel, &lv_font_montserrat_48, 0);
+  lv_obj_set_width(watchTimeLabel, LV_SIZE_CONTENT);
+  lv_label_set_long_mode(watchTimeLabel, LV_LABEL_LONG_CLIP);
+  lv_obj_set_style_text_font(watchTimeLabel, &montserrat_bold_128, 0);
   lv_obj_set_style_text_color(watchTimeLabel, lvColor(255, 255, 255), 0);
-  lv_obj_set_style_text_align(watchTimeLabel, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_text(watchTimeLabel, "--:--");
   lv_obj_align(watchTimeLabel, LV_ALIGN_TOP_MID, 0, kWatchTimeY);
 
   watchDateLabel = lv_label_create(screen);
   lv_obj_set_width(watchDateLabel, LCD_WIDTH - 36);
-  lv_obj_set_style_text_font(watchDateLabel, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(watchDateLabel, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(watchDateLabel, lvColor(255, 255, 255), 0);
   lv_obj_set_style_text_align(watchDateLabel, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_text(watchDateLabel, "Waiting for RTC or Wi-Fi");

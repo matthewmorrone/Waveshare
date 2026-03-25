@@ -1,6 +1,8 @@
 #include "config/screen_constants.h"
 #include "core/screen_manager.h"
 #include "screens/screen_callbacks.h"
+
+#ifdef SCREEN_MOON
 #include <cmath>
 #include <time.h>
 
@@ -130,11 +132,13 @@ static void renderMoon(float ageDays)
       float termX    = cosPhase * sqrtf(R2 - dy * dy);
       float edgeDist = (waxing ? (dx - termX) : (termX - dx)) / R;
       float shadow;
-      if (edgeDist >  0.015f) shadow = 0.0f;
-      else if (edgeDist < -0.015f) shadow = 1.0f;
-      else shadow = 0.5f - edgeDist / 0.03f * 0.5f;
+      if (edgeDist > 0.08f) shadow = 0.0f;
+      else if (edgeDist < -0.08f) shadow = 1.0f;
+      else shadow = 0.5f - edgeDist / 0.16f * 0.5f;
 
-      uint8_t v = (uint8_t)((base * (1.0f - shadow * 0.94f)) * 255.0f);
+      // Earthshine: dark side is dimly visible, not black
+      float earthshine = shadow * 0.07f;
+      uint8_t v = (uint8_t)(((base * (1.0f - shadow * 0.82f)) + earthshine) * 255.0f);
       pixels[py * stride + px] = ((uint16_t)(v >> 3) << 11) |
                                   ((uint16_t)(v >> 2) << 5)  |
                                   (v >> 3);
@@ -198,3 +202,5 @@ void waveformEnterMoonScreen()
 
 void waveformLeaveMoonScreen() {}
 void waveformTickMoonScreen(uint32_t) {}
+
+#endif // SCREEN_MOON

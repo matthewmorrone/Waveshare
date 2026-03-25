@@ -16,6 +16,7 @@ void showNextScreen();
 void showPreviousScreen();
 void noteActivity();
 bool hasValidTime();
+void waveformDestroyWeatherScreen();
 
 namespace
 {
@@ -28,6 +29,7 @@ const ScreenModule kModule = {
     waveformLeaveWeatherScreen,
     waveformTickWeatherScreen,
     waveformWeatherScreenRoot,
+    waveformDestroyWeatherScreen,
 };
 
 constexpr uint16_t kBackgroundColor = 0x0000;
@@ -206,38 +208,60 @@ float currentMoonPhaseFraction()
 
 void updateMoonPhaseVisual(WeatherUi &ui, lv_color_t skyColor)
 {
-  if (!ui.moon || !ui.moonShadow) {
-    return;
-  }
+  if (!ui.moon || !ui.moonBuf) return;
 
-  constexpr int moonSize = 66;
+  constexpr int D = 66;
+  constexpr float R = D * 0.5f;
   constexpr int moonX = 42;
   constexpr int moonY = 32;
-  constexpr float moonRadius = moonSize * 0.5f;
 
-  float phase = currentMoonPhaseFraction();
-  float illumination = 0.5f * (1.0f - cosf(phase * 2.0f * static_cast<float>(M_PI)));
+  float phase = currentMoonPhaseFraction();  // 0=new, 0.5=full, 1=new
+  // terminator x-coordinate in normalised disc space: -R..+R
+  // positive = right side lit (waxing), negative = left side lit (waning)
+  float termX = R * cosf(phase * 2.0f * static_cast<float>(M_PI));
   bool waxing = phase < 0.5f;
 
+  lv_draw_buf_t *buf = ui.moonBuf;
+  uint32_t *pixels = reinterpret_cast<uint32_t *>(buf->data);
+  uint32_t stride = buf->header.stride / 4;  // stride in pixels (ARGB8888 = 4 bytes)
+
+  for (int py = 0; py < D; ++py) {
+    float ny = (py + 0.5f) - R;
+    for (int px = 0; px < D; ++px) {
+      float nx = (px + 0.5f) - R;
+      float dist = sqrtf(nx * nx + ny * ny);
+      if (dist >= R) {
+        pixels[py * stride + px] = 0x00000000;  // fully transparent outside disc
+        continue;
+      }
+
+      // Base brightness: limb darkening
+      float base = 0.78f * (1.0f - (dist / R) * (dist / R) * 0.25f);
+
+      float shadow;
+      float soften = R * 0.12f;
+      if (waxing) {
+        float edge = nx - termX;
+        shadow = edge < -soften ? 1.0f : edge > soften ? 0.0f
+               : 0.5f - edge / (2.0f * soften);
+      } else {
+        float edge = termX - nx;
+        shadow = edge < -soften ? 1.0f : edge > soften ? 0.0f
+               : 0.5f - edge / (2.0f * soften);
+      }
+
+      float bright = base * (1.0f - shadow) + base * shadow * 0.06f;
+
+      uint8_t r = static_cast<uint8_t>(fminf(255.0f, bright * 210.0f));
+      uint8_t g = static_cast<uint8_t>(fminf(255.0f, bright * 220.0f));
+      uint8_t b = static_cast<uint8_t>(fminf(255.0f, bright * 255.0f));
+      // ARGB8888 in memory (little-endian): B G R A
+      pixels[py * stride + px] = (0xFFu << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+    }
+  }
+
+  lv_obj_invalidate(ui.moon);
   lv_obj_set_pos(ui.moon, moonX, moonY);
-  lv_obj_set_style_bg_color(ui.moon, lvColor(210, 220, 255), 0);
-  lv_obj_set_style_bg_opa(ui.moon, LV_OPA_COVER, 0);
-
-  float shadowOffset = illumination * moonSize;
-  int shadowX = moonX + static_cast<int>(roundf((waxing ? -1.0f : 1.0f) * shadowOffset));
-  lv_obj_set_pos(ui.moonShadow, shadowX, moonY);
-  lv_obj_set_style_bg_color(ui.moonShadow, skyColor, 0);
-  lv_obj_set_style_bg_opa(ui.moonShadow, LV_OPA_COVER, 0);
-
-  if (illumination >= 0.995f) {
-    lv_obj_add_flag(ui.moonShadow, LV_OBJ_FLAG_HIDDEN);
-  } else {
-    lv_obj_clear_flag(ui.moonShadow, LV_OBJ_FLAG_HIDDEN);
-  }
-
-  if (illumination <= 0.005f) {
-    lv_obj_set_pos(ui.moonShadow, moonX, moonY);
-  }
 }
 } // namespace
 
@@ -438,17 +462,15 @@ lv_obj_t *buildCurrentWeatherScreen(WeatherUi &ui)
   lv_obj_set_style_bg_color(ui.sun, lvColor(255, 196, 72), 0);
   lv_obj_set_style_border_width(ui.sun, 0, 0);
 
-  ui.moon = lv_obj_create(ui.hero);
-  lv_obj_set_size(ui.moon, 66, 66);
-  lv_obj_set_style_radius(ui.moon, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(ui.moon, lvColor(210, 220, 255), 0);
+  constexpr int kWeatherMoonD = 66;
+  ui.moonBuf = lv_draw_buf_create(kWeatherMoonD, kWeatherMoonD, LV_COLOR_FORMAT_ARGB8888, LV_STRIDE_AUTO);
+  ui.moon = lv_canvas_create(ui.hero);
+  lv_canvas_set_draw_buf(ui.moon, ui.moonBuf);
+  lv_obj_set_size(ui.moon, kWeatherMoonD, kWeatherMoonD);
   lv_obj_set_style_border_width(ui.moon, 0, 0);
-
-  ui.moonShadow = lv_obj_create(ui.hero);
-  lv_obj_set_size(ui.moonShadow, 66, 66);
-  lv_obj_set_style_radius(ui.moonShadow, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(ui.moonShadow, lvColor(16, 26, 64), 0);
-  lv_obj_set_style_border_width(ui.moonShadow, 0, 0);
+  lv_obj_set_style_pad_all(ui.moon, 0, 0);
+  lv_obj_set_style_bg_opa(ui.moon, LV_OPA_TRANSP, 0);
+  ui.moonShadow = nullptr;
 
   ui.clouds[0] = createCloud(ui.hero, 126, 44);
   ui.clouds[1] = createCloud(ui.hero, 106, 38);
@@ -491,7 +513,7 @@ lv_obj_t *buildCurrentWeatherScreen(WeatherUi &ui)
   lv_obj_align(ui.tempLabel, LV_ALIGN_TOP_LEFT, 24, 248);
 
   ui.tempMeta = lv_obj_create(screen);
-  lv_obj_set_size(ui.tempMeta, 176, 96);
+  lv_obj_set_size(ui.tempMeta, 176, 110);
   lv_obj_align_to(ui.tempMeta, ui.tempLabel, LV_ALIGN_OUT_RIGHT_TOP, 54, 6);
   lv_obj_set_style_bg_opa(ui.tempMeta, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(ui.tempMeta, 0, 0);
@@ -499,39 +521,16 @@ lv_obj_t *buildCurrentWeatherScreen(WeatherUi &ui)
   lv_obj_set_style_pad_all(ui.tempMeta, 0, 0);
   lv_obj_clear_flag(ui.tempMeta, LV_OBJ_FLAG_SCROLLABLE);
 
-  ui.highOpenLabel = lv_label_create(ui.tempMeta);
-  lv_obj_set_style_text_font(ui.highOpenLabel, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(ui.highOpenLabel, lvColor(208, 214, 226), 0);
-  lv_label_set_text(ui.highOpenLabel, "(");
-  lv_obj_align(ui.highOpenLabel, LV_ALIGN_TOP_LEFT, 0, 0);
-
-  ui.highLabel = lv_label_create(ui.tempMeta);
-  lv_obj_set_style_text_font(ui.highLabel, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(ui.highLabel, lvColor(255, 104, 104), 0);
-  lv_label_set_text(ui.highLabel, "--");
-  lv_obj_align_to(ui.highLabel, ui.highOpenLabel, LV_ALIGN_OUT_RIGHT_MID, 2, 0);
-
-  ui.rangeDividerLabel = lv_label_create(ui.tempMeta);
-  lv_obj_set_style_text_font(ui.rangeDividerLabel, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(ui.rangeDividerLabel, lvColor(208, 214, 226), 0);
-  lv_label_set_text(ui.rangeDividerLabel, " / ");
-  lv_obj_align_to(ui.rangeDividerLabel, ui.highLabel, LV_ALIGN_OUT_RIGHT_MID, 2, 0);
-
-  ui.lowLabel = lv_label_create(ui.tempMeta);
-  lv_obj_set_style_text_font(ui.lowLabel, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(ui.lowLabel, lvColor(108, 180, 255), 0);
-  lv_label_set_text(ui.lowLabel, "--");
-  lv_obj_align_to(ui.lowLabel, ui.rangeDividerLabel, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
-
-  ui.highCloseLabel = lv_label_create(ui.tempMeta);
-  lv_obj_set_style_text_font(ui.highCloseLabel, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(ui.highCloseLabel, lvColor(208, 214, 226), 0);
-  lv_label_set_text(ui.highCloseLabel, ")");
-  lv_obj_align_to(ui.highCloseLabel, ui.lowLabel, LV_ALIGN_OUT_RIGHT_MID, 2, 0);
+  ui.rangeLine = lv_label_create(ui.tempMeta);
+  lv_obj_set_style_text_font(ui.rangeLine, &lv_font_montserrat_16, 0);
+  lv_label_set_recolor(ui.rangeLine, true);
+  lv_obj_set_style_text_color(ui.rangeLine, lvColor(255, 255, 255), 0);
+  lv_label_set_text(ui.rangeLine, "#ff6868 --# / #6cb4ff --# / feels --");
+  lv_obj_align(ui.rangeLine, LV_ALIGN_TOP_LEFT, 0, 0);
 
   ui.sunEventIcon = lv_obj_create(ui.tempMeta);
   lv_obj_set_size(ui.sunEventIcon, 28, 20);
-  lv_obj_align(ui.sunEventIcon, LV_ALIGN_TOP_LEFT, 0, 34);
+  lv_obj_align(ui.sunEventIcon, LV_ALIGN_TOP_LEFT, 0, 22);
   lv_obj_set_style_bg_opa(ui.sunEventIcon, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(ui.sunEventIcon, 0, 0);
   lv_obj_set_style_outline_width(ui.sunEventIcon, 0, 0);
@@ -565,13 +564,6 @@ lv_obj_t *buildCurrentWeatherScreen(WeatherUi &ui)
   lv_obj_set_style_text_color(ui.sunEventTimeLabel, lvColor(208, 214, 226), 0);
   lv_label_set_text(ui.sunEventTimeLabel, "--:--");
   lv_obj_align_to(ui.sunEventTimeLabel, ui.sunEventIcon, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
-
-  ui.feelsLabel = lv_label_create(ui.tempMeta);
-  lv_obj_set_style_text_font(ui.feelsLabel, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(ui.feelsLabel, lvColor(236, 240, 246), 0);
-  lv_obj_set_style_transform_skew_x(ui.feelsLabel, -10, 0);
-  lv_label_set_text(ui.feelsLabel, "(Feels --)");
-  lv_obj_align(ui.feelsLabel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
   ui.conditionLabel = lv_label_create(screen);
   lv_obj_set_width(ui.conditionLabel, LCD_WIDTH - 48);
@@ -714,9 +706,8 @@ void refreshCurrentWeatherScreen(WeatherUi &ui,
 
   if (state.hasData) {
     lv_label_set_text(ui.tempLabel, (String(state.temperatureF) + "\xC2\xB0").c_str());
-    lv_label_set_text(ui.highLabel, (String(state.highF) + "\xC2\xB0").c_str());
-    lv_label_set_text(ui.lowLabel, (String(state.lowF) + "\xC2\xB0").c_str());
-    lv_label_set_text(ui.feelsLabel, (String("(Feels ") + String(state.feelsLikeF) + "\xC2\xB0)").c_str());
+    lv_label_set_text(ui.rangeLine,
+      (String("#ff6868 ") + state.highF + "\xC2\xB0# / #6cb4ff " + state.lowF + "\xC2\xB0# / feels " + state.feelsLikeF + "\xC2\xB0").c_str());
     lv_label_set_text(ui.conditionLabel, debugOverrideEnabled ? sceneLabel : state.condition.c_str());
     lv_label_set_text(ui.primaryLabel,
                       (String(LV_SYMBOL_REFRESH) + " " + String(state.windMph) + " mph   " +
@@ -733,9 +724,7 @@ void refreshCurrentWeatherScreen(WeatherUi &ui,
       noDataStatus = "Connected - no cached weather";
     }
     lv_label_set_text(ui.tempLabel, "--");
-    lv_label_set_text(ui.highLabel, "--");
-    lv_label_set_text(ui.lowLabel, "--");
-    lv_label_set_text(ui.feelsLabel, "(Feels --)");
+    lv_label_set_text(ui.rangeLine, "#ff6868 --# / #6cb4ff --# / feels --");
     lv_label_set_text(ui.conditionLabel, sceneLabel);
     lv_label_set_text(ui.primaryLabel,
                       networkOnline ? (String(LV_SYMBOL_REFRESH) + " -- mph   " + LV_SYMBOL_TINT + " --%").c_str()
@@ -904,9 +893,6 @@ void updateWeatherHero(WeatherUi &ui,
     lv_obj_add_flag(ray, LV_OBJ_FLAG_HIDDEN);
   }
   lv_obj_add_flag(ui.moon, LV_OBJ_FLAG_HIDDEN);
-  if (ui.moonShadow) {
-    lv_obj_add_flag(ui.moonShadow, LV_OBJ_FLAG_HIDDEN);
-  }
   lv_obj_add_flag(ui.bolt, LV_OBJ_FLAG_HIDDEN);
   for (auto *cloud : ui.clouds) {
     lv_obj_add_flag(cloud, LV_OBJ_FLAG_HIDDEN);
@@ -1488,6 +1474,19 @@ void waveformEnterWeatherScreen()
 
 void waveformLeaveWeatherScreen()
 {
+}
+
+void waveformDestroyWeatherScreen()
+{
+  if (gUi.moonBuf) {
+    lv_draw_buf_destroy(gUi.moonBuf);
+    gUi.moonBuf = nullptr;
+  }
+  if (gRoot) {
+    lv_obj_delete(gRoot);
+    gRoot = nullptr;
+  }
+  gUi = WeatherUi{};
 }
 
 void waveformTickWeatherScreen(uint32_t nowMs)
