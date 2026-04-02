@@ -1,7 +1,7 @@
 #pragma once
 
-#define WIFI_SSID_PRIMARY "The Y-Files"
-#define WIFI_PASSWORD_PRIMARY "quartz21wrench10crown"
+#define WIFI_SSID_PRIMARY "ESPn"
+#define WIFI_PASSWORD_PRIMARY "it's like I have"
 
 #define WIFI_SSID_FALLBACK "Monoceros"
 #define WIFI_PASSWORD_FALLBACK "12345678"

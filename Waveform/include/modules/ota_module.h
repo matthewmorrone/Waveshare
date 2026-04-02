@@ -4,6 +4,7 @@
 
 void otaModuleBuildOverlay();
 void otaModuleStart();
+void otaModuleReset();
 void otaModuleHandle();
 void otaModuleUpdateOverlay(const String &status, const String &footer, int percent);
 void otaModuleHideOverlay();

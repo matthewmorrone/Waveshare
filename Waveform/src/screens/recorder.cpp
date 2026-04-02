@@ -71,7 +71,7 @@ static uint8_t audioBuffer[kRecorderAudioChunkBytes] = {};
 
 static String clipPath()
 {
-  return String(kSdMountPath) + kRecorderClipPath;
+  return String(kRecorderClipPath);
 }
 
 static String fmtDuration(uint32_t bytes)

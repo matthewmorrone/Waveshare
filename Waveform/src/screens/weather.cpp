@@ -14,9 +14,11 @@
 
 void showNextScreen();
 void showPreviousScreen();
+bool showScreenById(ScreenId id);
 void noteActivity();
 bool hasValidTime();
 void waveformDestroyWeatherScreen();
+extern size_t currentScreenIndex;
 
 namespace
 {
@@ -30,6 +32,28 @@ const ScreenModule kModule = {
     waveformTickWeatherScreen,
     waveformWeatherScreenRoot,
     waveformDestroyWeatherScreen,
+};
+
+const ScreenModule kHourlyModule = {
+    ScreenId::WeatherHourly,
+    "Forecast 24h",
+    waveformBuildWeatherHourlyScreen,
+    waveformRefreshWeatherHourlyScreen,
+    waveformEnterWeatherHourlyScreen,
+    waveformLeaveWeatherHourlyScreen,
+    waveformTickWeatherHourlyScreen,
+    waveformWeatherHourlyScreenRoot,
+};
+
+const ScreenModule kDailyModule = {
+    ScreenId::WeatherDaily,
+    "Forecast 10d",
+    waveformBuildWeatherDailyScreen,
+    waveformRefreshWeatherDailyScreen,
+    waveformEnterWeatherDailyScreen,
+    waveformLeaveWeatherDailyScreen,
+    waveformTickWeatherDailyScreen,
+    waveformWeatherDailyScreenRoot,
 };
 
 constexpr uint16_t kBackgroundColor = 0x0000;
@@ -46,6 +70,43 @@ bool gFetchInProgress = false;
 bool gDebugOverrideEnabled = false;
 WeatherSceneType gDebugScene = WeatherSceneType::Clear;
 uint32_t gNextRefreshAtMs = 0;
+bool gRefreshScheduled = false;
+bool gStartupFetchPending = true;
+
+bool isWeatherFamilyScreen(ScreenId id)
+{
+  return id == ScreenId::Weather ||
+         id == ScreenId::WeatherHourly ||
+         id == ScreenId::WeatherDaily;
+}
+
+ScreenId nextWeatherFamilyScreen(ScreenId current, int direction)
+{
+  static const ScreenId kWeatherStack[] = {
+      ScreenId::Weather,
+      ScreenId::WeatherHourly,
+      ScreenId::WeatherDaily,
+  };
+
+  size_t currentIndex = 0;
+  for (size_t i = 0; i < (sizeof(kWeatherStack) / sizeof(kWeatherStack[0])); ++i) {
+    if (kWeatherStack[i] == current) {
+      currentIndex = i;
+      break;
+    }
+  }
+
+  const size_t count = sizeof(kWeatherStack) / sizeof(kWeatherStack[0]);
+  for (size_t offset = 1; offset <= count; ++offset) {
+    size_t candidate =
+        direction > 0 ? (currentIndex + offset) % count : (currentIndex + count - offset) % count;
+    if (screenManagerIsEnabled(kWeatherStack[candidate])) {
+      return kWeatherStack[candidate];
+    }
+  }
+
+  return current;
+}
 
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -55,6 +116,11 @@ lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b)
 bool networkOnline()
 {
   return gConfig.networkIsOnline && gConfig.networkIsOnline();
+}
+
+bool weatherFamilyOpen()
+{
+  return isWeatherFamilyScreen(static_cast<ScreenId>(currentScreenIndex));
 }
 
 bool otaBusy()
@@ -610,7 +676,13 @@ lv_obj_t *buildHourlyForecastScreen(WeatherUi &ui)
   applyRootStyle(screen);
   ui.hourlyScreen = screen;
 
-  const int startY = 22;
+  lv_obj_t *title = lv_label_create(screen);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(title, lvColor(236, 240, 248), 0);
+  lv_label_set_text(title, "24 Hour Forecast");
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 18, 18);
+
+  const int startY = 54;
   const int rowHeight = 30;
   const int leftX = 18;
   const int colWidth = 176;
@@ -654,7 +726,13 @@ lv_obj_t *buildDailyForecastScreen(WeatherUi &ui)
   applyRootStyle(screen);
   ui.dailyScreen = screen;
 
-  const int startY = 34;
+  lv_obj_t *title = lv_label_create(screen);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(title, lvColor(236, 240, 248), 0);
+  lv_label_set_text(title, "10 Day Forecast");
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 22, 18);
+
+  const int startY = 60;
   const int rowHeight = 38;
 
   for (size_t i = 0; i < kDailyForecastCount; ++i) {
@@ -1040,28 +1118,19 @@ void updateWeatherHero(WeatherUi &ui,
 
 void handleWeatherStackSwipe(int deltaY)
 {
+  ScreenId current = static_cast<ScreenId>(currentScreenIndex);
+  if (!isWeatherFamilyScreen(current)) {
+    return;
+  }
+
   if (deltaY <= -kWeatherNavSwipeMinDistancePx) {
-    showNextScreen();
+    showScreenById(nextWeatherFamilyScreen(current, 1));
     noteActivity();
     return;
   }
 
   if (deltaY >= kWeatherNavSwipeMinDistancePx) {
-    showPreviousScreen();
-    noteActivity();
-  }
-}
-
-void handleWeatherSwipe(int deltaX)
-{
-  if (deltaX <= -kWeatherSwipeMinDistancePx) {
-    weatherModuleCycleDebugScene(1);
-    noteActivity();
-    return;
-  }
-
-  if (deltaX >= kWeatherSwipeMinDistancePx) {
-    weatherModuleCycleDebugScene(-1);
+    showScreenById(nextWeatherFamilyScreen(current, -1));
     noteActivity();
   }
 }
@@ -1146,6 +1215,8 @@ void saveWeatherCache()
 static void refreshUi()
 {
   refreshCurrentWeatherScreen(gUi, gState, networkOnline(), gDebugOverrideEnabled, gDebugScene);
+  refreshHourlyForecastScreen(gUi, gState);
+  refreshDailyForecastScreen(gUi, gState);
   updateWeatherHero(gUi, gState, gDebugOverrideEnabled, gDebugScene, millis());
 }
 
@@ -1264,7 +1335,8 @@ bool fetchWeather()
         }
 
         saveWeatherCache();
-        gNextRefreshAtMs = millis() + gConfig.refreshIntervalMs;
+        gRefreshScheduled = false;
+        gStartupFetchPending = false;
         success = true;
       } else {
         Serial.printf("Weather JSON parse failed: %s\n", error.c_str());
@@ -1282,13 +1354,19 @@ bool fetchWeather()
   }
 
   if (!success) {
+    gStartupFetchPending = false;
     if (gState.hasData) {
       gState.stale = true;
       gState.updated = kDefaultOfflineWeatherLabel;
     } else {
       setUnavailableState(networkOnline() ? "Retrying shortly" : "Waiting for Wi-Fi");
     }
-    gNextRefreshAtMs = millis() + gConfig.retryIntervalMs;
+    if (weatherFamilyOpen()) {
+      gNextRefreshAtMs = millis() + gConfig.retryIntervalMs;
+      gRefreshScheduled = true;
+    } else {
+      gRefreshScheduled = false;
+    }
   }
 
   gFetchInProgress = false;
@@ -1396,6 +1474,7 @@ void weatherModuleMarkOffline()
 void weatherModuleScheduleRefreshIn(uint32_t delayMs)
 {
   gNextRefreshAtMs = millis() + delayMs;
+  gRefreshScheduled = true;
 }
 
 void weatherModuleUpdate()
@@ -1409,6 +1488,14 @@ void weatherModuleUpdate()
   }
 
   if (!gConfig.fetchEnabled || gFetchInProgress || otaBusy() || lightSleepActive()) {
+    return;
+  }
+
+  if (!gRefreshScheduled) {
+    return;
+  }
+
+  if (!gStartupFetchPending && !weatherFamilyOpen()) {
     return;
   }
 
@@ -1445,6 +1532,16 @@ lv_obj_t *waveformWeatherScreenRoot()
   return gRoot;
 }
 
+lv_obj_t *waveformWeatherHourlyScreenRoot()
+{
+  return gUi.hourlyScreen;
+}
+
+lv_obj_t *waveformWeatherDailyScreenRoot()
+{
+  return gUi.dailyScreen;
+}
+
 bool waveformBuildWeatherScreen()
 {
   if (!gRoot) {
@@ -1452,6 +1549,24 @@ bool waveformBuildWeatherScreen()
   }
 
   return gRoot && gUi.currentScreen && gUi.cityLabel && gUi.tempLabel && gUi.conditionLabel;
+}
+
+bool waveformBuildWeatherHourlyScreen()
+{
+  if (!gUi.hourlyScreen) {
+    buildHourlyForecastScreen(gUi);
+  }
+
+  return gUi.hourlyScreen != nullptr;
+}
+
+bool waveformBuildWeatherDailyScreen()
+{
+  if (!gUi.dailyScreen) {
+    buildDailyForecastScreen(gUi);
+  }
+
+  return gUi.dailyScreen != nullptr;
 }
 
 bool waveformRefreshWeatherScreen()
@@ -1464,15 +1579,57 @@ bool waveformRefreshWeatherScreen()
   return true;
 }
 
+bool waveformRefreshWeatherHourlyScreen()
+{
+  if (!gUi.hourlyScreen) {
+    return false;
+  }
+
+  refreshHourlyForecastScreen(gUi, gState);
+  return true;
+}
+
+bool waveformRefreshWeatherDailyScreen()
+{
+  if (!gUi.dailyScreen) {
+    return false;
+  }
+
+  refreshDailyForecastScreen(gUi, gState);
+  return true;
+}
+
 void waveformEnterWeatherScreen()
 {
   gDebugOverrideEnabled = false;
   if (gConfig.fetchEnabled && networkOnline() && !gFetchInProgress && !otaBusy() && !lightSleepActive()) {
-    fetchWeather();
+    weatherModuleScheduleRefreshIn(250);
+  }
+}
+
+void waveformEnterWeatherHourlyScreen()
+{
+  if (gConfig.fetchEnabled && networkOnline() && !gFetchInProgress && !otaBusy() && !lightSleepActive()) {
+    weatherModuleScheduleRefreshIn(250);
+  }
+}
+
+void waveformEnterWeatherDailyScreen()
+{
+  if (gConfig.fetchEnabled && networkOnline() && !gFetchInProgress && !otaBusy() && !lightSleepActive()) {
+    weatherModuleScheduleRefreshIn(250);
   }
 }
 
 void waveformLeaveWeatherScreen()
+{
+}
+
+void waveformLeaveWeatherHourlyScreen()
+{
+}
+
+void waveformLeaveWeatherDailyScreen()
 {
 }
 
@@ -1497,9 +1654,29 @@ void waveformTickWeatherScreen(uint32_t nowMs)
   }
 }
 
+void waveformTickWeatherHourlyScreen(uint32_t nowMs)
+{
+  (void)nowMs;
+}
+
+void waveformTickWeatherDailyScreen(uint32_t nowMs)
+{
+  (void)nowMs;
+}
+
 const ScreenModule &weatherScreenModule()
 {
   return kModule;
+}
+
+const ScreenModule &weatherHourlyScreenModule()
+{
+  return kHourlyModule;
+}
+
+const ScreenModule &weatherDailyScreenModule()
+{
+  return kDailyModule;
 }
 
 

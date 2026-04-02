@@ -13,14 +13,20 @@ static const ScreenModule *const kModulesArr[] = {
 #ifdef SCREEN_WATCH
     &watchScreenModule(),
 #endif
-#ifdef SCREEN_MOON
-    &moonScreenModule(),
+#ifdef SCREEN_CALENDAR
+    &calendarScreenModule(),
 #endif
 #ifdef SCREEN_MOTION
     &motionScreenModule(),
 #endif
 #ifdef SCREEN_WEATHER
     &weatherScreenModule(),
+#endif
+#ifdef SCREEN_WEATHER_HOURLY
+    &weatherHourlyScreenModule(),
+#endif
+#ifdef SCREEN_WEATHER_DAILY
+    &weatherDailyScreenModule(),
 #endif
 #ifdef SCREEN_GEO
     &geoScreenModule(),
@@ -54,6 +60,12 @@ static const ScreenModule *const kModulesArr[] = {
 #endif
 #ifdef SCREEN_SPECTRUM
     &spectrumScreenModule(),
+#endif
+#ifdef SCREEN_RADIO
+    &radioScreenModule(),
+#endif
+#ifdef SCREEN_ORB
+    &orbScreenModule(),
 #endif
 };
 

@@ -28,6 +28,7 @@ void waveformEnterLauncherScreen();
 void waveformLeaveLauncherScreen();
 void waveformTickLauncherScreen(uint32_t nowMs);
 void waveformLauncherScrollBy(int dy);
+void waveformLauncherScrollFling();
 #endif
 
 lv_obj_t *waveformWatchScreenRoot();
@@ -40,6 +41,15 @@ void watchShowCalendar();
 void watchDismissCalendar();
 void watchDismissCalendarSilent();
 bool watchCalendarIsVisible();
+
+#ifdef SCREEN_CALENDAR
+lv_obj_t *waveformCalendarScreenRoot();
+bool waveformBuildCalendarScreen();
+bool waveformRefreshCalendarScreen();
+void waveformEnterCalendarScreen();
+void waveformLeaveCalendarScreen();
+void waveformTickCalendarScreen(uint32_t nowMs);
+#endif
 
 lv_obj_t *waveformMotionScreenRoot();
 bool waveformBuildMotionScreen();
@@ -54,6 +64,24 @@ bool waveformRefreshWeatherScreen();
 void waveformEnterWeatherScreen();
 void waveformLeaveWeatherScreen();
 void waveformTickWeatherScreen(uint32_t nowMs);
+
+#ifdef SCREEN_WEATHER_HOURLY
+lv_obj_t *waveformWeatherHourlyScreenRoot();
+bool waveformBuildWeatherHourlyScreen();
+bool waveformRefreshWeatherHourlyScreen();
+void waveformEnterWeatherHourlyScreen();
+void waveformLeaveWeatherHourlyScreen();
+void waveformTickWeatherHourlyScreen(uint32_t nowMs);
+#endif
+
+#ifdef SCREEN_WEATHER_DAILY
+lv_obj_t *waveformWeatherDailyScreenRoot();
+bool waveformBuildWeatherDailyScreen();
+bool waveformRefreshWeatherDailyScreen();
+void waveformEnterWeatherDailyScreen();
+void waveformLeaveWeatherDailyScreen();
+void waveformTickWeatherDailyScreen(uint32_t nowMs);
+#endif
 
 lv_obj_t *waveformGeoScreenRoot();
 bool waveformBuildGeoScreen();
@@ -99,15 +127,6 @@ bool waveformRefreshCalculatorScreen();
 void waveformEnterCalculatorScreen();
 void waveformLeaveCalculatorScreen();
 void waveformTickCalculatorScreen(uint32_t nowMs);
-
-#ifdef SCREEN_MOON
-lv_obj_t *waveformMoonScreenRoot();
-bool waveformBuildMoonScreen();
-bool waveformRefreshMoonScreen();
-void waveformEnterMoonScreen();
-void waveformLeaveMoonScreen();
-void waveformTickMoonScreen(uint32_t nowMs);
-#endif
 
 #ifdef SCREEN_STOPWATCH
 lv_obj_t *waveformStopwatchScreenRoot();
@@ -157,6 +176,25 @@ void waveformEnterSpectrumScreen();
 void waveformLeaveSpectrumScreen();
 void waveformTickSpectrumScreen(uint32_t nowMs);
 void waveformDestroySpectrumScreen();
+#endif
+
+#ifdef SCREEN_RADIO
+lv_obj_t *waveformRadioScreenRoot();
+bool waveformBuildRadioScreen();
+bool waveformRefreshRadioScreen();
+void waveformEnterRadioScreen();
+void waveformLeaveRadioScreen();
+void waveformTickRadioScreen(uint32_t nowMs);
+void waveformDestroyRadioScreen();
+#endif
+
+#ifdef SCREEN_ORB
+lv_obj_t *waveformOrbScreenRoot();
+bool waveformBuildOrbScreen();
+bool waveformRefreshOrbScreen();
+void waveformEnterOrbScreen();
+void waveformLeaveOrbScreen();
+void waveformTickOrbScreen(uint32_t nowMs);
 #endif
 
 // --- Timezone picker (standalone overlay screen) ---

@@ -6,6 +6,7 @@ SettingsState gSettings;
 
 constexpr const char *kKeyBrightness = "brightness";
 constexpr const char *kKeyWifi = "wifi_on";
+constexpr const char *kKeyBle = "ble_on";
 constexpr const char *kKey24h = "use24h";
 constexpr const char *kKeyCelsius = "celsius";
 constexpr const char *kKeyAutoCycle = "autocycle";
@@ -24,6 +25,7 @@ void settingsLoad(Preferences &prefs)
 {
   gSettings.brightness = prefs.getUChar(kKeyBrightness, 255);
   gSettings.wifiEnabled = prefs.getBool(kKeyWifi, true);
+  gSettings.bleEnabled = prefs.getBool(kKeyBle, true);
   gSettings.use24hClock = prefs.getBool(kKey24h, true);
   gSettings.useCelsius = prefs.getBool(kKeyCelsius, false);
   gSettings.autoCycleEnabled = prefs.getBool(kKeyAutoCycle, false);
@@ -37,6 +39,7 @@ void settingsSave(Preferences &prefs)
 {
   prefs.putUChar(kKeyBrightness, gSettings.brightness);
   prefs.putBool(kKeyWifi, gSettings.wifiEnabled);
+  prefs.putBool(kKeyBle, gSettings.bleEnabled);
   prefs.putBool(kKey24h, gSettings.use24hClock);
   prefs.putBool(kKeyCelsius, gSettings.useCelsius);
   prefs.putBool(kKeyAutoCycle, gSettings.autoCycleEnabled);

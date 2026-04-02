@@ -280,8 +280,9 @@ static lv_obj_t *makeTouchZone(lv_obj_t *parent, lv_align_t align,
 {
   lv_obj_t *zone = lv_obj_create(parent);
   lv_obj_remove_style_all(zone);
-  lv_obj_set_size(zone, LCD_WIDTH / 2, LCD_HEIGHT);
-  lv_obj_align(zone, align, 0, 0);
+  constexpr lv_coord_t kInteractiveTop = 88;
+  lv_obj_set_size(zone, LCD_WIDTH / 2, LCD_HEIGHT - kInteractiveTop);
+  lv_obj_align(zone, align, 0, kInteractiveTop / 2);
   lv_obj_set_style_bg_opa(zone, LV_OPA_TRANSP, 0);
   lv_obj_clear_flag(zone, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(zone, LV_OBJ_FLAG_CLICKABLE);

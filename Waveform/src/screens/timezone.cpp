@@ -1,6 +1,11 @@
+#include "state/settings_state.h"
+#include <Preferences.h>
 #include "config/pin_config.h"
 #include "screens/screen_callbacks.h"
 #include <lvgl.h>
+
+extern Preferences preferences;
+void applyConfiguredTimezone();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -276,6 +281,9 @@ static void buildTimezonePicker()
   lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_add_event_cb(btn, [](lv_event_t *) {
+    settingsState().utcOffsetHours = kTimezones[gSelectedIdx].utcOffset;
+    settingsSave(preferences);
+    applyConfiguredTimezone();
     hideTimezonePicker();
   }, LV_EVENT_CLICKED, nullptr);
 

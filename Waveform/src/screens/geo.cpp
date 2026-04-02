@@ -325,7 +325,7 @@ void waveformEnterGeoScreen()
 {
   if ((!geoState.hasData || geoState.stale || static_cast<int32_t>(millis() - nextGeoRefreshAtMs) >= 0) &&
       networkIsOnline() && !geoFetchInProgress && !otaUpdateInProgress() && !lightSleepActive()) {
-    fetchGeoData();
+    nextGeoRefreshAtMs = 0;
   }
 }
 

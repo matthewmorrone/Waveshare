@@ -512,7 +512,7 @@ void waveformEnterSolarScreen()
 {
   if (!solarSystemState.hasData || solarSystemState.stale ||
       static_cast<int32_t>(millis() - nextSolarRefreshAtMs) >= 0) {
-    startSolarSystemFetch();
+    nextSolarRefreshAtMs = 0;
   }
 }
 

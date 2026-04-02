@@ -2,7 +2,9 @@
 
 #ifdef SCREEN_SETTINGS
 
+#include "config/ota_config.h"
 #include "config/pin_config.h"
+#include "modules/ble_manager.h"
 #include "modules/ota_module.h"
 #include "modules/wifi_manager.h"
 #include "screens/screen_callbacks.h"
@@ -17,7 +19,11 @@ extern lv_obj_t *screenRoots[];
 extern Preferences preferences;
 extern bool autoCycleEnabled;
 extern uint32_t lastAutoCycleAtMs;
+extern uint32_t nextWifiRetryAtMs;
+extern ConnectivityState connectivityState;
+void applyConfiguredTimezone();
 void noteActivity();
+void setOfflineMode(const char *reason);
 void setDisplayBrightness(uint8_t brightness);
 
 namespace
@@ -40,6 +46,7 @@ struct SettingsUi
   lv_obj_t *brightnessSlider = nullptr;
   lv_obj_t *brightnessValueLabel = nullptr;
   lv_obj_t *wifiToggle = nullptr;
+  lv_obj_t *bleToggle = nullptr;
   lv_obj_t *clockToggle = nullptr;
   lv_obj_t *unitToggle = nullptr;
   lv_obj_t *unitRowLabel = nullptr;
@@ -48,6 +55,7 @@ struct SettingsUi
   lv_obj_t *sleepValueLabel = nullptr;
   lv_obj_t *faceDownToggle = nullptr;
   lv_obj_t *faceDownRowLabel = nullptr;
+  lv_obj_t *timezoneValueLabel = nullptr;
   lv_obj_t *otaStatusLabel = nullptr;
 };
 
@@ -199,8 +207,26 @@ void onWifiToggle(lv_event_t *e)
   lv_obj_t *sw = static_cast<lv_obj_t *>(lv_event_get_target(e));
   settingsState().wifiEnabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
   if (!settingsState().wifiEnabled) {
-    WiFi.disconnect(true);
+    setOfflineMode("Wi-Fi disabled in settings");
     WiFi.mode(WIFI_OFF);
+    wifiManagerClearScanResults();
+  } else {
+    nextWifiRetryAtMs = millis();
+    wifiManagerRequestScan();
+  }
+  saveAll();
+  noteActivity();
+}
+
+void onBleToggle(lv_event_t *e)
+{
+  lv_obj_t *sw = static_cast<lv_obj_t *>(lv_event_get_target(e));
+  settingsState().bleEnabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  bleManagerSetEnabled(settingsState().bleEnabled);
+  if (settingsState().bleEnabled) {
+    bleManagerRequestScan();
+  } else {
+    bleManagerClearResults();
   }
   saveAll();
   noteActivity();
@@ -294,10 +320,15 @@ void onTimezoneTap(lv_event_t *e)
 void onOtaTap(lv_event_t *e)
 {
   (void)e;
-  if (otaModuleIsReady()) {
+  if (networkIsOnline()) {
     otaModuleStart();
     if (gUi.otaStatusLabel) {
-      lv_label_set_text(gUi.otaStatusLabel, "Starting...");
+      if (otaModuleIsReady()) {
+        String status = String(OTA_HOSTNAME) + ".local";
+        lv_label_set_text(gUi.otaStatusLabel, status.c_str());
+      } else {
+        lv_label_set_text(gUi.otaStatusLabel, "OTA unavailable");
+      }
     }
   } else {
     if (gUi.otaStatusLabel) {
@@ -464,6 +495,12 @@ void buildSettingsScreen()
     gUi.wifiToggle = buildToggle(row, settingsState().wifiEnabled, onWifiToggle);
   }
 
+  // BLE
+  {
+    lv_obj_t *row = buildRow(cont, "Bluetooth LE", nullptr);
+    gUi.bleToggle = buildToggle(row, settingsState().bleEnabled, onBleToggle);
+  }
+
   // Clock format
   {
     lv_obj_t *row = buildRow(cont, "24-hour clock", nullptr);
@@ -509,7 +546,7 @@ void buildSettingsScreen()
     char tzBuf[16];
     int off = settingsState().utcOffsetHours;
     snprintf(tzBuf, sizeof(tzBuf), "UTC%+d", off);
-    buildCycleLabel(row, tzBuf, onTimezoneTap);
+    gUi.timezoneValueLabel = buildCycleLabel(row, tzBuf, onTimezoneTap);
   }
 
   // OTA update
@@ -564,6 +601,21 @@ void waveformEnterSettingsScreen()
         lv_obj_add_state(gUi.autoCycleToggle, LV_STATE_CHECKED);
       } else {
         lv_obj_clear_state(gUi.autoCycleToggle, LV_STATE_CHECKED);
+      }
+    }
+    if (gUi.timezoneValueLabel) {
+      char tzBuf[16];
+      snprintf(tzBuf, sizeof(tzBuf), "UTC%+d", s.utcOffsetHours);
+      lv_label_set_text(gUi.timezoneValueLabel, tzBuf);
+    }
+    if (gUi.otaStatusLabel) {
+      if (otaModuleIsReady()) {
+        String status = String(OTA_HOSTNAME) + ".local";
+        lv_label_set_text(gUi.otaStatusLabel, status.c_str());
+      } else if (networkIsOnline()) {
+        lv_label_set_text(gUi.otaStatusLabel, "Wi-Fi online");
+      } else {
+        lv_label_set_text(gUi.otaStatusLabel, "Wi-Fi needed");
       }
     }
   }

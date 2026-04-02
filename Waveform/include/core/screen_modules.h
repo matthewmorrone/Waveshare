@@ -8,11 +8,20 @@ const ScreenModule &launcherScreenModule();
 #ifdef SCREEN_WATCH
 const ScreenModule &watchScreenModule();
 #endif
+#ifdef SCREEN_CALENDAR
+const ScreenModule &calendarScreenModule();
+#endif
 #ifdef SCREEN_MOTION
 const ScreenModule &motionScreenModule();
 #endif
 #ifdef SCREEN_WEATHER
 const ScreenModule &weatherScreenModule();
+#endif
+#ifdef SCREEN_WEATHER_HOURLY
+const ScreenModule &weatherHourlyScreenModule();
+#endif
+#ifdef SCREEN_WEATHER_DAILY
+const ScreenModule &weatherDailyScreenModule();
 #endif
 #ifdef SCREEN_GEO
 const ScreenModule &geoScreenModule();
@@ -32,9 +41,6 @@ const ScreenModule &qrScreenModule();
 #ifdef SCREEN_CALCULATOR
 const ScreenModule &calculatorScreenModule();
 #endif
-#ifdef SCREEN_MOON
-const ScreenModule &moonScreenModule();
-#endif
 #ifdef SCREEN_STOPWATCH
 const ScreenModule &stopwatchScreenModule();
 #endif
@@ -49,4 +55,10 @@ const ScreenModule &settingsScreenModule();
 #endif
 #ifdef SCREEN_SPECTRUM
 const ScreenModule &spectrumScreenModule();
+#endif
+#ifdef SCREEN_RADIO
+const ScreenModule &radioScreenModule();
+#endif
+#ifdef SCREEN_ORB
+const ScreenModule &orbScreenModule();
 #endif

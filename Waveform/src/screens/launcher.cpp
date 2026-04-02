@@ -4,11 +4,13 @@
 
 #include "config/pin_config.h"
 #include "modules/battery.h"
+#include "modules/ble_manager.h"
 #include "modules/storage.h"
 #include "modules/wifi_manager.h"
 #include "screens/screen_callbacks.h"
 
 #include <WiFi.h>
+#include <cmath>
 #include <inttypes.h>
 
 extern lv_obj_t *screenRoots[];
@@ -49,6 +51,8 @@ const ScreenModule kModule = {
 LauncherUi gUi;
 bool gBuilt = false;
 int gScrollY = 0;
+float gVelocity = 0.0f;
+bool gFlinging = false;
 
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -85,9 +89,6 @@ constexpr LauncherApp kApps[] = {
 #ifdef SCREEN_WATCH
     {ScreenId::Watch, "Clock", "RTC and status", "TIME", 34, 131, 255},
 #endif
-#ifdef SCREEN_MOON
-    {ScreenId::Moon, "Moon", "Phase visual", "LUNA", 150, 124, 255},
-#endif
 #ifdef SCREEN_MOTION
     {ScreenId::Motion, "Motion", "IMU views", "IMU", 18, 195, 136},
 #endif
@@ -98,10 +99,10 @@ constexpr LauncherApp kApps[] = {
     {ScreenId::Calculator, "Calc", "Scientific", "MATH", 255, 92, 114},
 #endif
 #ifdef SCREEN_STOPWATCH
-    {ScreenId::Stopwatch, "Stopwatch", "Tap timing", "RUN", 255, 106, 56},
+    {ScreenId::Stopwatch, "Timers", "Stopwatch + timer", "RUN", 255, 106, 56},
 #endif
-#ifdef SCREEN_TIMER
-    {ScreenId::Timer, "Timer", "Countdown", "TMR", 255, 214, 10},
+#ifdef SCREEN_RADIO
+    {ScreenId::Radio, "Radio", "Wi-Fi + BLE", "RF", 92, 224, 224},
 #endif
 #ifdef SCREEN_SYSTEM
     {ScreenId::System, "System", "Power and SD", "SYS", 74, 222, 128},
@@ -144,8 +145,20 @@ void updateLauncherStatus()
     return;
   }
 
-  const char *networkText = networkIsOnline() ? WiFi.SSID().c_str() : connectivityLabel();
-  lv_label_set_text(gUi.statusLabel, networkText);
+  char status[128];
+  if (bleManagerScanInProgress()) {
+    snprintf(status,
+             sizeof(status),
+             "%s  |  BLE scanning",
+             networkIsOnline() ? WiFi.SSID().c_str() : connectivityLabel());
+  } else {
+    snprintf(status,
+             sizeof(status),
+             "%s  |  %u BLE seen",
+             networkIsOnline() ? WiFi.SSID().c_str() : connectivityLabel(),
+             static_cast<unsigned>(bleManagerDeviceCount()));
+  }
+  lv_label_set_text(gUi.statusLabel, status);
 }
 
 void buildLauncherScreen()
@@ -244,7 +257,7 @@ bool waveformBuildLauncherScreen()
 
 bool waveformRefreshLauncherScreen()
 {
-  if (!gBuilt || !gUi.statusLabel || !gUi.storageLabel) {
+  if (!gBuilt || !gUi.statusLabel) {
     return false;
   }
   updateLauncherStatus();
@@ -255,6 +268,8 @@ void waveformEnterLauncherScreen()
 {
   updateLauncherStatus();
   gScrollY = 0;
+  gVelocity = 0.0f;
+  gFlinging = false;
   if (gUi.screen) lv_obj_scroll_to_y(gUi.screen, 0, LV_ANIM_OFF);
 }
 
@@ -265,6 +280,19 @@ void waveformLeaveLauncherScreen()
 void waveformTickLauncherScreen(uint32_t nowMs)
 {
   (void)nowMs;
+  if (!gFlinging || !gBuilt || !gUi.screen) return;
+  if (fabsf(gVelocity) < 0.5f) {
+    gVelocity = 0.0f;
+    gFlinging = false;
+    return;
+  }
+  constexpr int kContentHeight = 556;
+  constexpr int kMaxScroll = kContentHeight - LCD_HEIGHT;
+  gScrollY += static_cast<int>(gVelocity);
+  if (gScrollY < 0) { gScrollY = 0; gVelocity = 0.0f; gFlinging = false; }
+  else if (gScrollY > kMaxScroll) { gScrollY = kMaxScroll; gVelocity = 0.0f; gFlinging = false; }
+  lv_obj_scroll_to_y(gUi.screen, gScrollY, LV_ANIM_OFF);
+  gVelocity *= 0.88f;
 }
 
 void waveformLauncherScrollBy(int dy)
@@ -273,10 +301,18 @@ void waveformLauncherScrollBy(int dy)
   // 5 rows of tiles: kStartY(110) + 5*74 + 4*14 + 20 bottom padding = 556
   constexpr int kContentHeight = 556;
   constexpr int kMaxScroll = kContentHeight - LCD_HEIGHT;
+  gFlinging = false;
+  gVelocity = gVelocity * 0.4f + static_cast<float>(dy) * 0.6f;
   gScrollY += dy;
   if (gScrollY < 0) gScrollY = 0;
   if (gScrollY > kMaxScroll) gScrollY = kMaxScroll;
   lv_obj_scroll_to_y(gUi.screen, gScrollY, LV_ANIM_OFF);
+}
+
+void waveformLauncherScrollFling()
+{
+  if (!gBuilt) return;
+  if (fabsf(gVelocity) > 1.0f) gFlinging = true;
 }
 
 #endif

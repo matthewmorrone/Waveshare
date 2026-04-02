@@ -4,6 +4,7 @@
 
 #include "config/pin_config.h"
 #include "modules/battery.h"
+#include "modules/ble_manager.h"
 #include "modules/storage.h"
 #include "modules/wifi_manager.h"
 #include "screens/screen_callbacks.h"
@@ -123,11 +124,16 @@ void updateSystemValues()
   if (networkIsOnline()) {
     snprintf(network,
              sizeof(network),
-             "%s\n%s",
+             "%s\n%s\nBLE %u seen",
              WiFi.SSID().c_str(),
-             WiFi.localIP().toString().c_str());
+             WiFi.localIP().toString().c_str(),
+             static_cast<unsigned>(bleManagerDeviceCount()));
   } else {
-    snprintf(network, sizeof(network), "%s\nWeather sync + OTA", connectivityLabel());
+    snprintf(network,
+             sizeof(network),
+             "%s\nWi-Fi sync + OTA\nBLE %u seen",
+             connectivityLabel(),
+             static_cast<unsigned>(bleManagerDeviceCount()));
   }
   setLabelText(gUi.networkValue, network);
 

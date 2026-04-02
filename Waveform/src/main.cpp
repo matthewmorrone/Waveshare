@@ -16,6 +16,7 @@
 #include <driver/gpio.h>
 #include <esp_heap_caps.h>
 #include <esp_sleep.h>
+#include <esp_sntp.h>
 #include <lvgl.h>
 #include <memory>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #include "core/screen_manager.h"
 #include "drivers/es8311.h"
 #include "modules/battery.h"
+#include "modules/ble_manager.h"
 #include "modules/imu_module.h"
 #include "modules/math_utils.h"
 #include "modules/ota_module.h"
@@ -55,6 +57,7 @@ constexpr uint32_t kWifiRetryIntervalMs = 30000;
 constexpr uint32_t kWifiServiceIntervalMs = 1000;
 constexpr uint32_t kWifiServiceConnectingIntervalMs = 250;
 constexpr uint32_t kRtcWriteIntervalSeconds = 60;
+constexpr uint32_t kTimeBackupWriteIntervalSeconds = 15 * 60;
 constexpr uint32_t kDimAfterMs = 30000;
 constexpr uint32_t kSleepAfterMs = 5UL * 60UL * 1000UL;
 constexpr uint32_t kTapMaxDurationMs = 350;
@@ -72,10 +75,13 @@ constexpr int kQrSwipeMinDominancePx = 2;
 constexpr int kScreenNavSwipeMinDistancePx = 20;
 constexpr int kScreenNavSwipeMinDominancePx = 4;
 constexpr int kTapMaxTravelPx = 12;
+constexpr int kTimerFamilySwipeHeaderPx = 88;
 constexpr const char *kPreferencesNamespace = "waveform";
 constexpr const char *kPrefScreenKey = "screen";
 constexpr const char *kPrefMotionViewKey = "motionview";
 constexpr const char *kPrefWeatherCacheKey = "weather";
+constexpr const char *kPrefTimeEpochKey = "time_epoch";
+constexpr bool kPersistCurrentScreen = false;
 
 struct WiFiCredential
 {
@@ -134,6 +140,7 @@ void saveMotionViewPreference();
 void saveScreenPreference(size_t screenIndex);
 void showNextScreen();
 void showPreviousScreen();
+bool performShowScreen(size_t index);
 void initRtc();
 std::unique_ptr<Arduino_IIC> touchController(
     new Arduino_FT3x68(touchBus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, handleTouchInterrupt));
@@ -142,11 +149,14 @@ lv_display_t *display = nullptr;
 lv_indev_t *touchInput = nullptr;
 static uint8_t *lvBuffer = nullptr;
 
-lv_obj_t *screenRoots[16] = {};  // sized to max possible screens
-bool screenRefreshPending[16] = {};
+lv_obj_t *screenRoots[24] = {};
+bool screenRefreshPending[24] = {};
+bool screenDestroyPending[24] = {};
 size_t currentScreenIndex = 0;
 bool screenPreferenceSavePending = false;
 size_t pendingScreenPreferenceIndex = 0;
+bool screenChangePending = false;
+size_t pendingScreenChangeIndex = 0;
 
 lv_obj_t *watchTimeLabel = nullptr;
 lv_obj_t *watchTimeRow = nullptr;
@@ -207,10 +217,14 @@ uint32_t nextWifiRetryAtMs = 0;
 uint32_t lastWifiServiceAtMs = 0;
 uint32_t lastActivityAtMs = 0;
 time_t lastRtcWriteEpoch = 0;
+time_t lastTimeBackupWriteEpoch = 0;
+time_t lastKnownValidTimeEpoch = 0;
+char configuredTimezonePosix[16] = {};
 uint32_t touchTapStartedAtMs = 0;
 uint32_t lastSkyRefreshAtMs = 0;
 uint32_t lastAutoCycleAtMs = 0;
 bool autoCycleEnabled = false;
+bool systemTimeHasEverBeenValid = false;
 
 int16_t touchTapStartX = LCD_WIDTH / 2;
 int16_t touchTapStartY = LCD_HEIGHT / 2;
@@ -223,6 +237,154 @@ lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b)
 lv_color_t blendColor(uint8_t r, uint8_t g, uint8_t b)
 {
   return lv_color_make(r, g, b);
+}
+
+const char *wifiStatusLabel(wl_status_t status)
+{
+  switch (status) {
+    case WL_NO_SHIELD:
+      return "NO_SHIELD";
+    case WL_IDLE_STATUS:
+      return "IDLE";
+    case WL_NO_SSID_AVAIL:
+      return "NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:
+      return "SCAN_COMPLETED";
+    case WL_CONNECTED:
+      return "CONNECTED";
+    case WL_CONNECT_FAILED:
+      return "CONNECT_FAILED";
+    case WL_CONNECTION_LOST:
+      return "CONNECTION_LOST";
+    case WL_DISCONNECTED:
+      return "DISCONNECTED";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+const char *wifiDisconnectReasonLabel(uint8_t reason)
+{
+  switch (reason) {
+    case WIFI_REASON_UNSPECIFIED:
+      return "UNSPECIFIED";
+    case WIFI_REASON_AUTH_EXPIRE:
+      return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:
+      return "AUTH_LEAVE";
+    case WIFI_REASON_ASSOC_LEAVE:
+      return "ASSOC_LEAVE";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+      return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_BEACON_TIMEOUT:
+      return "BEACON_TIMEOUT";
+    case WIFI_REASON_NO_AP_FOUND:
+      return "NO_AP_FOUND";
+    case WIFI_REASON_AUTH_FAIL:
+      return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:
+      return "ASSOC_FAIL";
+    case WIFI_REASON_CONNECTION_FAIL:
+      return "CONNECTION_FAIL";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+      return "NO_AP_FOUND_W_COMPATIBLE_SECURITY";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+      return "NO_AP_FOUND_IN_AUTHMODE_THRESHOLD";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+      return "NO_AP_FOUND_IN_RSSI_THRESHOLD";
+    default:
+      return "OTHER";
+  }
+}
+
+void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED: {
+      const auto &connected = info.wifi_sta_connected;
+      char ssid[33] = {};
+      size_t ssidLength = connected.ssid_len;
+      if (ssidLength > 32) {
+        ssidLength = 32;
+      }
+      memcpy(ssid, connected.ssid, ssidLength);
+      ssid[ssidLength] = '\0';
+      Serial.printf("Wi-Fi associated with \"%s\" on channel %u (authmode %u)\n",
+                    ssid,
+                    static_cast<unsigned>(connected.channel),
+                    static_cast<unsigned>(connected.authmode));
+      break;
+    }
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      connectivityState = ConnectivityState::Online;
+      wifiAttemptInProgress = false;
+      Serial.printf("Wi-Fi got IP: %s\n", WiFi.localIP().toString().c_str());
+      if (!ntpConfigured) {
+        configTzTime(configuredTimezonePosix, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+        ntpConfigured = true;
+        Serial.printf("Requested NTP sync: tz_posix=%s, utc_offset=%d, servers=%s,%s\n",
+                      configuredTimezonePosix,
+                      settingsState().utcOffsetHours,
+                      NTP_SERVER_PRIMARY,
+                      NTP_SERVER_SECONDARY);
+      }
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+      const auto &disconnected = info.wifi_sta_disconnected;
+      char ssid[33] = {};
+      size_t ssidLength = disconnected.ssid_len;
+      if (ssidLength > 32) {
+        ssidLength = 32;
+      }
+      memcpy(ssid, disconnected.ssid, ssidLength);
+      ssid[ssidLength] = '\0';
+      Serial.printf("Wi-Fi disconnected from \"%s\": reason=%u (%s), rssi=%d\n",
+                    ssid,
+                    static_cast<unsigned>(disconnected.reason),
+                    wifiDisconnectReasonLabel(disconnected.reason),
+                    static_cast<int>(disconnected.rssi));
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void logTimeSyncState(const char *source, time_t epoch)
+{
+  if (epoch < kMinValidEpoch) {
+    Serial.printf("%s time sync produced invalid epoch: %ld\n", source, static_cast<long>(epoch));
+    return;
+  }
+
+  struct tm utcTime = {};
+  struct tm localTime = {};
+  char utcBuffer[32] = {};
+  char localBuffer[32] = {};
+  gmtime_r(&epoch, &utcTime);
+  localtime_r(&epoch, &localTime);
+  strftime(utcBuffer, sizeof(utcBuffer), "%Y-%m-%d %H:%M:%S UTC", &utcTime);
+  strftime(localBuffer, sizeof(localBuffer), "%Y-%m-%d %H:%M:%S", &localTime);
+
+  Serial.printf("%s time sync: epoch=%ld, local=%s, utc=%s, tz_posix=%s, utc_offset=%d\n",
+                source,
+                static_cast<long>(epoch),
+                localBuffer,
+                utcBuffer,
+                configuredTimezonePosix,
+                settingsState().utcOffsetHours);
+}
+
+void handleSntpTimeSync(struct timeval *tv)
+{
+  if (!tv) {
+    Serial.println("SNTP time sync callback received null time");
+    return;
+  }
+
+  logTimeSyncState("SNTP", static_cast<time_t>(tv->tv_sec));
 }
 
 void setDisplayBrightness(uint8_t brightness)
@@ -240,6 +402,24 @@ void noteActivity()
   }
 }
 
+void showBootSplash(const char *headline, const char *detail)
+{
+  if (!gfx) {
+    return;
+  }
+
+  gfx->fillScreen(kBackgroundColor);
+  gfx->setTextSize(2);
+  gfx->setTextColor(0xFFFF);
+  gfx->setCursor(44, 170);
+  gfx->print(headline ? headline : "Waveform");
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(0xAD55);
+  gfx->setCursor(44, 206);
+  gfx->print(detail ? detail : "Starting...");
+}
+
 void saveMotionViewPreference()
 {
   preferences.putUChar(kPrefMotionViewKey, static_cast<uint8_t>(motionGetViewMode()));
@@ -247,6 +427,9 @@ void saveMotionViewPreference()
 
 void saveScreenPreference(size_t screenIndex)
 {
+  if (!kPersistCurrentScreen) {
+    return;
+  }
   preferences.putUChar(kPrefScreenKey, static_cast<uint8_t>(screenIndex));
 }
 
@@ -319,6 +502,12 @@ void handleMotionSwipe(int deltaY)
 bool isWeatherStackScreen(ScreenId screen)
 {
   return screen == ScreenId::Weather
+#ifdef SCREEN_WEATHER_HOURLY
+         || screen == ScreenId::WeatherHourly
+#endif
+#ifdef SCREEN_WEATHER_DAILY
+         || screen == ScreenId::WeatherDaily
+#endif
 #ifdef SCREEN_GEO
          || screen == ScreenId::Geo
 #endif
@@ -329,6 +518,58 @@ bool isWeatherStackScreen(ScreenId screen)
          || screen == ScreenId::Sky
 #endif
   ;
+}
+
+bool isTimerStackScreen(ScreenId screen)
+{
+#ifdef SCREEN_STOPWATCH
+  if (screen == ScreenId::Stopwatch) {
+    return true;
+  }
+#endif
+#ifdef SCREEN_TIMER
+  if (screen == ScreenId::Timer) {
+    return true;
+  }
+#endif
+  return false;
+}
+
+ScreenId nextTimerStackScreen(ScreenId current, int direction)
+{
+  (void)current;
+#if defined(SCREEN_STOPWATCH) && defined(SCREEN_TIMER)
+  return direction > 0 ? ScreenId::Timer : ScreenId::Stopwatch;
+#elif defined(SCREEN_STOPWATCH)
+  (void)direction;
+  return ScreenId::Stopwatch;
+#elif defined(SCREEN_TIMER)
+  (void)direction;
+  return ScreenId::Timer;
+#else
+  (void)current;
+  (void)direction;
+  return current;
+#endif
+}
+
+void handleTimerStackSwipe(int deltaY)
+{
+  ScreenId current = static_cast<ScreenId>(currentScreenIndex);
+  if (!isTimerStackScreen(current)) {
+    return;
+  }
+
+  if (deltaY <= -kWeatherNavSwipeMinDistancePx) {
+    showScreenById(nextTimerStackScreen(current, 1));
+    noteActivity();
+    return;
+  }
+
+  if (deltaY >= kWeatherNavSwipeMinDistancePx) {
+    showScreenById(nextTimerStackScreen(current, -1));
+    noteActivity();
+  }
 }
 
 #ifdef SCREEN_QR
@@ -414,6 +655,10 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
       touchTapStartedAtMs = millis();
       touchTapStartX = touchLastX;
       touchTapStartY = touchLastY;
+      Serial.printf("Touch start: screen=%s x=%d y=%d\n",
+                    screenModuleByIndex(currentScreenIndex).name,
+                    static_cast<int>(touchTapStartX),
+                    static_cast<int>(touchTapStartY));
 #ifdef SCREEN_LAUNCHER
     } else if (pressedNow &&
                static_cast<ScreenId>(currentScreenIndex) == ScreenId::Launcher &&
@@ -431,6 +676,11 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         waveformLauncherScrollBy(touchPrevY - touchLastY);
         touchGestureConsumed = true;
         touchTapTracking = false;
+      } else if (absDx >= kScreenNavSwipeMinDistancePx &&
+                 absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+        handleScreenNavigationSwipe(deltaX);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
       }
 #endif
     } else if (pressedNow && !touchGestureConsumed &&
@@ -442,6 +692,11 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
       if (absDy >= kMotionSwipeMinDistancePx &&
           absDy >= (absDx + kMotionSwipeMinDominancePx)) {
         handleMotionSwipe(deltaY);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      } else if (absDx >= kScreenNavSwipeMinDistancePx &&
+                 absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+        handleScreenNavigationSwipe(deltaX);
         touchGestureConsumed = true;
         touchTapTracking = false;
       }
@@ -457,8 +712,31 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         handleQrSwipe(deltaY);
         touchGestureConsumed = true;
         touchTapTracking = false;
+      } else if (absDx >= kScreenNavSwipeMinDistancePx &&
+                 absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+        handleScreenNavigationSwipe(deltaX);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
       }
 #endif
+    } else if (pressedNow && !touchGestureConsumed &&
+               isTimerStackScreen(static_cast<ScreenId>(currentScreenIndex)) &&
+               (static_cast<ScreenId>(currentScreenIndex) != ScreenId::Timer || touchTapStartY <= kTimerFamilySwipeHeaderPx)) {
+      int deltaX = touchLastX - touchTapStartX;
+      int deltaY = touchLastY - touchTapStartY;
+      int absDx = abs(deltaX);
+      int absDy = abs(deltaY);
+      if (absDy >= kWeatherNavSwipeMinDistancePx &&
+          absDy >= (absDx + kWeatherNavSwipeMinDominancePx)) {
+        handleTimerStackSwipe(deltaY);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      } else if (absDx >= kScreenNavSwipeMinDistancePx &&
+                 absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+        handleScreenNavigationSwipe(deltaX);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      }
     } else if (pressedNow && !touchGestureConsumed &&
                isWeatherStackScreen(static_cast<ScreenId>(currentScreenIndex))) {
       int deltaX = touchLastX - touchTapStartX;
@@ -470,10 +748,9 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         handleWeatherStackSwipe(deltaY);
         touchGestureConsumed = true;
         touchTapTracking = false;
-      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Weather &&
-                 absDx >= kWeatherSwipeMinDistancePx &&
-                 absDx >= (absDy + 10)) {
-        handleWeatherSwipe(deltaX);
+      } else if (absDx >= kScreenNavSwipeMinDistancePx &&
+                 absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+        handleScreenNavigationSwipe(deltaX);
         touchGestureConsumed = true;
         touchTapTracking = false;
       }
@@ -494,12 +771,34 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         touchGestureConsumed = true;
         touchTapTracking = false;
       }
+    } else if (pressedNow && !touchGestureConsumed) {
+      int deltaX = touchLastX - touchTapStartX;
+      int deltaY = touchLastY - touchTapStartY;
+      int absDx = abs(deltaX);
+      int absDy = abs(deltaY);
+      if (absDx >= kScreenNavSwipeMinDistancePx &&
+          absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+        handleScreenNavigationSwipe(deltaX);
+        touchGestureConsumed = true;
+        touchTapTracking = false;
+      }
     } else if (!pressedNow && wasPressed) {
       int deltaX = touchLastX - touchTapStartX;
       int deltaY = touchLastY - touchTapStartY;
       int absDx = abs(deltaX);
       int absDy = abs(deltaY);
+      Serial.printf("Touch end: screen=%s dx=%d dy=%d consumed=%d tap=%d\n",
+                    screenModuleByIndex(currentScreenIndex).name,
+                    deltaX,
+                    deltaY,
+                    touchGestureConsumed ? 1 : 0,
+                    touchTapTracking ? 1 : 0);
       if (touchGestureConsumed) {
+#ifdef SCREEN_LAUNCHER
+        if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Launcher) {
+          waveformLauncherScrollFling();
+        }
+#endif
         touchGestureConsumed = false;
       } else if (touchTapTracking) {
         uint32_t tapDurationMs = millis() - touchTapStartedAtMs;
@@ -520,16 +819,16 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
                  absDy >= kWeatherNavSwipeMinDistancePx &&
                  absDy >= (absDx + kWeatherNavSwipeMinDominancePx)) {
         handleWeatherStackSwipe(deltaY);
-      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Weather &&
-                 absDx >= kWeatherSwipeMinDistancePx &&
-                 absDx >= (absDy + 10)) {
-        handleWeatherSwipe(deltaX);
+      } else if (isTimerStackScreen(static_cast<ScreenId>(currentScreenIndex)) &&
+                 (static_cast<ScreenId>(currentScreenIndex) != ScreenId::Timer || touchTapStartY <= kTimerFamilySwipeHeaderPx) &&
+                 absDy >= kWeatherNavSwipeMinDistancePx &&
+                 absDy >= (absDx + kWeatherNavSwipeMinDominancePx)) {
+        handleTimerStackSwipe(deltaY);
       } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watch &&
                  absDy >= kScreenNavSwipeMinDistancePx && absDy >= (absDx + kMotionSwipeMinDominancePx)) {
         if (watchCalendarIsVisible()) { watchDismissCalendar(); } else { watchShowCalendar(); }
         noteActivity();
-      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Watch &&
-                 absDx >= kScreenNavSwipeMinDistancePx &&
+      } else if (absDx >= kScreenNavSwipeMinDistancePx &&
                  absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
         handleScreenNavigationSwipe(deltaX);
       }
@@ -670,6 +969,19 @@ bool setSystemTimeFromTm(const struct tm &timeInfo)
   return settimeofday(&tv, nullptr) == 0;
 }
 
+bool setSystemTimeFromEpoch(time_t epoch)
+{
+  if (epoch < kMinValidEpoch) {
+    return false;
+  }
+
+  timeval tv = {
+      .tv_sec = epoch,
+      .tv_usec = 0,
+  };
+  return settimeofday(&tv, nullptr) == 0;
+}
+
 size_t countConfiguredNetworks()
 {
   size_t count = 0;
@@ -689,6 +1001,24 @@ bool hasConfiguredNetworks()
 bool hasValidTime()
 {
   return time(nullptr) >= kMinValidEpoch;
+}
+
+void buildTimezonePosix(int utcOffsetHours, char *buffer, size_t bufferSize)
+{
+  int posixOffsetHours = -utcOffsetHours;
+  if (posixOffsetHours == 0) {
+    snprintf(buffer, bufferSize, "UTC0");
+    return;
+  }
+
+  snprintf(buffer, bufferSize, "UTC%+d", posixOffsetHours);
+}
+
+void applyConfiguredTimezone()
+{
+  buildTimezonePosix(settingsState().utcOffsetHours, configuredTimezonePosix, sizeof(configuredTimezonePosix));
+  setenv("TZ", configuredTimezonePosix, 1);
+  tzset();
 }
 
 String timeText()
@@ -721,15 +1051,8 @@ String dateText()
 
 String timezoneText()
 {
-  if (!hasValidTime()) {
-    return "TIME UNAVAILABLE";
-  }
-
   char buffer[16];
-  struct tm localTime = {};
-  time_t now = time(nullptr);
-  localtime_r(&now, &localTime);
-  strftime(buffer, sizeof(buffer), "%Z", &localTime);
+  snprintf(buffer, sizeof(buffer), "UTC%+d", settingsState().utcOffsetHours);
   return String(buffer);
 }
 
@@ -750,15 +1073,72 @@ void persistTimeToRtc()
   lastRtcWriteEpoch = now;
 }
 
+void persistTimeToPreferences(bool force = false)
+{
+  if (!hasValidTime()) {
+    return;
+  }
+
+  time_t now = time(nullptr);
+  if (!force && lastTimeBackupWriteEpoch != 0 &&
+      (now - lastTimeBackupWriteEpoch) < kTimeBackupWriteIntervalSeconds) {
+    return;
+  }
+
+  preferences.putUInt(kPrefTimeEpochKey, static_cast<uint32_t>(now));
+  lastTimeBackupWriteEpoch = now;
+}
+
+void loadTimeFromPreferences()
+{
+  uint32_t storedEpoch = preferences.getUInt(kPrefTimeEpochKey, 0);
+  if (storedEpoch < static_cast<uint32_t>(kMinValidEpoch)) {
+    return;
+  }
+
+  if (setSystemTimeFromEpoch(static_cast<time_t>(storedEpoch))) {
+    lastKnownValidTimeEpoch = static_cast<time_t>(storedEpoch);
+    systemTimeHasEverBeenValid = true;
+    Serial.printf("Loaded time from local backup: %lu\n", static_cast<unsigned long>(storedEpoch));
+  }
+}
+
+void maintainSystemTime()
+{
+  if (!hasValidTime()) {
+    if (lastKnownValidTimeEpoch >= kMinValidEpoch &&
+        setSystemTimeFromEpoch(lastKnownValidTimeEpoch)) {
+      Serial.println("Restored time from local backup");
+    }
+    return;
+  }
+
+  time_t now = time(nullptr);
+  bool firstValidSample = !systemTimeHasEverBeenValid;
+
+  lastKnownValidTimeEpoch = now;
+  systemTimeHasEverBeenValid = true;
+
+  if (firstValidSample) {
+    persistTimeToRtc();
+    persistTimeToPreferences(true);
+    return;
+  }
+
+  persistTimeToRtc();
+  persistTimeToPreferences();
+}
+
 void setOfflineMode(const char *reason)
 {
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.getMode() != WIFI_OFF && WiFi.status() == WL_CONNECTED) {
     WiFi.disconnect();
   }
 
   connectivityState = ConnectivityState::Offline;
   wifiAttemptInProgress = false;
   ntpConfigured = false;
+  otaModuleReset();
 
   weatherModuleMarkOffline();
 
@@ -786,7 +1166,9 @@ void beginWifiAttempt(size_t credentialIndex)
 
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
-  WiFi.disconnect(true, true);
+  if (WiFi.getMode() != WIFI_OFF) {
+    WiFi.disconnect(true, true);
+  }
   delay(40);
   WiFi.mode(WIFI_OFF);
   delay(40);
@@ -823,9 +1205,13 @@ void requestNtpSync()
     return;
   }
 
-  configTzTime(TIMEZONE_POSIX, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+  configTzTime(configuredTimezonePosix, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
   ntpConfigured = true;
-  Serial.println("Requested NTP sync");
+  Serial.printf("Requested NTP sync: tz_posix=%s, utc_offset=%d, servers=%s,%s\n",
+                configuredTimezonePosix,
+                settingsState().utcOffsetHours,
+                NTP_SERVER_PRIMARY,
+                NTP_SERVER_SECONDARY);
 }
 
 void updatePowerHoldOverlay(const String &status, const String &footer, int remainingTenths)
@@ -910,6 +1296,14 @@ void updatePowerButtonHold()
 
 void updateWiFi()
 {
+  if (!settingsState().wifiEnabled) {
+    if (connectivityState != ConnectivityState::Offline || WiFi.getMode() != WIFI_OFF) {
+      setOfflineMode("Wi-Fi disabled in settings");
+      WiFi.mode(WIFI_OFF);
+    }
+    return;
+  }
+
   if (!hasConfiguredNetworks()) {
     return;
   }
@@ -918,7 +1312,6 @@ void updateWiFi()
     if (connectivityState != ConnectivityState::Online) {
       connectivityState = ConnectivityState::Online;
       wifiAttemptInProgress = false;
-      weatherModuleScheduleRefreshIn(1000);
       Serial.printf("Wi-Fi connected to \"%s\": %s\n",
                     WiFi.SSID().c_str(),
                     WiFi.localIP().toString().c_str());
@@ -939,7 +1332,11 @@ void updateWiFi()
     }
 
     wifiAttemptInProgress = false;
-    Serial.printf("Timed out on \"%s\"\n", kWiFiCredentials[currentCredentialIndex].ssid);
+    wl_status_t wifiStatus = WiFi.status();
+    Serial.printf("Timed out on \"%s\" with status %d (%s)\n",
+                  kWiFiCredentials[currentCredentialIndex].ssid,
+                  static_cast<int>(wifiStatus),
+                  wifiStatusLabel(wifiStatus));
 
     while (nextCredentialIndex < (sizeof(kWiFiCredentials) / sizeof(kWiFiCredentials[0]))) {
       if (strlen(kWiFiCredentials[nextCredentialIndex].ssid) > 0) {
@@ -1123,7 +1520,104 @@ void enableTapBubbling(lv_obj_t *obj)
   lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE);
 }
 
-bool showScreen(size_t index)
+bool shouldKeepScreenCached(ScreenId id)
+{
+#ifdef SCREEN_WATCH
+  if (id == ScreenId::Watch) {
+    return true;
+  }
+#endif
+#ifdef SCREEN_LAUNCHER
+  if (id == ScreenId::Launcher) {
+    return true;
+  }
+#endif
+#ifdef SCREEN_WEATHER
+  if (id == ScreenId::Weather) {
+    return true;
+  }
+#endif
+#ifdef SCREEN_WEATHER_HOURLY
+  if (id == ScreenId::WeatherHourly) {
+    return true;
+  }
+#endif
+#ifdef SCREEN_WEATHER_DAILY
+  if (id == ScreenId::WeatherDaily) {
+    return true;
+  }
+#endif
+
+  return false;
+}
+
+ScreenId primaryNavigationAnchor(ScreenId id)
+{
+#ifdef SCREEN_WEATHER_HOURLY
+  if (id == ScreenId::WeatherHourly) {
+    return ScreenId::Weather;
+  }
+#endif
+#ifdef SCREEN_WEATHER_DAILY
+  if (id == ScreenId::WeatherDaily) {
+    return ScreenId::Weather;
+  }
+#endif
+#ifdef SCREEN_TIMER
+  if (id == ScreenId::Timer) {
+    return ScreenId::Stopwatch;
+  }
+#endif
+
+  return id;
+}
+
+bool isPrimaryNavigationScreen(ScreenId id)
+{
+  return primaryNavigationAnchor(id) == id;
+}
+
+size_t nextPrimaryScreenIndex(size_t fromIndex)
+{
+  size_t anchorIndex = static_cast<size_t>(primaryNavigationAnchor(static_cast<ScreenId>(fromIndex)));
+  for (size_t offset = 1; offset <= kScreenCount; ++offset) {
+    size_t candidate = (anchorIndex + offset) % kScreenCount;
+    ScreenId candidateId = static_cast<ScreenId>(candidate);
+    if (screenManagerIsEnabled(candidateId) && isPrimaryNavigationScreen(candidateId)) {
+      return candidate;
+    }
+  }
+
+  return anchorIndex;
+}
+
+size_t previousPrimaryScreenIndex(size_t fromIndex)
+{
+  size_t anchorIndex = static_cast<size_t>(primaryNavigationAnchor(static_cast<ScreenId>(fromIndex)));
+  for (size_t offset = 1; offset <= kScreenCount; ++offset) {
+    size_t candidate = (anchorIndex + kScreenCount - offset) % kScreenCount;
+    ScreenId candidateId = static_cast<ScreenId>(candidate);
+    if (screenManagerIsEnabled(candidateId) && isPrimaryNavigationScreen(candidateId)) {
+      return candidate;
+    }
+  }
+
+  return anchorIndex;
+}
+
+void processPendingScreenDestroys()
+{
+  for (size_t index = 0; index < kScreenCount; ++index) {
+    if (!screenDestroyPending[index] || index == currentScreenIndex) {
+      continue;
+    }
+
+    screenDestroyPending[index] = false;
+    screenManagerDestroy(static_cast<ScreenId>(index));
+  }
+}
+
+bool performShowScreen(size_t index)
 {
   if (index >= kScreenCount) {
     return false;
@@ -1131,6 +1625,11 @@ bool showScreen(size_t index)
 
   ScreenId nextScreen = static_cast<ScreenId>(index);
   ScreenId previousScreen = static_cast<ScreenId>(currentScreenIndex);
+  if (previousScreen != nextScreen) {
+    Serial.printf("Show screen: %s -> %s\n",
+                  screenModuleByIndex(currentScreenIndex).name,
+                  screenModuleByIndex(index).name);
+  }
   if (previousScreen != nextScreen) {
     screenManagerLeave(previousScreen);
   }
@@ -1143,24 +1642,17 @@ bool showScreen(size_t index)
 
   size_t previousScreenIndex = currentScreenIndex;
   currentScreenIndex = index;
+  screenDestroyPending[currentScreenIndex] = false;
   screenManagerEnter(nextScreen);
   screenManagerRefresh(nextScreen);
   lv_screen_load(screenManagerRoot(nextScreen));
   lv_refr_now(display);
 
-  // Free the previous screen after the new one is rendered to avoid mid-frame deletion.
-  // Keep Watch and Launcher cached for instant switching.
+  // Defer teardown until the main loop so we never delete the source LVGL tree
+  // from inside a touch/event callback.
   if (previousScreen != nextScreen) {
-#ifdef SCREEN_WATCH
-    if (previousScreen != ScreenId::Watch)
-#endif
-    {
-#ifdef SCREEN_LAUNCHER
-      if (previousScreen != ScreenId::Launcher)
-#endif
-      {
-        screenManagerDestroy(previousScreen);
-      }
+    if (!shouldKeepScreenCached(previousScreen)) {
+      screenDestroyPending[previousScreenIndex] = true;
     }
   }
 
@@ -1173,19 +1665,45 @@ bool showScreen(size_t index)
 
 bool showScreenById(ScreenId id)
 {
-  return showScreen(static_cast<size_t>(id));
+  size_t index = static_cast<size_t>(id);
+  if (index >= kScreenCount) {
+    return false;
+  }
+
+  pendingScreenChangeIndex = index;
+  screenChangePending = true;
+  return true;
 }
 
 void showNextScreen()
 {
-  if (watchCalendarIsVisible()) watchDismissCalendarSilent();
-  showScreen(screenManagerNextEnabledIndex(currentScreenIndex));
+  size_t baseIndex = screenChangePending ? pendingScreenChangeIndex : currentScreenIndex;
+  pendingScreenChangeIndex = nextPrimaryScreenIndex(baseIndex);
+  Serial.printf("Nav next: %s -> %s\n",
+                screenModuleByIndex(baseIndex).name,
+                screenModuleByIndex(pendingScreenChangeIndex).name);
+  screenChangePending = true;
 }
 
 void showPreviousScreen()
 {
-  if (watchCalendarIsVisible()) watchDismissCalendarSilent();
-  showScreen(screenManagerPreviousEnabledIndex(currentScreenIndex));
+  size_t baseIndex = screenChangePending ? pendingScreenChangeIndex : currentScreenIndex;
+  pendingScreenChangeIndex = previousPrimaryScreenIndex(baseIndex);
+  Serial.printf("Nav previous: %s -> %s\n",
+                screenModuleByIndex(baseIndex).name,
+                screenModuleByIndex(pendingScreenChangeIndex).name);
+  screenChangePending = true;
+}
+
+void processPendingScreenChange()
+{
+  if (!screenChangePending) {
+    return;
+  }
+
+  size_t index = pendingScreenChangeIndex;
+  screenChangePending = false;
+  performShowScreen(index);
 }
 
 void updateTopButton()
@@ -1385,9 +1903,12 @@ void setup()
 {
   Serial.begin(115200);
   delay(250);
+  WiFi.onEvent(handleWiFiEvent);
+  sntp_set_time_sync_notification_cb(handleSntpTimeSync);
   randomSeed(static_cast<unsigned long>(micros()));
   preferences.begin(kPreferencesNamespace, false);
   settingsLoad(preferences);
+  applyConfiguredTimezone();
   weatherModuleConfigure({
       &preferences,
       kPrefWeatherCacheKey,
@@ -1403,15 +1924,15 @@ void setup()
   });
   weatherModuleRestoreCache();
 
-  setenv("TZ", TIMEZONE_POSIX, 1);
-  tzset();
-
   Wire.begin(IIC_SDA, IIC_SCL);
   pinMode(TP_INT, INPUT_PULLUP);
 
   initExpander();
   initPower();
   initRtc();
+  if (!hasValidTime()) {
+    loadTimeFromPreferences();
+  }
   initTouch();
   imuModuleInit();
   sdMounted = false;
@@ -1426,6 +1947,7 @@ void setup()
   gfx->setBrightness(kActiveBrightness);
   gfx->fillScreen(kBackgroundColor);
   gfx->displayOn();
+  showBootSplash("Waveform", "Starting...");
   initSdCard();
 
 #ifdef WAVEFORM_DIAG_DISPLAY
@@ -1435,6 +1957,16 @@ void setup()
 #endif
 
   configuredNetworkCount = countConfiguredNetworks();
+  const char *knownNetworks[sizeof(kWiFiCredentials) / sizeof(kWiFiCredentials[0])] = {};
+  size_t knownNetworkCount = 0;
+  for (const auto &credential : kWiFiCredentials) {
+    if (strlen(credential.ssid) == 0) {
+      continue;
+    }
+    knownNetworks[knownNetworkCount++] = credential.ssid;
+  }
+  wifiManagerConfigureKnownNetworks(knownNetworks, knownNetworkCount);
+  bleManagerSetEnabled(settingsState().bleEnabled);
   if (configuredNetworkCount == 0 && !weatherModuleHasData()) {
     weatherModuleSetUnavailable("Offline - no Wi-Fi configured");
   }
@@ -1462,16 +1994,21 @@ void setup()
   }
 
   setupLvgl();
+  showBootSplash("Waveform", "Loading UI...");
   buildUi();
   setDisplayBrightness(settingsState().brightness);
   autoCycleEnabled = settingsState().autoCycleEnabled;
-  uint8_t savedScreen = preferences.getUChar(kPrefScreenKey, 0);
-  if (savedScreen >= kScreenCount) {
-    savedScreen = 0;
+  uint8_t savedScreen = static_cast<uint8_t>(ScreenId::Watch);
+  if (kPersistCurrentScreen) {
+    savedScreen = preferences.getUChar(kPrefScreenKey, static_cast<uint8_t>(ScreenId::Watch));
+    if (savedScreen >= kScreenCount) {
+      savedScreen = static_cast<uint8_t>(ScreenId::Watch);
+    }
+    savedScreen = static_cast<uint8_t>(primaryNavigationAnchor(static_cast<ScreenId>(savedScreen)));
   }
 
-  if (!showScreen(savedScreen) && savedScreen != static_cast<uint8_t>(ScreenId::Watch)) {
-    showScreen(static_cast<size_t>(ScreenId::Watch));
+  if (!performShowScreen(savedScreen) && savedScreen != static_cast<uint8_t>(ScreenId::Watch)) {
+    performShowScreen(static_cast<size_t>(ScreenId::Watch));
   }
   refreshUi();
   lv_obj_invalidate(lv_screen_active());
@@ -1481,6 +2018,10 @@ void setup()
   lastWeatherAnimAtMs = millis();
   lastRecorderVisualRefreshAtMs = millis();
   lastSkyRefreshAtMs = millis();
+  systemTimeHasEverBeenValid = hasValidTime();
+  if (systemTimeHasEverBeenValid) {
+    lastKnownValidTimeEpoch = time(nullptr);
+  }
 }
 
 void loop()
@@ -1497,6 +2038,13 @@ void loop()
     lastWifiServiceAtMs = now;
     updateWiFi();
   }
+  wifiManagerUpdateScan(now,
+                        settingsState().wifiEnabled,
+                        settingsState().wifiEnabled && !wifiAttemptInProgress && !otaModuleIsInProgress() &&
+                            !inLightSleep);
+  bleManagerUpdate(now,
+                   settingsState().bleEnabled,
+                   settingsState().bleEnabled && !otaModuleIsInProgress() && !inLightSleep);
   weatherModuleUpdate();
 #ifdef SCREEN_GEO
   updateGeo();
@@ -1512,10 +2060,12 @@ void loop()
   updatePowerKey();
   updatePowerButtonHold();
   updateIdleState();
-  persistTimeToRtc();
+  maintainSystemTime();
 
   otaModuleHandle();
   otaModuleUpdate();
+  processPendingScreenChange();
+  processPendingScreenDestroys();
 
   ScreenId activeScreen = static_cast<ScreenId>(currentScreenIndex);
 
@@ -1562,6 +2112,11 @@ void loop()
     screenManagerTick(activeScreen, now);
   }
 #endif
+#ifdef SCREEN_RADIO
+  if (activeScreen == ScreenId::Radio) {
+    screenManagerTick(activeScreen, now);
+  }
+#endif
 #ifdef SCREEN_STOPWATCH
   if (activeScreen == ScreenId::Stopwatch) {
     screenManagerTick(activeScreen, now);
@@ -1569,6 +2124,11 @@ void loop()
 #endif
 #ifdef SCREEN_TIMER
   if (activeScreen == ScreenId::Timer) {
+    screenManagerTick(activeScreen, now);
+  }
+#endif
+#ifdef SCREEN_ORB
+  if (activeScreen == ScreenId::Orb) {
     screenManagerTick(activeScreen, now);
   }
 #endif

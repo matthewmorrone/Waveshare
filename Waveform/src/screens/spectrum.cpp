@@ -53,6 +53,7 @@ struct SpectrumUi
 SpectrumUi gUi;
 bool gBuilt = false;
 bool gAudioReady = false;
+bool gAudioStartPending = false;
 
 // ─── Signal state ────────────────────────────────────────────────────────────
 double vReal[kFftSamples];
@@ -95,13 +96,21 @@ lv_color_t barColor(size_t barIndex)
 bool initAudio()
 {
   audioI2s.end();
-  // No DOUT (-1) → RX-only channel so we don't accidentally get TX loopback zeros
-  audioI2s.setPins(AUDIO_I2S_BCLK, AUDIO_I2S_WS, -1, AUDIO_I2S_DIN, AUDIO_I2S_MCLK);
-  // Init codec first (matches working reference sketch order)
+  audioI2s.setPins(AUDIO_I2S_BCLK, AUDIO_I2S_WS, AUDIO_I2S_DOUT, AUDIO_I2S_DIN, AUDIO_I2S_MCLK);
+  audioI2s.setTimeout(100);
+  if (!audioI2s.begin(I2S_MODE_STD,
+                      kSampleRate,
+                      I2S_DATA_BIT_WIDTH_16BIT,
+                      I2S_SLOT_MODE_MONO,
+                      I2S_STD_SLOT_LEFT)) {
+    return false;
+  }
+
   if (!gCodec) {
     gCodec = es8311_create(0, ES8311_ADDRRES_0);
   }
   if (!gCodec) {
+    audioI2s.end();
     return false;
   }
 
@@ -109,30 +118,19 @@ bool initAudio()
       .mclk_inverted      = false,
       .sclk_inverted      = false,
       .mclk_from_mclk_pin = true,
-      .mclk_frequency     = 12288000,   // 768× for 16 kHz (matches reference)
+      .mclk_frequency     = (int)(kSampleRate * 256U),
       .sample_frequency   = (int)(kSampleRate),
   };
 
   esp_err_t err = es8311_init(gCodec, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
-  Serial.printf("[spec] es8311_init=%d\n", err);
+  if (err == ESP_OK) err = es8311_sample_frequency_config(gCodec, clk.mclk_frequency, clk.sample_frequency);
   if (err == ESP_OK) err = es8311_microphone_config(gCodec, false);
   if (err == ESP_OK) err = es8311_microphone_gain_set(gCodec, ES8311_MIC_GAIN_18DB);
-  Serial.printf("[spec] codec setup done err=%d\n", err);
+  if (err == ESP_OK) err = es8311_voice_mute(gCodec, false);
   if (err != ESP_OK) {
     es8311_delete(gCodec);
     gCodec = nullptr;
-    return false;
-  }
-
-  // Init I2S after codec
-  audioI2s.setTimeout(100);
-  if (!audioI2s.begin(I2S_MODE_STD,
-                      kSampleRate,
-                      I2S_DATA_BIT_WIDTH_16BIT,
-                      I2S_SLOT_MODE_MONO,
-                      I2S_STD_SLOT_LEFT)) {
-    es8311_delete(gCodec);
-    gCodec = nullptr;
+    audioI2s.end();
     return false;
   }
 
@@ -155,24 +153,7 @@ void processSamples()
   // Read mono 16-bit samples
   static int16_t buf[kFftSamples];
   size_t bytesRead = audioI2s.readBytes(reinterpret_cast<char *>(buf), sizeof(buf));
-  static uint32_t logCount = 0;
-  if (++logCount <= 10 || logCount % 50 == 0) {
-    Serial.printf("[spec] bytesRead=%u needed=%u\n", (unsigned)bytesRead, (unsigned)sizeof(buf));
-  }
   if (bytesRead < sizeof(buf)) return;
-
-  // Log raw samples to diagnose zero signal
-  {
-    static uint32_t rawLogCount = 0;
-    if (++rawLogCount <= 5) {
-      int16_t mn = 32767, mx = -32768;
-      for (size_t i = 0; i < kFftSamples; ++i) {
-        if (buf[i] < mn) mn = buf[i];
-        if (buf[i] > mx) mx = buf[i];
-      }
-      Serial.printf("[spec] raw min=%d max=%d buf[0]=%d buf[1]=%d\n", mn, mx, buf[0], buf[1]);
-    }
-  }
 
   // Load real, apply Hann window
   for (size_t i = 0; i < kFftSamples; ++i) {
@@ -203,13 +184,6 @@ void processSamples()
     for (size_t bin = binLo; bin <= binHi; ++bin) {
       float mag = static_cast<float>(vReal[bin]);
       if (mag > peak) peak = mag;
-    }
-
-    // Log raw peak for first few frames on bar 8
-    if (bar == 8) {
-      static uint32_t peakLogCount = 0;
-      if (++peakLogCount <= 20 || peakLogCount % 50 == 0)
-        Serial.printf("[spec] bar8 peak=%.6f\n", peak);
     }
 
     // Convert to 0..1 via log scale
@@ -353,11 +327,10 @@ void waveformEnterSpectrumScreen()
 {
   memset(gBarHeights,  0, sizeof(gBarHeights));
   memset(gPeakHeights, 0, sizeof(gPeakHeights));
-  gAudioReady = initAudio();
-  Serial.printf("[spec] initAudio=%d\n", gAudioReady);
   if (gUi.statusLabel) {
-    lv_label_set_text(gUi.statusLabel, gAudioReady ? "Listening" : "Mic error");
+    lv_label_set_text(gUi.statusLabel, "Starting mic...");
   }
+  gAudioStartPending = true;
 }
 
 void waveformLeaveSpectrumScreen()
@@ -368,14 +341,15 @@ void waveformLeaveSpectrumScreen()
 void waveformTickSpectrumScreen(uint32_t nowMs)
 {
   static uint32_t lastTickMs = 0;
-  static uint32_t diagCount = 0;
   if (!gBuilt) return;
-  if (!gAudioReady) {
-    if (++diagCount % 100 == 1) {
-      Serial.printf("[spec] tick: built=%d audioReady=%d\n", gBuilt, gAudioReady);
+  if (gAudioStartPending) {
+    gAudioStartPending = false;
+    gAudioReady = initAudio();
+    if (gUi.statusLabel) {
+      lv_label_set_text(gUi.statusLabel, gAudioReady ? "Listening" : "Mic error");
     }
-    return;
   }
+  if (!gAudioReady) return;
   if (nowMs - lastTickMs < 40) return;
   lastTickMs = nowMs;
   processSamples();

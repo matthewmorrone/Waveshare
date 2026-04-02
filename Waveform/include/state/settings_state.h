@@ -7,6 +7,7 @@ struct SettingsState
 {
   uint8_t brightness = 255;      // 0-255
   bool wifiEnabled = true;
+  bool bleEnabled = true;
   bool use24hClock = true;
   bool useCelsius = false;
   bool autoCycleEnabled = false;

@@ -47,9 +47,8 @@ uint64_t storageCardSizeMb()
 void ensureSdDirectories()
 {
   for (const char *dir : kSdStartupDirs) {
-    String fullPath = String(kSdMountPath) + dir;
-    if (!SD_MMC.exists(fullPath.c_str()) && !SD_MMC.mkdir(fullPath.c_str())) {
-      Serial.printf("Failed to create SD directory: %s\n", fullPath.c_str());
+    if (!SD_MMC.exists(dir) && !SD_MMC.mkdir(dir)) {
+      Serial.printf("Failed to create SD directory: %s\n", dir);
     }
   }
 }

@@ -9,20 +9,24 @@
 // Matching entry in screen_manager.cpp must also be commented out.
 #define SCREEN_LAUNCHER
 #define SCREEN_WATCH
+#define SCREEN_CALENDAR
 #define SCREEN_MOTION
 #define SCREEN_WEATHER
-// #define SCREEN_GEO
-// #define SCREEN_SOLAR
-// #define SCREEN_MOON
-// #define SCREEN_SKY
-// #define SCREEN_RECORDER
-// #define SCREEN_QR
+#define SCREEN_WEATHER_HOURLY
+#define SCREEN_WEATHER_DAILY
+#define SCREEN_GEO
+#define SCREEN_SOLAR
+#define SCREEN_SKY
+#define SCREEN_RECORDER
+#define SCREEN_QR
 #define SCREEN_CALCULATOR
 #define SCREEN_STOPWATCH
 #define SCREEN_TIMER
 #define SCREEN_SYSTEM
 #define SCREEN_SETTINGS
 #define SCREEN_SPECTRUM
+#define SCREEN_RADIO
+#define SCREEN_ORB
 
 enum class ScreenId : uint8_t {
 #ifdef SCREEN_LAUNCHER
@@ -31,20 +35,26 @@ enum class ScreenId : uint8_t {
 #ifdef SCREEN_WATCH
   Watch,
 #endif
+#ifdef SCREEN_CALENDAR
+  Calendar,
+#endif
 #ifdef SCREEN_MOTION
   Motion,
 #endif
 #ifdef SCREEN_WEATHER
   Weather,
 #endif
+#ifdef SCREEN_WEATHER_HOURLY
+  WeatherHourly,
+#endif
+#ifdef SCREEN_WEATHER_DAILY
+  WeatherDaily,
+#endif
 #ifdef SCREEN_GEO
   Geo,
 #endif
 #ifdef SCREEN_SOLAR
   Solar,
-#endif
-#ifdef SCREEN_MOON
-  Moon,
 #endif
 #ifdef SCREEN_SKY
   Sky,
@@ -72,6 +82,12 @@ enum class ScreenId : uint8_t {
 #endif
 #ifdef SCREEN_SPECTRUM
   Spectrum,
+#endif
+#ifdef SCREEN_RADIO
+  Radio,
+#endif
+#ifdef SCREEN_ORB
+  Orb,
 #endif
 };
 

@@ -22,6 +22,7 @@ bool otaReady = false;
 bool otaInProgress = false;
 bool otaOverlaySticky = false;
 uint32_t otaOverlayHideAtMs = 0;
+IPAddress otaReadyIp;
 } // namespace
 
 void otaModuleBuildOverlay()
@@ -84,7 +85,12 @@ void otaModuleBuildOverlay()
 
 void otaModuleStart()
 {
-  if (otaReady || !networkIsOnline()) {
+  if (!networkIsOnline()) {
+    return;
+  }
+
+  IPAddress currentIp = WiFi.localIP();
+  if (otaReady && otaReadyIp == currentIp) {
     return;
   }
 
@@ -138,12 +144,22 @@ void otaModuleStart()
 
   ArduinoOTA.begin();
   otaReady = true;
-  Serial.printf("OTA ready at %s.local (%s)\n", OTA_HOSTNAME, WiFi.localIP().toString().c_str());
+  otaReadyIp = currentIp;
+  Serial.printf("OTA ready at %s.local (%s)\n", OTA_HOSTNAME, currentIp.toString().c_str());
+}
+
+void otaModuleReset()
+{
+  otaReady = false;
+  otaReadyIp = IPAddress();
+  if (!otaInProgress) {
+    otaModuleHideOverlay();
+  }
 }
 
 void otaModuleHandle()
 {
-  if (otaReady) {
+  if (otaReady && networkIsOnline()) {
     ArduinoOTA.handle();
   }
 }
@@ -189,7 +205,7 @@ bool otaModuleIsInProgress()
 
 bool otaModuleIsReady()
 {
-  return otaReady;
+  return otaReady && networkIsOnline() && otaReadyIp == WiFi.localIP();
 }
 
 void otaModuleUpdate()

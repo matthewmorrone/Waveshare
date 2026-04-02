@@ -31,4 +31,3 @@ void weatherModuleRefreshUi();
 String weatherApiUrl();
 String weatherUpdatedLabel();
 void handleWeatherStackSwipe(int deltaY);
-void handleWeatherSwipe(int deltaX);
