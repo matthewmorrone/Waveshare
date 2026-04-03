@@ -60,6 +60,11 @@ constexpr uint32_t kRtcWriteIntervalSeconds = 60;
 constexpr uint32_t kTimeBackupWriteIntervalSeconds = 15 * 60;
 constexpr uint32_t kDimAfterMs = 30000;
 constexpr uint32_t kSleepAfterMs = 5UL * 60UL * 1000UL;
+constexpr uint32_t kVoiceRaiseCooldownMs = 4500;
+constexpr uint32_t kVoiceRaiseListenWindowMs = 6000;
+constexpr float kVoiceRaiseGyroThreshold = 150.0f;
+constexpr float kVoiceRaisePitchLimit = 68.0f;
+constexpr float kVoiceRaiseRollLimit = 150.0f;
 constexpr uint32_t kTapMaxDurationMs = 350;
 constexpr uint32_t kShutdownHoldArmMs = 450;
 constexpr uint32_t kSideButtonLongPressMs = 1200;
@@ -133,15 +138,21 @@ extern bool qrNeedsRender;
 void updateRecorderAudio();
 extern bool audioRecordingActive;
 extern bool audioPlaybackActive;
+bool recorderStartVoiceArm();
+void recorderCancelVoiceArm();
+bool recorderVoiceArmActive();
+bool recorderVoiceClipCaptured();
 #endif
 void handleTouchInterrupt();
 bool refreshManagedScreen(ScreenId id);
+void noteActivity();
 void saveMotionViewPreference();
 void saveScreenPreference(size_t screenIndex);
 void showNextScreen();
 void showPreviousScreen();
 bool performShowScreen(size_t index);
 void initRtc();
+void updateRaiseToSpeakPrototype(uint32_t now);
 std::unique_ptr<Arduino_IIC> touchController(
     new Arduino_FT3x68(touchBus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, handleTouchInterrupt));
 
@@ -225,6 +236,11 @@ uint32_t lastSkyRefreshAtMs = 0;
 uint32_t lastAutoCycleAtMs = 0;
 bool autoCycleEnabled = false;
 bool systemTimeHasEverBeenValid = false;
+bool voiceRaiseSessionPending = false;
+bool voiceRaiseSessionActive = false;
+uint32_t voiceRaiseWindowEndsAtMs = 0;
+uint32_t nextVoiceRaiseAllowedAtMs = 0;
+size_t voiceRaiseReturnScreenIndex = 0;
 
 int16_t touchTapStartX = LCD_WIDTH / 2;
 int16_t touchTapStartY = LCD_HEIGHT / 2;
@@ -297,6 +313,86 @@ const char *wifiDisconnectReasonLabel(uint8_t reason)
     default:
       return "OTHER";
   }
+}
+
+bool shouldArmRaiseToSpeak(uint32_t now)
+{
+#ifdef SCREEN_RECORDER
+  if (now < nextVoiceRaiseAllowedAtMs || inLightSleep || !imuModuleIsReady() ||
+      audioRecordingActive || audioPlaybackActive || recorderVoiceArmActive()) {
+    return false;
+  }
+
+  const MotionState &ms = imuModuleState();
+  if (!ms.valid) {
+    return false;
+  }
+
+  float gyroMagnitude = fabsf(ms.gx) + fabsf(ms.gy) + fabsf(ms.gz);
+  bool orientationOk = strcmp(ms.orientation, "Face Down") != 0;
+  bool poseOk = fabsf(ms.pitch) <= kVoiceRaisePitchLimit && fabsf(ms.roll) <= kVoiceRaiseRollLimit;
+  return orientationOk && poseOk && gyroMagnitude >= kVoiceRaiseGyroThreshold;
+#else
+  (void)now;
+  return false;
+#endif
+}
+
+void cancelRaiseToSpeakPrototype()
+{
+#ifdef SCREEN_RECORDER
+  voiceRaiseSessionPending = false;
+  voiceRaiseSessionActive = false;
+  voiceRaiseWindowEndsAtMs = 0;
+  recorderCancelVoiceArm();
+#endif
+}
+
+void updateRaiseToSpeakPrototype(uint32_t now)
+{
+#ifdef SCREEN_RECORDER
+  if (voiceRaiseSessionActive && now >= voiceRaiseWindowEndsAtMs &&
+      !audioRecordingActive && !recorderVoiceArmActive()) {
+    voiceRaiseSessionActive = false;
+    voiceRaiseWindowEndsAtMs = 0;
+    if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Recorder) {
+      showScreenById(static_cast<ScreenId>(voiceRaiseReturnScreenIndex));
+    }
+    nextVoiceRaiseAllowedAtMs = now + kVoiceRaiseCooldownMs;
+  }
+
+  if (!voiceRaiseSessionActive && !voiceRaiseSessionPending && shouldArmRaiseToSpeak(now)) {
+    noteActivity();
+    voiceRaiseReturnScreenIndex = currentScreenIndex;
+    voiceRaiseSessionPending = true;
+    voiceRaiseSessionActive = true;
+    voiceRaiseWindowEndsAtMs = now + kVoiceRaiseListenWindowMs;
+    nextVoiceRaiseAllowedAtMs = voiceRaiseWindowEndsAtMs + kVoiceRaiseCooldownMs;
+    showScreenById(ScreenId::Recorder);
+  }
+
+  if (voiceRaiseSessionPending && static_cast<ScreenId>(currentScreenIndex) == ScreenId::Recorder) {
+    voiceRaiseSessionPending = false;
+    if (!recorderStartVoiceArm()) {
+      cancelRaiseToSpeakPrototype();
+      nextVoiceRaiseAllowedAtMs = now + kVoiceRaiseCooldownMs;
+    }
+  }
+
+  if (voiceRaiseSessionActive && recorderVoiceClipCaptured()) {
+    voiceRaiseSessionActive = false;
+    voiceRaiseWindowEndsAtMs = 0;
+    nextVoiceRaiseAllowedAtMs = now + kVoiceRaiseCooldownMs;
+  }
+
+  if (voiceRaiseSessionActive && static_cast<ScreenId>(currentScreenIndex) != ScreenId::Recorder &&
+      !voiceRaiseSessionPending) {
+    cancelRaiseToSpeakPrototype();
+    nextVoiceRaiseAllowedAtMs = now + kVoiceRaiseCooldownMs;
+  }
+#else
+  (void)now;
+#endif
 }
 
 void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
@@ -2055,6 +2151,7 @@ void loop()
   imuModuleUpdate();
 #ifdef SCREEN_RECORDER
   updateRecorderAudio();
+  updateRaiseToSpeakPrototype(now);
 #endif
   updateTopButton();
   updatePowerKey();

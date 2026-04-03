@@ -111,6 +111,10 @@ void waveformEnterRecorderScreen();
 void waveformLeaveRecorderScreen();
 void waveformTickRecorderScreen(uint32_t nowMs);
 void recorderHandleTap();
+bool recorderStartVoiceArm();
+void recorderCancelVoiceArm();
+bool recorderVoiceArmActive();
+bool recorderVoiceClipCaptured();
 
 #ifdef SCREEN_QR
 lv_obj_t *waveformQrScreenRoot();

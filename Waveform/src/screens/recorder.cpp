@@ -32,6 +32,15 @@ const ScreenModule kModule = {
 };
 } // namespace
 
+namespace
+{
+constexpr uint32_t kVoiceArmWindowMs = 5000;
+constexpr uint32_t kVoiceSilenceStopMs = 1400;
+constexpr uint32_t kVoiceMinCaptureMs = 900;
+constexpr int32_t kVoiceTriggerLevel = 2200;
+constexpr int32_t kVoiceHoldLevel = 900;
+}
+
 const ScreenModule &recorderScreenModule()
 {
   return kModule;
@@ -55,8 +64,14 @@ static bool audioHardwareReady  = false;
 bool audioRecordingActive = false;
 bool audioPlaybackActive  = false;
 bool audioClipAvailable   = false;
+static bool voiceArmActive = false;
+static bool voiceTriggeredRecording = false;
+static bool voiceClipCaptured = false;
 static uint32_t audioRecordedBytes = 0;
 static uint32_t audioPlaybackBytes = 0;
+static uint32_t voiceArmStartedAtMs = 0;
+static uint32_t voiceLastSpeechAtMs = 0;
+static int32_t voiceLastLevel = 0;
 uint32_t audioClipBytes     = 0;
 uint8_t  sdCardType         = CARD_NONE;
 uint64_t sdCardSizeMb       = 0;
@@ -81,6 +96,23 @@ static String fmtDuration(uint32_t bytes)
   snprintf(buf, sizeof(buf), "%02lu:%02lu",
            (unsigned long)(secs / 60), (unsigned long)(secs % 60));
   return String(buf);
+}
+
+static int32_t audioLevelFromBuffer(const uint8_t *data, size_t size)
+{
+  if (!data || size < sizeof(int16_t)) return 0;
+
+  const int16_t *samples = reinterpret_cast<const int16_t *>(data);
+  size_t sampleCount = size / sizeof(int16_t);
+  if (sampleCount == 0) return 0;
+
+  uint32_t sum = 0;
+  for (size_t i = 0; i < sampleCount; ++i) {
+    int32_t v = samples[i];
+    sum += static_cast<uint32_t>(v < 0 ? -v : v);
+  }
+
+  return static_cast<int32_t>(sum / sampleCount);
 }
 
 static void setStatus(const char *text)
@@ -179,6 +211,8 @@ void refreshRecorderClipState()
 
 static bool startPlayback()
 {
+  voiceArmActive = false;
+  voiceTriggeredRecording = false;
   if (!sdMounted) { setStatus("No SD card"); return false; }
   refreshRecorderClipState();
   if (!audioClipAvailable) { setStatus("No clip"); return false; }
@@ -215,10 +249,19 @@ static void stopRecording(bool playAfter)
 
   setStatus(("Saved " + fmtDuration(audioRecordedBytes)).c_str());
   setButtonColor(lvColor(154, 24, 30), lvColor(214, 84, 90));
+  if (voiceTriggeredRecording) {
+    voiceClipCaptured = audioRecordedBytes > 0;
+    voiceTriggeredRecording = false;
+    voiceArmActive = false;
+    if (audioRecordedBytes > 0) {
+      setStatus("Voice clip saved");
+    }
+    return;
+  }
   if (playAfter) startPlayback();
 }
 
-static bool startRecording()
+static bool startRecording(const uint8_t *initialData = nullptr, size_t initialBytes = 0)
 {
   if (!sdMounted) initSdCard();
   if (!sdMounted) { setStatus("No SD card"); return false; }
@@ -233,6 +276,16 @@ static bool startRecording()
   audioRecordedBytes  = 0;
   audioRecordingActive = true;
   audioClipAvailable   = false;
+  if (initialData && initialBytes > 0) {
+    size_t written = audioRecordingFile.write(initialData, initialBytes);
+    if (written != initialBytes) {
+      audioRecordingFile.close();
+      audioRecordingActive = false;
+      setStatus("Seed write failed");
+      return false;
+    }
+    audioRecordedBytes = static_cast<uint32_t>(written);
+  }
   setStatus("Recording...");
   setButtonColor(lvColor(184, 38, 44), lvColor(240, 98, 104));
   return true;
@@ -244,6 +297,46 @@ static bool startRecording()
 
 void updateRecorderAudio()
 {
+  uint32_t now = millis();
+  if (voiceArmActive && !audioRecordingActive) {
+    if (!ensureAudioReady()) {
+      voiceArmActive = false;
+      return;
+    }
+
+    if (now - voiceArmStartedAtMs >= kVoiceArmWindowMs) {
+      voiceArmActive = false;
+      setStatus("Voice window expired");
+      setButtonColor(lvColor(154, 24, 30), lvColor(214, 84, 90));
+      return;
+    }
+
+    size_t bytesRead = audioI2s.readBytes(reinterpret_cast<char *>(audioBuffer), sizeof(audioBuffer));
+    if (bytesRead == 0) {
+      setStatus("Mic arm failed");
+      voiceArmActive = false;
+      return;
+    }
+
+    noteActivity();
+    voiceLastLevel = audioLevelFromBuffer(audioBuffer, bytesRead);
+
+    char status[48];
+    snprintf(status, sizeof(status), "Speak now  %ld", static_cast<long>(voiceLastLevel));
+    setStatus(status);
+    setButtonColor(lvColor(112, 52, 10), lvColor(255, 166, 64));
+
+    if (voiceLastLevel >= kVoiceTriggerLevel) {
+      voiceTriggeredRecording = true;
+      voiceLastSpeechAtMs = now;
+      if (!startRecording(audioBuffer, bytesRead)) {
+        voiceTriggeredRecording = false;
+        voiceArmActive = false;
+      }
+    }
+    return;
+  }
+
   if (audioRecordingActive) {
     noteActivity();
     size_t bytesRead = audioI2s.readBytes(reinterpret_cast<char *>(audioBuffer), sizeof(audioBuffer));
@@ -259,13 +352,28 @@ void updateRecorderAudio()
       return;
     }
     audioRecordedBytes += (uint32_t)written;
+    if (voiceTriggeredRecording) {
+      voiceLastLevel = audioLevelFromBuffer(audioBuffer, bytesRead);
+      if (voiceLastLevel >= kVoiceHoldLevel) {
+        voiceLastSpeechAtMs = now;
+      } else if ((now - voiceLastSpeechAtMs) >= kVoiceSilenceStopMs &&
+                 audioRecordedBytes >= (kRecorderBytesPerSecond * kVoiceMinCaptureMs) / 1000U) {
+        stopRecording(false);
+        return;
+      }
+    }
 
     // Update status periodically with elapsed duration
     static uint32_t lastStatusUpdateMs = 0;
-    uint32_t now = millis();
     if (now - lastStatusUpdateMs >= 500) {
       lastStatusUpdateMs = now;
-      setStatus(("Recording " + fmtDuration(audioRecordedBytes)).c_str());
+      if (voiceTriggeredRecording) {
+        char status[48];
+        snprintf(status, sizeof(status), "Voice rec %s", fmtDuration(audioRecordedBytes).c_str());
+        setStatus(status);
+      } else {
+        setStatus(("Recording " + fmtDuration(audioRecordedBytes)).c_str());
+      }
     }
     return;
   }
@@ -301,6 +409,8 @@ static void onButtonEvent(lv_event_t *e)
   lv_event_code_t code = lv_event_get_code(e);
 
   if (code == LV_EVENT_PRESSED) {
+    voiceArmActive = false;
+    voiceTriggeredRecording = false;
     if (!audioPlaybackActive && !audioRecordingActive) {
       startRecording();
     }
@@ -326,6 +436,11 @@ static void onButtonEvent(lv_event_t *e)
 void recorderHandleTap()
 {
   if (!recorderBuilt) return;
+  if (voiceArmActive) {
+    recorderCancelVoiceArm();
+    setStatus(audioClipAvailable ? "Hold to record  •  Tap to play" : "Hold to record");
+    return;
+  }
   if (audioRecordingActive) return;  // button handles record stop on release
 
   if (audioPlaybackActive) {
@@ -419,6 +534,7 @@ void waveformEnterRecorderScreen()
 
 void waveformLeaveRecorderScreen()
 {
+  recorderCancelVoiceArm();
   if (audioRecordingActive) stopRecording(false);
   if (audioPlaybackActive)  stopPlayback();
   audioI2s.end();
@@ -428,6 +544,45 @@ void waveformLeaveRecorderScreen()
 void waveformTickRecorderScreen(uint32_t nowMs)
 {
   (void)nowMs;
+}
+
+bool recorderStartVoiceArm()
+{
+  if (!recorderBuilt) return false;
+  if (!sdMounted) initSdCard();
+  if (!sdMounted) {
+    setStatus("No SD card");
+    return false;
+  }
+  if (!ensureAudioReady()) return false;
+
+  stopPlayback();
+  voiceClipCaptured = false;
+  voiceTriggeredRecording = false;
+  voiceArmActive = true;
+  voiceArmStartedAtMs = millis();
+  voiceLastSpeechAtMs = voiceArmStartedAtMs;
+  voiceLastLevel = 0;
+  setStatus("Raise detected  •  speak");
+  setButtonColor(lvColor(112, 52, 10), lvColor(255, 166, 64));
+  return true;
+}
+
+void recorderCancelVoiceArm()
+{
+  voiceArmActive = false;
+  voiceTriggeredRecording = false;
+  voiceLastLevel = 0;
+}
+
+bool recorderVoiceArmActive()
+{
+  return voiceArmActive;
+}
+
+bool recorderVoiceClipCaptured()
+{
+  return voiceClipCaptured;
 }
 
 #endif // SCREEN_RECORDER
