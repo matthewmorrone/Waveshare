@@ -64,6 +64,9 @@ static const ScreenModule *const kModulesArr[] = {
 #ifdef SCREEN_RADIO
     &radioScreenModule(),
 #endif
+#ifdef SCREEN_LOCKET
+    &locketScreenModule(),
+#endif
 #ifdef SCREEN_ORB
     &orbScreenModule(),
 #endif

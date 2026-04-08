@@ -26,6 +26,7 @@
 #define SCREEN_SETTINGS
 #define SCREEN_SPECTRUM
 #define SCREEN_RADIO
+#define SCREEN_LOCKET
 #define SCREEN_ORB
 
 enum class ScreenId : uint8_t {
@@ -85,6 +86,9 @@ enum class ScreenId : uint8_t {
 #endif
 #ifdef SCREEN_RADIO
   Radio,
+#endif
+#ifdef SCREEN_LOCKET
+  Locket,
 #endif
 #ifdef SCREEN_ORB
   Orb,

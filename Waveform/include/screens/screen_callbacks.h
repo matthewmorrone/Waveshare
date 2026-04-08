@@ -192,6 +192,17 @@ void waveformTickRadioScreen(uint32_t nowMs);
 void waveformDestroyRadioScreen();
 #endif
 
+#ifdef SCREEN_LOCKET
+lv_obj_t *waveformLocketScreenRoot();
+bool waveformBuildLocketScreen();
+bool waveformRefreshLocketScreen();
+void waveformEnterLocketScreen();
+void waveformLeaveLocketScreen();
+void waveformTickLocketScreen(uint32_t nowMs);
+void waveformDestroyLocketScreen();
+void locketHandleOrbTap();
+#endif
+
 #ifdef SCREEN_ORB
 lv_obj_t *waveformOrbScreenRoot();
 bool waveformBuildOrbScreen();

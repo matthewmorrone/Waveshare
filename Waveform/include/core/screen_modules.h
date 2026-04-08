@@ -59,6 +59,9 @@ const ScreenModule &spectrumScreenModule();
 #ifdef SCREEN_RADIO
 const ScreenModule &radioScreenModule();
 #endif
+#ifdef SCREEN_LOCKET
+const ScreenModule &locketScreenModule();
+#endif
 #ifdef SCREEN_ORB
 const ScreenModule &orbScreenModule();
 #endif

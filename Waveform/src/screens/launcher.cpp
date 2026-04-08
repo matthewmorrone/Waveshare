@@ -104,6 +104,9 @@ constexpr LauncherApp kApps[] = {
 #ifdef SCREEN_RADIO
     {ScreenId::Radio, "Radio", "Wi-Fi + BLE", "RF", 92, 224, 224},
 #endif
+#ifdef SCREEN_LOCKET
+    {ScreenId::Locket, "Locket", "Sky charm scene", "SKY", 148, 214, 255},
+#endif
 #ifdef SCREEN_SYSTEM
     {ScreenId::System, "System", "Power and SD", "SYS", 74, 222, 128},
 #endif

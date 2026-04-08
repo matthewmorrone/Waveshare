@@ -10,3 +10,7 @@
 /lv_micropython/
 /.pip-cache/
 /.pydeps/
+Locket/.pio/
+Reboot/.pio/
+VendorAudioDemo/.pio/
+Locket/tmp/

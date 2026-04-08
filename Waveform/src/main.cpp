@@ -2214,6 +2214,11 @@ void loop()
     screenManagerTick(activeScreen, now);
   }
 #endif
+#ifdef SCREEN_LOCKET
+  if (activeScreen == ScreenId::Locket) {
+    screenManagerTick(activeScreen, now);
+  }
+#endif
 #ifdef SCREEN_STOPWATCH
   if (activeScreen == ScreenId::Stopwatch) {
     screenManagerTick(activeScreen, now);
