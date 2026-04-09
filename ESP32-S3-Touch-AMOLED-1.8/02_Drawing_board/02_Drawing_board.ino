@@ -10,19 +10,27 @@ HWCDC USBSerial;
 Adafruit_XCA9554 expander;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
-  LCD_CS /* CS */, LCD_SCLK /* SCK */, LCD_SDIO0 /* SDIO0 */, LCD_SDIO1 /* SDIO1 */,
-  LCD_SDIO2 /* SDIO2 */, LCD_SDIO3 /* SDIO3 */);
+  LCD_CS /* CS */,
+  LCD_SCLK /* SCK */,
+  LCD_SDIO0 /* SDIO0 */,
+  LCD_SDIO1 /* SDIO1 */,
+  LCD_SDIO2 /* SDIO2 */,
+  LCD_SDIO3 /* SDIO3 */
+);
 
 Arduino_SH8601 *gfx = new Arduino_SH8601(
-    bus, GFX_NOT_DEFINED /* RST */, 0 /* rotation */, LCD_WIDTH /* width */, LCD_HEIGHT /* height */);
+  bus,
+  GFX_NOT_DEFINED /* RST */,
+  0 /* rotation */,
+  LCD_WIDTH /* width */,
+  LCD_HEIGHT /* height */
+);
 
-std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus =
-  std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
+std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus = std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
 
 void Arduino_IIC_Touch_Interrupt(void);
 
-std::unique_ptr<Arduino_IIC> FT3168(new Arduino_FT3x68(IIC_Bus, FT3168_DEVICE_ADDRESS,
-                                                       DRIVEBUS_DEFAULT_VALUE, TP_INT, Arduino_IIC_Touch_Interrupt));
+std::unique_ptr<Arduino_IIC> FT3168(new Arduino_FT3x68(IIC_Bus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, Arduino_IIC_Touch_Interrupt));
 
 void Arduino_IIC_Touch_Interrupt(void) {
   FT3168->IIC_Interrupt_Flag = true;
@@ -33,8 +41,7 @@ void setup() {
   Wire.begin(IIC_SDA, IIC_SCL);
   if (!expander.begin(0x20)) {  // Replace with actual I2C address if different
     Serial.println("Failed to find XCA9554 chip");
-    while (1)
-      ;
+    while (1);
   }
   expander.pinMode(0, OUTPUT);
   expander.pinMode(1, OUTPUT);
@@ -53,8 +60,10 @@ void setup() {
   }
   USBSerial.println("FT3168 initialization successfully");
 
-  FT3168->IIC_Write_Device_State(FT3168->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
-                                 FT3168->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR);
+  FT3168->IIC_Write_Device_State(
+    FT3168->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
+    FT3168->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR
+  );
 
   gfx->begin();
   gfx->fillScreen(RGB565_WHITE);
@@ -73,12 +82,45 @@ void setup() {
 }
 
 void loop() {
+  static uint32_t touchStartMs = 0;
+  static int32_t holdStartX = -1, holdStartY = -1;
+  const uint32_t HOLD_RESET_MS = 5000;
+  const int32_t HOLD_MAX_MOVE_PX = 24;
+
   int32_t touchX = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
   int32_t touchY = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
 
   if (FT3168->IIC_Interrupt_Flag == true) {
     FT3168->IIC_Interrupt_Flag = false;
     USBSerial.printf("Touch X:%d Y:%d\n", touchX, touchY);
-    if (touchX > 20 && touchY > 20) { gfx->fillCircle(touchX, touchY, 5, RGB565_BLUE); }
+
+    if (touchX > 20 && touchY > 20) {
+      // Start hold detection on first touch
+      if (touchStartMs == 0) {
+        touchStartMs = millis();
+        holdStartX = touchX;
+        holdStartY = touchY;
+      } else {
+        // Cancel hold if moved too far from start position
+        int32_t dx = touchX - holdStartX;
+        int32_t dy = touchY - holdStartY;
+        if (dx * dx + dy * dy > HOLD_MAX_MOVE_PX * HOLD_MAX_MOVE_PX) {
+          touchStartMs = 0;
+        }
+      }
+      gfx->fillCircle(touchX, touchY, 5, RGB565_BLUE);
+    }
+  } else {
+    // No touch events for a while - check if finger is still held
+    if (touchStartMs != 0 && touchX > 20 && touchY > 20) {
+      // Finger still down (no new event means same position)
+      if (millis() - touchStartMs >= HOLD_RESET_MS) {
+        USBSerial.println("Hold detected - clearing screen");
+        gfx->fillScreen(RGB565_WHITE);
+        touchStartMs = 0;
+      }
+    } else {
+      touchStartMs = 0;
+    }
   }
 }
