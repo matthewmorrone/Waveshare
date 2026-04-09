@@ -20,11 +20,9 @@ I2SClass i2s;
 #define I2S_WS_IO 45
 #define I2S_DO_IO 8
 
-// Max recording: 10 seconds of 16-bit stereo @ 16kHz = 640KB
-#define MAX_RECORD_SIZE (EXAMPLE_SAMPLE_RATE * 2 * 2 * 10)
-#define READ_CHUNK 4000
+#define ECHO_BUF_SIZE 4000
 
-const char *TAG = "es8311_recorder";
+const char *TAG = "es8311_live_echo";
 
 Adafruit_XCA9554 expander;
 
@@ -43,9 +41,8 @@ std::unique_ptr<Arduino_IIC> FT3168(new Arduino_FT3x68(
 volatile bool touchFlag = false;
 void Arduino_IIC_Touch_Interrupt(void) { touchFlag = true; }
 
-static uint8_t *rec_buf = nullptr;
-static size_t rec_len = 0;
-static bool touching = false;
+static uint8_t echo_buf[ECHO_BUF_SIZE];
+static bool active = false;
 
 esp_err_t es8311_codec_init(void) {
   es8311_handle_t es_handle = es8311_create(I2C_NUM, ES8311_ADDRRES_0);
@@ -63,14 +60,6 @@ esp_err_t es8311_codec_init(void) {
   ESP_RETURN_ON_ERROR(es8311_voice_volume_set(es_handle, EXAMPLE_VOICE_VOLUME, NULL), TAG, "set volume failed");
   ESP_RETURN_ON_ERROR(es8311_microphone_gain_set(es_handle, EXAMPLE_MIC_GAIN), TAG, "set mic gain failed");
   return ESP_OK;
-}
-
-bool isTouching() {
-  if (touchFlag) {
-    touchFlag = false;
-    return true;
-  }
-  return false;
 }
 
 void setup() {
@@ -115,47 +104,29 @@ void setup() {
 
   es8311_codec_init();
 
-  rec_buf = (uint8_t *)ps_malloc(MAX_RECORD_SIZE);
-  if (!rec_buf) {
-    rec_buf = (uint8_t *)malloc(MAX_RECORD_SIZE);
-  }
-  if (!rec_buf) {
-    Serial.println("Record buffer alloc failed");
-  }
-
-  Serial.println("Ready — touch to record, release to play");
+  Serial.println("Ready — touch screen for live echo");
 }
 
 void loop() {
-  bool nowTouching = isTouching();
+  bool nowTouching = touchFlag;
+  if (touchFlag) touchFlag = false;
 
-  // Touch just started — begin recording
-  if (nowTouching && !touching) {
-    touching = true;
-    rec_len = 0;
-    gfx->fillScreen(0xF800);  // red = recording
-    Serial.println("Recording...");
+  if (nowTouching && !active) {
+    active = true;
+    gfx->fillScreen(0xF800);  // red = live echo active
+    Serial.println("Echo ON");
+  } else if (!nowTouching && active) {
+    active = false;
+    gfx->fillScreen(0x0000);  // black = idle
+    Serial.println("Echo OFF");
   }
 
-  // Still touching — keep recording
-  if (touching) {
-    if (nowTouching) {
-      if (rec_buf && rec_len + READ_CHUNK <= MAX_RECORD_SIZE) {
-        size_t bytes_read = i2s.readBytes((char *)rec_buf + rec_len, READ_CHUNK);
-        if (bytes_read > 0) rec_len += bytes_read;
-      }
-    } else {
-      // Released — play back
-      touching = false;
-      gfx->fillScreen(0xFFFF);  // white = playback
-      Serial.printf("Playing %d bytes...\n", rec_len);
-      if (rec_buf && rec_len > 0) {
-        i2s.write(rec_buf, rec_len);
-      }
-      gfx->fillScreen(0x0000);  // black = idle
-      Serial.println("Ready");
+  if (active) {
+    size_t bytes_read = i2s.readBytes((char *)echo_buf, ECHO_BUF_SIZE);
+    if (bytes_read > 0) {
+      i2s.write(echo_buf, bytes_read);
     }
+  } else {
+    delay(10);
   }
-
-  delay(5);
 }

@@ -2,7 +2,7 @@
 #include "Arduino_GFX_Library.h"
 #include "Arduino_DriveBus_Library.h"
 #include "pin_config.h"
-#include "ui_b.h"
+#include "ui_b.h"  // local copy — edit button positions here
 #include <Adafruit_XCA9554.h>
 
 #include "HWCDC.h"
@@ -20,19 +20,27 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf[screenWidth * screenHeight / 10];
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
-  LCD_CS /* CS */, LCD_SCLK /* SCK */, LCD_SDIO0 /* SDIO0 */, LCD_SDIO1 /* SDIO1 */,
-  LCD_SDIO2 /* SDIO2 */, LCD_SDIO3 /* SDIO3 */);
+  LCD_CS /* CS */, 
+  LCD_SCLK /* SCK */, 
+  LCD_SDIO0 /* SDIO0 */, 
+  LCD_SDIO1 /* SDIO1 */,
+  LCD_SDIO2 /* SDIO2 */, 
+  LCD_SDIO3 /* SDIO3 */
+);
 
 Arduino_SH8601 *gfx = new Arduino_SH8601(
-    bus, GFX_NOT_DEFINED /* RST */, 0 /* rotation */, LCD_WIDTH /* width */, LCD_HEIGHT /* height */);
+  bus,
+  GFX_NOT_DEFINED /* RST */,
+  0 /* rotation */,
+  LCD_WIDTH /* width */,
+  LCD_HEIGHT /* height */
+);
 
-std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus =
-  std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
+std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus = std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
 
 void Arduino_IIC_Touch_Interrupt(void);
 
-std::unique_ptr<Arduino_IIC> FT3168(new Arduino_FT3x68(IIC_Bus, FT3168_DEVICE_ADDRESS,
-                                                       DRIVEBUS_DEFAULT_VALUE, TP_INT, Arduino_IIC_Touch_Interrupt));
+std::unique_ptr<Arduino_IIC> FT3168(new Arduino_FT3x68(IIC_Bus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, Arduino_IIC_Touch_Interrupt));
 
 void Arduino_IIC_Touch_Interrupt(void) {
   FT3168->IIC_Interrupt_Flag = true;
@@ -102,8 +110,7 @@ void setup() {
   Wire.begin(IIC_SDA, IIC_SCL);
   if (!expander.begin(0x20)) {  // Replace with actual I2C address if different
     Serial.println("Failed to find XCA9554 chip");
-    while (1)
-      ;
+    while (1);
   }
 
   expander.pinMode(0, OUTPUT);
@@ -138,9 +145,10 @@ void setup() {
   lv_log_register_print_cb(my_print); /* register print function for debugging */
 #endif
 
-  FT3168->IIC_Write_Device_State(FT3168->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
-                                 FT3168->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR);
-
+  FT3168->IIC_Write_Device_State(
+    FT3168->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
+    FT3168->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR
+  );
 
   lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * screenHeight / 10);
 

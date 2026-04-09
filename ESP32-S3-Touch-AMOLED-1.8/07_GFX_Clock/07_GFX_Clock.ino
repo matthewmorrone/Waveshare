@@ -34,7 +34,7 @@ static uint8_t conv2d(const char *p)
   return (10 * (*p - '0')) + (*++p - '0');
 }
 
-static int16_t w, h, center;
+static int16_t w, h, center, cx, cy;
 static int16_t hHandLen, mHandLen, sHandLen, markLen;
 static float sdeg, mdeg, hdeg;
 static int16_t osx = 0, osy = 0, omx = 0, omy = 0, ohx = 0, ohy = 0; // Saved H, M, S x & y coords
@@ -43,9 +43,98 @@ static int16_t xMin, yMin, xMax, yMax;                               // RGB565_R
 static int16_t hh, mm, ss;
 static unsigned long targetTime; // next action time
 
-static int16_t *cached_points;
-static uint16_t cached_points_idx = 0;
-static int16_t *last_cached_point;
+// Previous hand endpoints for erase
+static int16_t psx = -1, psy = -1, pmx = -1, pmy = -1, phx = -1, phy = -1;
+
+// Blend fg over bg in RGB565 by alpha (0..255)
+static inline uint16_t blend565(uint16_t bg, uint16_t fg, uint8_t a)
+{
+  uint16_t br = (bg >> 11) & 0x1F;
+  uint16_t bgn = (bg >> 5) & 0x3F;
+  uint16_t bb = bg & 0x1F;
+  uint16_t fr = (fg >> 11) & 0x1F;
+  uint16_t fgn = (fg >> 5) & 0x3F;
+  uint16_t fb = fg & 0x1F;
+  uint16_t r = (br * (255 - a) + fr * a) / 255;
+  uint16_t g = (bgn * (255 - a) + fgn * a) / 255;
+  uint16_t b = (bb * (255 - a) + fb * a) / 255;
+  return (r << 11) | (g << 5) | b;
+}
+
+static inline void wu_plot(int16_t x, int16_t y, uint16_t color, uint8_t alpha)
+{
+  if (alpha == 0) return;
+  uint16_t c = (color == BACKGROUND) ? BACKGROUND : blend565(BACKGROUND, color, alpha);
+  gfx->writePixel(x, y, c);
+}
+
+// Xiaolin Wu antialiased line (single pixel thick)
+static void draw_line_aa_1(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color)
+{
+  bool steep = abs(y1 - y0) > abs(x1 - x0);
+  if (steep) { int16_t t = x0; x0 = y0; y0 = t; t = x1; x1 = y1; y1 = t; }
+  if (x0 > x1) { int16_t t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; }
+
+  float dx = x1 - x0;
+  float dy = y1 - y0;
+  float gradient = (dx == 0.0f) ? 1.0f : dy / dx;
+  float intery = y0 + gradient;
+
+  // Endpoints (solid)
+  if (steep) {
+    wu_plot(y0, x0, color, 255);
+    wu_plot(y1, x1, color, 255);
+  } else {
+    wu_plot(x0, y0, color, 255);
+    wu_plot(x1, y1, color, 255);
+  }
+
+  for (int16_t x = x0 + 1; x < x1; x++) {
+    int16_t iy = (int16_t)intery;
+    float frac = intery - iy;
+    uint8_t a1 = (uint8_t)((1.0f - frac) * 255);
+    uint8_t a2 = (uint8_t)(frac * 255);
+    if (steep) {
+      wu_plot(iy, x, color, a1);
+      wu_plot(iy + 1, x, color, a2);
+    } else {
+      wu_plot(x, iy, color, a1);
+      wu_plot(x, iy + 1, color, a2);
+    }
+    intery += gradient;
+  }
+}
+
+// 2px-thick antialiased line: draw twice, offset by 1px perpendicular.
+static void draw_line_aa(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color)
+{
+  float dx = x1 - x0;
+  float dy = y1 - y0;
+  float len = sqrtf(dx * dx + dy * dy);
+  if (len < 0.5f) {
+    draw_line_aa_1(x0, y0, x1, y1, color);
+    return;
+  }
+  // Perpendicular unit vector
+  int16_t ox = (int16_t)roundf(-dy / len);
+  int16_t oy = (int16_t)roundf(dx / len);
+  draw_line_aa_1(x0, y0, x1, y1, color);
+  draw_line_aa_1(x0 + ox, y0 + oy, x1 + ox, y1 + oy, color);
+}
+
+// Like draw_line_aa but starts at distance `skip` from (x0,y0) along the line.
+// Used to erase old hands without touching the center hub.
+static void draw_line_aa_skip(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color, int16_t skip)
+{
+  float dx = x1 - x0;
+  float dy = y1 - y0;
+  float len = sqrtf(dx * dx + dy * dy);
+  if (len <= skip) return;
+  float t = skip / len;
+  int16_t sx = (int16_t)(x0 + dx * t);
+  int16_t sy = (int16_t)(y0 + dy * t);
+  draw_line_aa(sx, sy, x1, y1, color);
+}
 
 void setup(void)
 {
@@ -64,19 +153,13 @@ void setup(void)
   // init LCD constant
   w = gfx->width();
   h = gfx->height();
-  if (w < h)
-  {
-    center = w / 2;
-  }
-  else
-  {
-    center = h / 2;
-  }
+  cx = w / 2;
+  cy = h / 2;
+  center = (w < h) ? (w / 2) : (h / 2);
   hHandLen = center * 3 / 8;
   mHandLen = center * 2 / 3;
   sHandLen = center * 5 / 6;
   markLen = sHandLen / 6;
-  cached_points = (int16_t *)malloc((hHandLen + 1 + mHandLen + 1 + sHandLen + 1) * 2 * 2);
 
   // Draw 60 clock marks
   draw_round_clock_mark(
@@ -117,21 +200,48 @@ void loop()
 
   // Pre-compute hand degrees, x & y coords for a fast screen update
   sdeg = SIXTIETH_RADIAN * ((0.001 * (cur_millis % 1000)) + ss); // 0-59 (includes millis)
-  nsx = cos(sdeg - RIGHT_ANGLE_RADIAN) * sHandLen + center;
-  nsy = sin(sdeg - RIGHT_ANGLE_RADIAN) * sHandLen + center;
+  nsx = cos(sdeg - RIGHT_ANGLE_RADIAN) * sHandLen + cx;
+  nsy = sin(sdeg - RIGHT_ANGLE_RADIAN) * sHandLen + cy;
   if ((nsx != osx) || (nsy != osy))
   {
     mdeg = (SIXTIETH * sdeg) + (SIXTIETH_RADIAN * mm); // 0-59 (includes seconds)
     hdeg = (TWELFTH * mdeg) + (TWELFTH_RADIAN * hh);   // 0-11 (includes minutes)
     mdeg -= RIGHT_ANGLE_RADIAN;
     hdeg -= RIGHT_ANGLE_RADIAN;
-    nmx = cos(mdeg) * mHandLen + center;
-    nmy = sin(mdeg) * mHandLen + center;
-    nhx = cos(hdeg) * hHandLen + center;
-    nhy = sin(hdeg) * hHandLen + center;
+    nmx = cos(mdeg) * mHandLen + cx;
+    nmy = sin(mdeg) * mHandLen + cy;
+    nhx = cos(hdeg) * hHandLen + cx;
+    nhy = sin(hdeg) * hHandLen + cy;
 
-    // RGB565_REDraw hands
-    RGB565_REDraw_hands_cached_draw_and_erase();
+    // Redraw hands with antialiasing — draw new first, then erase old,
+    // then redraw everything on top so there's never a blank frame.
+    gfx->startWrite();
+    draw_line_aa(cx, cy, nhx, nhy, HOUR_COLOR);
+    draw_line_aa(cx, cy, nmx, nmy, MINUTE_COLOR);
+    draw_line_aa(cx, cy, nsx, nsy, SECOND_COLOR);
+    // Erase previous hands, skipping the center hub where all hands overlap
+    int16_t skipR = hHandLen + 2;
+    if (psx >= 0 && (psx != nsx || psy != nsy)) {
+      draw_line_aa_skip(cx, cy, psx, psy, BACKGROUND, skipR);
+    }
+    if (pmx >= 0 && (pmx != nmx || pmy != nmy)) {
+      draw_line_aa_skip(cx, cy, pmx, pmy, BACKGROUND, skipR);
+    }
+    if (phx >= 0 && (phx != nhx || phy != nhy)) {
+      draw_line_aa(cx, cy, phx, phy, BACKGROUND);
+    }
+    // Redraw marks (cheap) and hands on top to repair any damage
+    draw_round_clock_mark(
+        center - markLen, center,
+        center - (markLen * 2 / 3), center,
+        center - (markLen / 2), center);
+    draw_line_aa(cx, cy, nhx, nhy, HOUR_COLOR);
+    draw_line_aa(cx, cy, nmx, nmy, MINUTE_COLOR);
+    draw_line_aa(cx, cy, nsx, nsy, SECOND_COLOR);
+    gfx->endWrite();
+    phx = nhx; phy = nhy;
+    pmx = nmx; pmy = nmy;
+    psx = nsx; psy = nsy;
 
     ohx = nhx;
     ohy = nhy;
@@ -174,12 +284,12 @@ void draw_round_clock_mark(int16_t innerR1, int16_t outerR1, int16_t innerR2, in
     mdeg = (SIXTIETH_RADIAN * i) - RIGHT_ANGLE_RADIAN;
     x = cos(mdeg);
     y = sin(mdeg);
-    x0 = x * outerR + center;
-    y0 = y * outerR + center;
-    x1 = x * innerR + center;
-    y1 = y * innerR + center;
+    x0 = x * outerR + cx;
+    y0 = y * outerR + cy;
+    x1 = x * innerR + cx;
+    y1 = y * innerR + cy;
 
-    gfx->drawLine(x0, y0, x1, y1, c);
+    draw_line_aa(x0, y0, x1, y1, c);
   }
 }
 
@@ -246,113 +356,3 @@ void draw_square_clock_mark(int16_t innerR1, int16_t outerR1, int16_t innerR2, i
   }
 }
 
-void RGB565_REDraw_hands_cached_draw_and_erase()
-{
-  gfx->startWrite();
-  draw_and_erase_cached_line(center, center, nsx, nsy, SECOND_COLOR, cached_points, sHandLen + 1, false, false);
-  draw_and_erase_cached_line(center, center, nhx, nhy, HOUR_COLOR, cached_points + ((sHandLen + 1) * 2), hHandLen + 1, true, false);
-  draw_and_erase_cached_line(center, center, nmx, nmy, MINUTE_COLOR, cached_points + ((sHandLen + 1 + hHandLen + 1) * 2), mHandLen + 1, true, true);
-  gfx->endWrite();
-}
-
-void draw_and_erase_cached_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t color, int16_t *cache, int16_t cache_len, bool cross_check_second, bool cross_check_hour)
-{
-#if defined(ESP8266)
-  yield();
-#endif
-  bool steep = _diff(y1, y0) > _diff(x1, x0);
-  if (steep)
-  {
-    _swap_int16_t(x0, y0);
-    _swap_int16_t(x1, y1);
-  }
-
-  int16_t dx, dy;
-  dx = _diff(x1, x0);
-  dy = _diff(y1, y0);
-
-  int16_t err = dx / 2;
-  int8_t xstep = (x0 < x1) ? 1 : -1;
-  int8_t ystep = (y0 < y1) ? 1 : -1;
-  x1 += xstep;
-  int16_t x, y, ox, oy;
-  for (uint16_t i = 0; i <= dx; i++)
-  {
-    if (steep)
-    {
-      x = y0;
-      y = x0;
-    }
-    else
-    {
-      x = x0;
-      y = y0;
-    }
-    ox = *(cache + (i * 2));
-    oy = *(cache + (i * 2) + 1);
-    if ((x == ox) && (y == oy))
-    {
-      if (cross_check_second || cross_check_hour)
-      {
-        write_cache_pixel(x, y, color, cross_check_second, cross_check_hour);
-      }
-    }
-    else
-    {
-      write_cache_pixel(x, y, color, cross_check_second, cross_check_hour);
-      if ((ox > 0) || (oy > 0))
-      {
-        write_cache_pixel(ox, oy, BACKGROUND, cross_check_second, cross_check_hour);
-      }
-      *(cache + (i * 2)) = x;
-      *(cache + (i * 2) + 1) = y;
-    }
-    if (err < dy)
-    {
-      y0 += ystep;
-      err += dx;
-    }
-    err -= dy;
-    x0 += xstep;
-  }
-  for (uint16_t i = dx + 1; i < cache_len; i++)
-  {
-    ox = *(cache + (i * 2));
-    oy = *(cache + (i * 2) + 1);
-    if ((ox > 0) || (oy > 0))
-    {
-      write_cache_pixel(ox, oy, BACKGROUND, cross_check_second, cross_check_hour);
-    }
-    *(cache + (i * 2)) = 0;
-    *(cache + (i * 2) + 1) = 0;
-  }
-}
-
-void write_cache_pixel(int16_t x, int16_t y, int16_t color, bool cross_check_second, bool cross_check_hour)
-{
-  int16_t *cache = cached_points;
-  if (cross_check_second)
-  {
-    for (uint16_t i = 0; i <= sHandLen; i++)
-    {
-      if ((x == *(cache++)) && (y == *(cache)))
-      {
-        return;
-      }
-      cache++;
-    }
-  }
-  if (cross_check_hour)
-  {
-    cache = cached_points + ((sHandLen + 1) * 2);
-    for (uint16_t i = 0; i <= hHandLen; i++)
-    {
-      if ((x == *(cache++)) && (y == *(cache)))
-      {
-        return;
-      }
-      cache++;
-    }
-  }
-  gfx->writePixel(x, y, color);
-}

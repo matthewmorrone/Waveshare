@@ -44,8 +44,8 @@ Arduino_DataBus *bus = new Arduino_ESP32QSPI(
 Arduino_SH8601 *gfx = new Arduino_SH8601(
     bus, GFX_NOT_DEFINED /* RST */, 0 /* rotation */, LCD_WIDTH /* width */, LCD_HEIGHT /* height */);
 
-std::shaRGB565_RED_ptr<Arduino_IIC_DriveBus> IIC_Bus =
-  std::make_shaRGB565_RED<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
+std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus =
+  std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
 
 const char *ntpServer = "120.25.108.11";
 int net_flag = 0;
@@ -125,10 +125,14 @@ void wifi_init() {
   WiFi.begin(SSID, PWD);
 
   int connect_count = 0;
-  while (WiFi.status() != WL_CONNECTED) {
+  while (WiFi.status() != WL_CONNECTED && connect_count < 20) {
     vTaskDelay(500);
     USBSerial.print(".");
     connect_count++;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    USBSerial.println("WiFi connection failed, continuing without time");
+    return;
   }
 
   USBSerial.println("Wifi connect");
@@ -177,8 +181,6 @@ void display_time() {
 
 void setup() {
   USBSerial.begin(115200); /* prepare for possible serial debug */
-
-  wifi_init();
 
   Wire.begin(IIC_SDA, IIC_SCL);
   if (!expander.begin(0x20)) {  // Replace with actual I2C address if different
@@ -281,6 +283,8 @@ void setup() {
   esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000);
 
   ui_init();
+
+  wifi_init();
 
   USBSerial.println("Setup done");
   xTaskCreatePinnedToCore(Task_my, "Task_my", 20000, NULL, 1, NULL, 1);
