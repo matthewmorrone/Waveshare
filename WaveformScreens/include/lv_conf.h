@@ -25,7 +25,5 @@
 #define LV_FONT_MONTSERRAT_28 1
 #define LV_FONT_MONTSERRAT_36 1
 #define LV_FONT_MONTSERRAT_48 1
-#define LV_FONT_CUSTOM_DECLARE \
-  extern const lv_font_t montserrat_bold_128;
 
 #endif

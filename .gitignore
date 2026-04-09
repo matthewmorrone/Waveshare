@@ -1,8 +1,8 @@
 /Waveform/.pio/
+/WaveformScreens/.pio/
 /.superpowers/
 /.remember/
 /.codex/
-/ESP32-AIChats/xiaozhi-esp32/v2.2.4/ESP32S3/v2.2.4_waveshare-esp32-s3-touch-amoled-1.8.zip
 /esp-idf/
 /esp-idf-tools/
 /esp-idf-component-cache/
@@ -14,3 +14,4 @@ Locket/.pio/
 Reboot/.pio/
 VendorAudioDemo/.pio/
 Locket/tmp/
+WaveformScreens/.pio
