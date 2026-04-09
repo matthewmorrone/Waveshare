@@ -1,5 +1,3 @@
-/Waveform/.pio/
-/WaveformScreens/.pio/
 /.superpowers/
 /.remember/
 /.codex/
@@ -10,8 +8,5 @@
 /lv_micropython/
 /.pip-cache/
 /.pydeps/
-Locket/.pio/
-Reboot/.pio/
-VendorAudioDemo/.pio/
 Locket/tmp/
-WaveformScreens/.pio
+**/.pio/

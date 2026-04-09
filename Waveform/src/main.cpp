@@ -34,6 +34,9 @@ static uint8_t *lvBuffer = nullptr;
 static lv_obj_t *timeLabel, *dateLabel, *timezoneLabel;
 static lv_obj_t *wifiIcon, *btIcon, *batteryTrack, *batteryFill;
 
+// WiFi state
+static bool ntpConfigured = false;
+
 // Screen constants (from WaveformScreens)
 static const int kBatteryTrackWidth = 266;
 static const int kBatteryTrackHeight = 8;
@@ -172,83 +175,95 @@ void updateDisplay() {
   lv_obj_set_style_text_color(wifiIcon, WiFi.isConnected() ? lv_color_white() : lv_color_hex(0x485260), 0);
 }
 
-void setupWiFi() {
-  WiFi.mode(WIFI_STA);
+void syncTimeViaAPI() {
+  Serial.println("Syncing time via worldtimeapi.org fallback...");
+  HTTPClient http;
+  http.begin("http://worldtimeapi.org/api/timezone/America/New_York");
+  int httpCode = http.GET();
 
-  // Scan to prove WiFi radio works
-  Serial.println("Scanning for networks...");
-  int networks = WiFi.scanNetworks();
-  Serial.printf("Found %d networks:\n", networks);
-  for (int i = 0; i < networks && i < 10; i++) {
-    Serial.printf("  [%d] %s (RSSI: %ld)\n", i, WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+  if (httpCode == 200) {
+    String payload = http.getString();
+    int pos = payload.indexOf("\"unixtime\":");
+    if (pos != -1) {
+      int endPos = payload.indexOf(",", pos);
+      String timeStr = payload.substring(pos + 11, endPos);
+      time_t apiTime = timeStr.toInt();
+      Serial.printf("API unix timestamp: %lld\n", (long long)apiTime);
+
+      timeval tv = {apiTime, 0};
+      settimeofday(&tv, nullptr);
+      Serial.println("✓ System time set from API");
+    }
+  } else {
+    Serial.printf("API call failed with code: %d\n", httpCode);
   }
-  Serial.println();
+  http.end();
+}
+
+void handleWiFiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("WiFi connected");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("Got IP: %s\n", WiFi.localIP().toString().c_str());
+
+      if (!ntpConfigured) {
+        // Set DNS servers in case DHCP didn't provide them
+        WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(),
+                    IPAddress(8, 8, 8, 8), IPAddress(8, 8, 4, 4));
+
+        Serial.printf("Requesting NTP sync: tz=%s, servers=%s,%s\n",
+                      TIMEZONE_POSIX, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+        configTzTime(TIMEZONE_POSIX, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
+        ntpConfigured = true;
+
+        // Try API as fallback in case NTP is slow
+        delay(3000);
+        if (time(nullptr) < 1000000000) {  // epoch before ~2001, likely still default
+          syncTimeViaAPI();
+        }
+      }
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("WiFi disconnected");
+      ntpConfigured = false;
+      break;
+
+    default:
+      break;
+  }
+}
+
+void setupWiFi() {
+  WiFi.onEvent(handleWiFiEvent);
+  WiFi.mode(WIFI_STA);
 
   const char *ssids[] = {WIFI_SSID_PRIMARY, WIFI_SSID_SECONDARY, HOTSPOT_SSID};
   const char *passes[] = {WIFI_PASSWORD_PRIMARY, WIFI_PASSWORD_SECONDARY, HOTSPOT_PASSWORD};
 
+  Serial.println("Scanning networks...");
+  int networks = WiFi.scanNetworks();
+  Serial.printf("Found %d networks\n", networks);
+
   for (int i = 0; i < 3; i++) {
-    if (strlen(ssids[i]) == 0) {
-      Serial.printf("Skipping empty SSID at index %d\n", i);
-      continue;
-    }
-    Serial.printf("[%d] Attempting %s...\n", i, ssids[i]);
+    if (strlen(ssids[i]) == 0) continue;
+    Serial.printf("Attempting %s...\n", ssids[i]);
     WiFi.begin(ssids[i], passes[i]);
 
     uint32_t timeout = millis() + 15000;
     while (WiFi.status() != WL_CONNECTED && millis() < timeout) {
       delay(500);
-      Serial.printf("  Status: %d\n", WiFi.status());
     }
 
     if (WiFi.isConnected()) {
-      Serial.printf("✓ Connected to %s! IP: %s\n", ssids[i], WiFi.localIP().toString().c_str());
-
-      // Set DNS servers
-      WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), IPAddress(8, 8, 8, 8), IPAddress(8, 8, 4, 4));
-      Serial.println("DNS configured to 8.8.8.8, 8.8.4.4");
-
-      // Test API call
-      Serial.println("Testing HTTP GET to worldtimeapi.org...");
-      HTTPClient http;
-      http.begin("http://worldtimeapi.org/api/timezone/America/New_York");
-      int httpCode = http.GET();
-      Serial.printf("HTTP Response code: %d\n", httpCode);
-
-      if (httpCode == 200) {
-        String payload = http.getString();
-        Serial.println("API Response (first 200 chars):");
-        Serial.println(payload.substring(0, 200));
-
-        // Extract unix_timestamp from JSON
-        int pos = payload.indexOf("\"unixtime\":");
-        if (pos != -1) {
-          int endPos = payload.indexOf(",", pos);
-          String timeStr = payload.substring(pos + 11, endPos);
-          time_t apiTime = timeStr.toInt();
-          Serial.printf("API unix timestamp: %lld\n", (long long)apiTime);
-
-          // Set system time from API
-          timeval tv = {apiTime, 0};
-          settimeofday(&tv, nullptr);
-          Serial.println("✓ System time set from API");
-        }
-      }
-      http.end();
-
-      Serial.printf("Calling configTzTime with TZ=%s\n", TIMEZONE_POSIX);
-      configTzTime(TIMEZONE_POSIX, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
-      Serial.println("✓ configTzTime completed");
-
-      delay(1000);
-      time_t now = time(nullptr);
-      Serial.printf("Time after sync: epoch=%lld\n", (long long)now);
+      Serial.printf("✓ Connected to %s\n", ssids[i]);
       return;
-    } else {
-      Serial.printf("✗ Failed to connect to %s (final status: %d)\n", ssids[i], WiFi.status());
     }
   }
-  Serial.println("WiFi connection failed - all networks exhausted");
+  Serial.println("WiFi connection failed");
 }
 
 void setup() {
