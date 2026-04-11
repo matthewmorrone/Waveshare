@@ -10,3 +10,4 @@
 /.pydeps/
 Locket/tmp/
 **/.pio/
+.pio-central/
