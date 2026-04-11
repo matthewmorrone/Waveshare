@@ -1,6 +1,7 @@
 #include "screen_constants.h"
 #include "screen_manager.h"
 #include "screen_callbacks.h"
+#include "time_utils.h"
 #include "pin_config.h"
 
 #include <SensorPCF85063.hpp>
@@ -14,8 +15,6 @@ extern bool rtcReady;
 void applyRootStyle(lv_obj_t *obj);
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b);
 bool showScreenById(ScreenId id);
-bool rtcTimeLooksValid(const struct tm &timeInfo);
-bool setSystemTimeFromTm(const struct tm &timeInfo);
 void waveformDestroyCalendarScreen();
 
 namespace
@@ -45,7 +44,7 @@ void populateCalendar(lv_obj_t *container)
 
   lv_obj_clean(container);
 
-  time_t now = time(nullptr);
+  time_t now = waveform::effectiveNow();
   struct tm t = {};
   localtime_r(&now, &t);
   int today = t.tm_mday;
@@ -77,15 +76,11 @@ void populateCalendar(lv_obj_t *container)
   int totalH = kTitleH + kTitleGap + gridH;
   int topY = (LCD_HEIGHT - totalH) / 2;
 
-  char header[32];
-  const char *months[] = {"January", "February", "March", "April", "May", "June",
-                          "July", "August", "September", "October", "November", "December"};
-  snprintf(header, sizeof(header), "%s %d", months[t.tm_mon], t.tm_year + 1900);
-
   lv_obj_t *titleLabel = lv_label_create(container);
   lv_obj_set_style_text_font(titleLabel, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(titleLabel, lvColor(220, 220, 220), 0);
-  lv_label_set_text(titleLabel, header);
+  String header = waveform::formatCurrentLocal("%B %Y", "Calendar");
+  lv_label_set_text(titleLabel, header.c_str());
   lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, topY);
 
   int gridTop = topY + kTitleH + kTitleGap;
@@ -155,12 +150,12 @@ void loadTimeFromRtc()
 
   struct tm rtcTime = {};
   rtc.getDateTime(&rtcTime);
-  if (!rtcTimeLooksValid(rtcTime)) {
+  if (!waveform::rtcTimeLooksValid(rtcTime)) {
     Serial.println("RTC time is not valid yet");
     return;
   }
 
-  if (setSystemTimeFromTm(rtcTime)) {
+  if (waveform::setSystemTimeFromTm(rtcTime)) {
     Serial.printf("Loaded time from RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
                   rtcTime.tm_year + 1900,
                   rtcTime.tm_mon + 1,
@@ -180,6 +175,7 @@ void initRtc()
   }
 
   loadTimeFromRtc();
+  waveform::ensureSystemTimeAtLeastBuildTimestamp();
 }
 
 void watchShowCalendar()

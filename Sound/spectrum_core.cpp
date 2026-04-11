@@ -6,7 +6,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <arduinoFFT.h>
-#include <i2s.h>
+#include <driver/i2s.h>
 #include <math.h>
 
 namespace spectrum_core
@@ -18,7 +18,7 @@ constexpr uint32_t kI2cFreq = 400000;
 constexpr uint32_t kSampleRate = 16000;
 constexpr uint16_t kSampleCount = 128;
 constexpr float kMinHz = 300.0f;
-constexpr float kNoiseGate = 0.02f;
+constexpr float kNoiseGate = 0.003f;
 constexpr float kCompressionExponent = 1.35f;
 constexpr float kTrebleBoost = 1.4f;
 
@@ -90,7 +90,7 @@ bool codecInitForMic()
   if (es8311_microphone_config(gCodec, false) != ESP_OK) {
     return false;
   }
-  es8311_microphone_gain_set(gCodec, ES8311_MIC_GAIN_18DB);
+  es8311_microphone_gain_set(gCodec, ES8311_MIC_GAIN_MAX);
   return true;
 }
 
@@ -118,7 +118,7 @@ void fftToBands24(const float *mag, uint8_t *out)
     }
     magnitude /= static_cast<float>(k1 - k0 + 1);
 
-    float value = magnitude / 7000.0f;
+    float value = magnitude / 900.0f;
     value = constrain(value, 0.0f, 1.0f);
     value = powf(value, 0.60f);
 

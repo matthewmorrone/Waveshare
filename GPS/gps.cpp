@@ -1,7 +1,6 @@
 #include "screen_constants.h"
 #include "screen_manager.h"
 #ifdef SCREEN_GPS
-#include "weather_module.h"
 #include "wifi_manager.h"
 #include "screen_callbacks.h"
 #include "geo_state.h"
@@ -15,6 +14,7 @@ lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b);
 void scheduleScreenRefresh(ScreenId id);
 bool otaUpdateInProgress();
 bool lightSleepActive();
+String weatherUpdatedLabel();
 extern size_t currentScreenIndex;
 void refreshGpsScreen();
 

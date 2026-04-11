@@ -17,6 +17,7 @@
 #include "screen_constants.h"
 #include "settings_state.h"
 #include "storage.h"
+#include "time_utils.h"
 #include "wifi_manager.h"
 #include "ble_manager.h"
 
@@ -63,7 +64,6 @@ namespace
 constexpr uint8_t kActiveBrightness = 255;
 constexpr uint16_t kBackgroundColor = 0x0000;
 constexpr uint32_t kLvglBufferRows = 40;
-constexpr time_t kMinValidEpoch = 1704067200;
 constexpr uint32_t kTimeApiFallbackDelayMs = 3000;
 constexpr const char *kTimeApiFallbackUrl = "http://worldtimeapi.org/api/timezone/America/New_York";
 constexpr const char *kPreferencesNamespace = "waveform";
@@ -91,39 +91,22 @@ void handleTouchInterrupt()
 
 bool rtcTimeLooksValid(const struct tm &timeInfo)
 {
-  int year = timeInfo.tm_year + 1900;
-  return year >= 2024 && year <= 2099 &&
-         timeInfo.tm_mon >= 0 && timeInfo.tm_mon <= 11 &&
-         timeInfo.tm_mday >= 1 && timeInfo.tm_mday <= 31 &&
-         timeInfo.tm_hour >= 0 && timeInfo.tm_hour <= 23 &&
-         timeInfo.tm_min >= 0 && timeInfo.tm_min <= 59 &&
-         timeInfo.tm_sec >= 0 && timeInfo.tm_sec <= 59;
+  return waveform::rtcTimeLooksValid(timeInfo);
 }
 
 bool setSystemTimeFromTm(const struct tm &timeInfo)
 {
-  struct tm localTime = timeInfo;
-  localTime.tm_isdst = -1;
-  time_t epoch = mktime(&localTime);
-  if (epoch < kMinValidEpoch) {
-    return false;
-  }
-  timeval tv = {.tv_sec = epoch, .tv_usec = 0};
-  return settimeofday(&tv, nullptr) == 0;
+  return waveform::setSystemTimeFromTm(timeInfo);
 }
 
 bool setSystemTimeFromEpoch(time_t epoch)
 {
-  if (epoch < kMinValidEpoch) {
-    return false;
-  }
-  timeval tv = {.tv_sec = epoch, .tv_usec = 0};
-  return settimeofday(&tv, nullptr) == 0;
+  return waveform::setSystemTimeFromEpoch(epoch);
 }
 
 bool hasValidTime()
 {
-  return time(nullptr) >= kMinValidEpoch;
+  return waveform::hasReasonableTime();
 }
 
 bool syncTimeViaApiFallback()
@@ -453,6 +436,7 @@ void initRtc()
     return;
   }
   loadTimeFromRtc();
+  waveform::ensureSystemTimeAtLeastBuildTimestamp();
 }
 
 void applyConfiguredTimezone()

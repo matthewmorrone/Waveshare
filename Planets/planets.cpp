@@ -1,12 +1,11 @@
 #include "screen_constants.h"
 #include "screen_manager.h"
 #ifdef SCREEN_PLANETS
-#include "weather_module.h"
 #include "screen_callbacks.h"
+#include "time_utils.h"
 #include <math.h>
 
 extern lv_obj_t *screenRoots[];
-bool hasValidTime();
 void applyRootStyle(lv_obj_t *obj);
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b);
 float compressedOrbitRadius(float distanceAu);
@@ -225,12 +224,12 @@ bool computeApproxPlanetVector(const PlanetApproximation &elements, time_t unixT
 
 bool computeSolarSystemState()
 {
-  if (!hasValidTime()) {
+  time_t now = waveform::effectiveNow();
+  if (now < waveform::minimumReasonableEpoch()) {
     Serial.println("Planets: time is not valid yet");
     return false;
   }
 
-  time_t now = time(nullptr);
   Serial.printf("Planets: computing positions at epoch %ld\n", static_cast<long>(now));
 
   for (size_t i = 0; i < kSolarPlanetCount; ++i) {
@@ -254,14 +253,14 @@ bool computeSolarSystemState()
 
   solarSystemState.hasData = true;
   solarSystemState.stale = false;
-  solarSystemState.updated = weatherUpdatedLabel() + "  Approx";
+  // solarSystemState.updated = weatherUpdatedLabel() + "  Approx";
   nextPlanetsRefreshAtMs = millis() + kSolarRefreshIntervalMs;
   return true;
 }
 
 void startSolarSystemFetch()
 {
-  if (!hasValidTime()) {
+  if (waveform::effectiveNow() < waveform::minimumReasonableEpoch()) {
     setPlanetsUnavailableState("Waiting for time");
     return;
   }
@@ -289,7 +288,7 @@ void updatePlanets()
     return;
   }
 
-  if (!hasValidTime()) {
+  if (waveform::effectiveNow() < waveform::minimumReasonableEpoch()) {
     if (!solarSystemState.hasData) {
       setPlanetsUnavailableState("Waiting for time");
       refreshPlanetsScreen();

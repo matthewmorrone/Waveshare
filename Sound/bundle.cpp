@@ -4,7 +4,7 @@
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
 #include <arduinoFFT.h>
-#include <i2s.h>
+#include <driver/i2s.h>
 #include <lvgl.h>
 
 #include "pin_config.h"
@@ -21,7 +21,7 @@ constexpr uint16_t kSampleCount = 128;
 constexpr int kBands = 24;
 constexpr int kVisualBars = 32;
 constexpr float kMinHz = 300.0f;
-constexpr float kNoiseGate = 0.02f;
+constexpr float kNoiseGate = 0.003f;
 constexpr float kCompressionExponent = 1.35f;
 constexpr float kTrebleBoost = 1.4f;
 constexpr uint32_t kUiRefreshMs = 40;
@@ -178,7 +178,7 @@ bool initCodecForMic()
   if (es8311_microphone_config(gCodec, false) != ESP_OK) {
     return false;
   }
-  es8311_microphone_gain_set(gCodec, ES8311_MIC_GAIN_18DB);
+  es8311_microphone_gain_set(gCodec, ES8311_MIC_GAIN_MAX);
   return true;
 }
 
@@ -234,7 +234,7 @@ void fftToBands(const float *mag, uint8_t *out)
     }
     magnitude /= static_cast<float>(k1 - k0 + 1);
 
-    float value = magnitude / 7000.0f;
+    float value = magnitude / 900.0f;
     value = constrain(value, 0.0f, 1.0f);
     value = powf(value, 0.60f);
 

@@ -6,6 +6,7 @@
 #include "battery.h"
 #include "ble_manager.h"
 #include "storage.h"
+#include "time_utils.h"
 #include "wifi_manager.h"
 #include "screen_callbacks.h"
 #include <WiFi.h>
@@ -73,16 +74,7 @@ const char *connectivityLabel()
 
 String localClockText()
 {
-  time_t now = time(nullptr);
-  if (now < 1704067200) {
-    return String("Waiting for RTC or Wi-Fi");
-  }
-
-  struct tm localTime = {};
-  localtime_r(&now, &localTime);
-  char buffer[40];
-  strftime(buffer, sizeof(buffer), "%a %b %d  %H:%M:%S", &localTime);
-  return String(buffer);
+  return waveform::formatCurrentLocal("%a %b %d  %H:%M:%S", "Waiting for RTC or Wi-Fi");
 }
 
 String formatUptime()

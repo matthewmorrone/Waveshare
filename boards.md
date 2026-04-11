@@ -3,21 +3,65 @@
 These folders are standalone PlatformIO projects that reuse shared code from `Shared` while enabling only the screen profile they need.
 
 Current standalone projects:
-- `Launcher`
-- `Watch` (includes `Calendar` until that file is split)
-- `Motion`
-- `Weather` (includes `WeatherHourly` and `WeatherDaily` until that file is split)
-- `Gps`
-- `Planets`
-- `Stars`
-- `Recorder`
-- `Qr`
+- `flash Calculator`
+- `flash Calendar`
+- `flash Cube`
+- `flash GPS`
+- `flash IMU`
+- `flash Launcher`
+- `flash Locket`
+- `flash Motion`
+- `flash Planets`
+- `flash QR`
+- `flash Radio`
+- `flash Reboot`
+- `flash Recorder`
+- `flash Settings`
+- `flash Shared`
+- `flash Sound`
+- `flash Spectrum`
+- `flash Stars`
+- `flash Stopwatch`
+- `flash System`
+- `flash Timer`
+- `flash Watch`
+- `flash Weather`
+- `flash WeatherDaily`
+- `flash WeatherHourly`
+
+- `Examples`
+
+## Current Status
+
+Verified working:
 - `Calculator`
-- `Stopwatch`
-- `Timer`
-- `System`
+- `Calendar`
+- `Cube`
+- `GPS`
+- `IMU`
+- `Launcher`
+- `Locket`
+- `Motion`
+- `Planets`
+- `QR`
+- `Recorder`
 - `Settings`
-- `Sound`
+- `Stars`
+- `Stopwatch`
+- `System`
+- `Timer`
+- `Watch`
+- `Weather`
+- `WeatherDaily`
+- `WeatherHourly`
+
+Not working:
 - `Radio`
-- `WaveformLocket`
-- `Orb`
+- `Sound`
+- `Spectrum`
+
+Needs re-verification:
+- `Reboot`
+
+Notes:
+- `Shared` is not a standalone PlatformIO screen target, so `flash Shared` is not a valid standalone build in the same sense as the others.

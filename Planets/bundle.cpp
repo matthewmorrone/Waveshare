@@ -13,6 +13,7 @@
 #include "pin_config.h"
 #include "screen_manager.h"
 #include "screen_callbacks.h"
+#include "time_utils.h"
 void updatePlanets();
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
@@ -45,8 +46,6 @@ constexpr uint32_t kLvglBufferRows = 40;
 constexpr uint32_t kWifiConnectTimeoutMs = 12000;
 constexpr uint32_t kWifiRetryIntervalMs = 30000;
 constexpr uint32_t kMemoryReportIntervalMs = 10000;
-constexpr time_t kMinValidEpoch = 1704067200;
-
 uint8_t *lvBuffer = nullptr;
 bool expanderReady = false;
 bool wifiAttemptInProgress = false;
@@ -108,21 +107,12 @@ bool lightSleepActive()
 
 bool hasValidTime()
 {
-  return time(nullptr) >= kMinValidEpoch;
+  return waveform::effectiveNow() >= waveform::minimumReasonableEpoch();
 }
 
 String weatherUpdatedLabel()
 {
-  time_t now = time(nullptr);
-  if (now <= 0) {
-    return "Updated";
-  }
-
-  struct tm localTime = {};
-  localtime_r(&now, &localTime);
-  char buffer[32];
-  strftime(buffer, sizeof(buffer), "Updated %H:%M", &localTime);
-  return String(buffer);
+  return String("Updated ") + waveform::formatCurrentLocal("%H:%M", "--:--");
 }
 
 float compressedOrbitRadius(float distanceAu)
@@ -186,61 +176,20 @@ void setupLvgl()
   lv_display_set_flush_cb(display, flushDisplay);
 }
 
-int monthFromBuildString(const char *month)
-{
-  if (strcmp(month, "Jan") == 0) return 0;
-  if (strcmp(month, "Feb") == 0) return 1;
-  if (strcmp(month, "Mar") == 0) return 2;
-  if (strcmp(month, "Apr") == 0) return 3;
-  if (strcmp(month, "May") == 0) return 4;
-  if (strcmp(month, "Jun") == 0) return 5;
-  if (strcmp(month, "Jul") == 0) return 6;
-  if (strcmp(month, "Aug") == 0) return 7;
-  if (strcmp(month, "Sep") == 0) return 8;
-  if (strcmp(month, "Oct") == 0) return 9;
-  if (strcmp(month, "Nov") == 0) return 10;
-  if (strcmp(month, "Dec") == 0) return 11;
-  return 0;
-}
-
 void seedTimeFromBuildIfNeeded()
 {
   if (hasValidTime()) {
     return;
   }
 
-  char month[4] = {};
-  int day = 1;
-  int year = 2026;
-  int hour = 0;
-  int minute = 0;
-  int second = 0;
-
-  if (sscanf(__DATE__, "%3s %d %d", month, &day, &year) != 3) {
-    return;
-  }
-  if (sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second) != 3) {
-    return;
-  }
-
-  struct tm buildTm = {};
-  buildTm.tm_year = year - 1900;
-  buildTm.tm_mon = monthFromBuildString(month);
-  buildTm.tm_mday = day;
-  buildTm.tm_hour = hour;
-  buildTm.tm_min = minute;
-  buildTm.tm_sec = second;
-  buildTm.tm_isdst = -1;
-
-  time_t buildEpoch = mktime(&buildTm);
+  time_t buildEpoch = waveform::buildTimestampEpoch();
   if (buildEpoch <= 0) {
     return;
   }
 
-  timeval tv = {};
-  tv.tv_sec = buildEpoch;
-  settimeofday(&tv, nullptr);
-  Serial.printf("Seeded time from build timestamp: %ld\n", static_cast<long>(buildEpoch));
+  if (waveform::ensureSystemTimeAtLeastBuildTimestamp()) {
+    Serial.printf("Seeded time from build timestamp: %ld\n", static_cast<long>(buildEpoch));
+  }
 }
 
 void startWifi()

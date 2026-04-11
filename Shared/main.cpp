@@ -36,6 +36,7 @@
 #include "math_utils.h"
 #include "ota_module.h"
 #include "storage.h"
+#include "time_utils.h"
 #include "wifi_manager.h"
 #include "screen_callbacks.h"
 #include "settings_state.h"
@@ -87,7 +88,6 @@ constexpr int kTapMaxTravelPx = 12;
 constexpr int kTimerFamilySwipeHeaderPx = 88;
 constexpr const char *kPreferencesNamespace = "waveform";
 constexpr const char *kPrefScreenKey = "screen";
-constexpr const char *kPrefMotionViewKey = "motionview";
 constexpr const char *kPrefWeatherCacheKey = "weather";
 constexpr const char *kPrefTimeEpochKey = "time_epoch";
 constexpr bool kPersistCurrentScreen = false;
@@ -152,7 +152,6 @@ bool recorderVoiceClipCaptured();
 void handleTouchInterrupt();
 bool refreshManagedScreen(ScreenId id);
 void noteActivity();
-void saveMotionViewPreference();
 void saveScreenPreference(size_t screenIndex);
 void showNextScreen();
 void showPreviousScreen();
@@ -565,11 +564,6 @@ void showBootSplash(const char *headline, const char *detail)
   gfx->print(detail ? detail : "Starting...");
 }
 
-void saveMotionViewPreference()
-{
-  preferences.putUChar(kPrefMotionViewKey, static_cast<uint8_t>(motionGetViewMode()));
-}
-
 void saveScreenPreference(size_t screenIndex)
 {
   if (!kPersistCurrentScreen) {
@@ -590,30 +584,19 @@ String firmwareUpdatedText()
   return String(text);
 }
 
-void advanceMotionView()
-{
-  motionAdvanceView();
-  saveMotionViewPreference();
-}
-
-void reverseMotionView()
-{
-  motionReverseView();
-  saveMotionViewPreference();
-}
-
 void handleScreenTap()
 {
   ScreenId currentScreen = static_cast<ScreenId>(currentScreenIndex);
 #ifdef SCREEN_MOTION
   if (currentScreen == ScreenId::Motion) {
-    MotionViewMode mode = motionGetViewMode();
-    if (mode == MotionViewMode::Dot) {
-      imuModuleCaptureReference();
-      motionCenterDot();
-    } else if (mode == MotionViewMode::Cube) {
-      imuModuleCaptureReference();
-    }
+    motionHandleTap();
+    noteActivity();
+    return;
+  }
+#endif
+#ifdef SCREEN_CUBE
+  if (currentScreen == ScreenId::Cube) {
+    cubeHandleTap();
     noteActivity();
     return;
   }
@@ -630,20 +613,6 @@ void handleScreenTap()
     return;
   }
 #endif
-}
-
-void handleMotionSwipe(int deltaY)
-{
-  if (deltaY <= -kMotionSwipeMinDistancePx) {
-    advanceMotionView();
-    noteActivity();
-    return;
-  }
-
-  if (deltaY >= kMotionSwipeMinDistancePx) {
-    reverseMotionView();
-    noteActivity();
-  }
 }
 
 bool isWeatherStackScreen(ScreenId screen)
@@ -665,6 +634,21 @@ bool isWeatherStackScreen(ScreenId screen)
          || screen == ScreenId::Stars
 #endif
   ;
+}
+
+bool isImuFamilyScreen(ScreenId screen)
+{
+  return false
+#ifdef SCREEN_MOTION
+         || screen == ScreenId::Motion
+#endif
+#ifdef SCREEN_CUBE
+         || screen == ScreenId::Cube
+#endif
+#ifdef SCREEN_IMU
+         || screen == ScreenId::Imu
+#endif
+      ;
 }
 
 bool isTimerStackScreen(ScreenId screen)
@@ -831,22 +815,13 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
       }
 #endif
     } else if (pressedNow && !touchGestureConsumed &&
-#ifdef SCREEN_MOTION
-               static_cast<ScreenId>(currentScreenIndex) == ScreenId::Motion) {
-#else
                false) {
-#endif
       int deltaX = touchLastX - touchTapStartX;
       int deltaY = touchLastY - touchTapStartY;
       int absDx = abs(deltaX);
       int absDy = abs(deltaY);
-      if (absDy >= kMotionSwipeMinDistancePx &&
-          absDy >= (absDx + kMotionSwipeMinDominancePx)) {
-        handleMotionSwipe(deltaY);
-        touchGestureConsumed = true;
-        touchTapTracking = false;
-      } else if (absDx >= kScreenNavSwipeMinDistancePx &&
-                 absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
+      if (absDx >= kScreenNavSwipeMinDistancePx &&
+          absDx >= (absDy + kScreenNavSwipeMinDominancePx)) {
         handleScreenNavigationSwipe(deltaX);
         touchGestureConsumed = true;
         touchTapTracking = false;
@@ -964,12 +939,6 @@ void readTouch(lv_indev_t *indev, lv_indev_data_t *data)
         if (tapDurationMs <= kTapMaxDurationMs && absDx <= kTapMaxTravelPx && absDy <= kTapMaxTravelPx) {
           handleScreenTap();
         }
-#ifdef SCREEN_MOTION
-      } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Motion &&
-                 absDy >= kMotionSwipeMinDistancePx &&
-                 absDy >= (absDx + kMotionSwipeMinDominancePx)) {
-        handleMotionSwipe(deltaY);
-#endif
 #ifdef SCREEN_QR
       } else if (static_cast<ScreenId>(currentScreenIndex) == ScreenId::Qr &&
                  absDy >= kQrSwipeMinDistancePx &&
@@ -1109,42 +1078,17 @@ void initPower()
 
 bool rtcTimeLooksValid(const struct tm &timeInfo)
 {
-  int year = timeInfo.tm_year + 1900;
-  return year >= 2024 && year <= 2099 &&
-         timeInfo.tm_mon >= 0 && timeInfo.tm_mon <= 11 &&
-         timeInfo.tm_mday >= 1 && timeInfo.tm_mday <= 31 &&
-         timeInfo.tm_hour >= 0 && timeInfo.tm_hour <= 23 &&
-         timeInfo.tm_min >= 0 && timeInfo.tm_min <= 59 &&
-         timeInfo.tm_sec >= 0 && timeInfo.tm_sec <= 59;
+  return waveform::rtcTimeLooksValid(timeInfo);
 }
 
 bool setSystemTimeFromTm(const struct tm &timeInfo)
 {
-  struct tm localTime = timeInfo;
-  localTime.tm_isdst = -1;
-  time_t epoch = mktime(&localTime);
-  if (epoch < kMinValidEpoch) {
-    return false;
-  }
-
-  timeval tv = {
-      .tv_sec = epoch,
-      .tv_usec = 0,
-  };
-  return settimeofday(&tv, nullptr) == 0;
+  return waveform::setSystemTimeFromTm(timeInfo);
 }
 
 bool setSystemTimeFromEpoch(time_t epoch)
 {
-  if (epoch < kMinValidEpoch) {
-    return false;
-  }
-
-  timeval tv = {
-      .tv_sec = epoch,
-      .tv_usec = 0,
-  };
-  return settimeofday(&tv, nullptr) == 0;
+  return waveform::setSystemTimeFromEpoch(epoch);
 }
 
 size_t countConfiguredNetworks()
@@ -1165,7 +1109,7 @@ bool hasConfiguredNetworks()
 
 bool hasValidTime()
 {
-  return time(nullptr) >= kMinValidEpoch;
+  return waveform::hasReasonableTime();
 }
 
 void buildTimezonePosix(int utcOffsetHours, char *buffer, size_t bufferSize)
@@ -1189,37 +1133,17 @@ void applyConfiguredTimezone()
 
 String timeText()
 {
-  if (!hasValidTime()) {
-    return "--:--";
-  }
-
-  char buffer[16];
-  struct tm localTime = {};
-  time_t now = time(nullptr);
-  localtime_r(&now, &localTime);
-  strftime(buffer, sizeof(buffer), "%H:%M", &localTime);
-  return String(buffer);
+  return waveform::formatTimeText(settingsState().use24hClock);
 }
 
 String dateText()
 {
-  if (!hasValidTime()) {
-    return "Waiting for RTC or Wi-Fi";
-  }
-
-  char buffer[20];
-  struct tm localTime = {};
-  time_t now = time(nullptr);
-  localtime_r(&now, &localTime);
-  strftime(buffer, sizeof(buffer), "%a %d %m", &localTime);
-  return String(buffer);
+  return waveform::formatDateText();
 }
 
 String timezoneText()
 {
-  char buffer[16];
-  snprintf(buffer, sizeof(buffer), "UTC%+d", settingsState().utcOffsetHours);
-  return String(buffer);
+  return waveform::formatTimezoneText();
 }
 
 void persistTimeToRtc()
@@ -2110,6 +2034,7 @@ void setup()
   if (!hasValidTime()) {
     loadTimeFromPreferences();
   }
+  waveform::ensureSystemTimeAtLeastBuildTimestamp();
   initTouch();
   imuModuleInit();
   sdMounted = false;
@@ -2166,15 +2091,6 @@ void setup()
 #endif
   nextWifiRetryAtMs = 0;
   lastActivityAtMs = millis();
-
-#ifdef SCREEN_MOTION
-  uint8_t savedMotionView = preferences.getUChar(kPrefMotionViewKey, static_cast<uint8_t>(MotionViewMode::Dot));
-  if (savedMotionView < static_cast<uint8_t>(MotionViewMode::Count)) {
-    motionSetViewMode(static_cast<MotionViewMode>(savedMotionView));
-  } else {
-    motionSetViewMode(MotionViewMode::Dot);
-  }
-#endif
 
   setupLvgl();
   showBootSplash("Waveform", "Loading UI...");
@@ -2270,9 +2186,7 @@ void loop()
   if (now - lastStatusRefreshAtMs >= kStatusRefreshMs) {
     lastStatusRefreshAtMs = now;
     if (true
-#ifdef SCREEN_MOTION
-        && activeScreen != ScreenId::Motion
-#endif
+        && !isImuFamilyScreen(activeScreen)
 #ifdef SCREEN_WEATHER
         && activeScreen != ScreenId::Weather
 #endif
@@ -2307,11 +2221,9 @@ void loop()
 
   if (now - lastMotionRefreshAtMs >= kMotionRefreshMs) {
     lastMotionRefreshAtMs = now;
-#ifdef SCREEN_MOTION
-    if (activeScreen == ScreenId::Motion) {
+    if (isImuFamilyScreen(activeScreen)) {
       refreshManagedScreen(activeScreen);
     }
-#endif
   }
 
 

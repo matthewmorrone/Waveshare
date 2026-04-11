@@ -1,14 +1,14 @@
 #include <Arduino.h>
 #include "Arduino_GFX_Library.h"
 #include "Arduino_DriveBus_Library.h"
-#include "pin_config.h"
+#include "../Shared/pin_config.h"
 #include "HWCDC.h"
 #include <Adafruit_XCA9554.h>
 #include <Adafruit_GFX.h>
 #include <Wire.h>
-#include <i2s.h>
+#include <driver/i2s.h>
 #include <arduinoFFT.h>
-#include "font.h"
+#include "../Shared/font.h"
 
 extern "C" {
   #include "es8311.h"
@@ -37,7 +37,7 @@ unsigned short lineCol=0x6D97;
 unsigned short peekLine=0x2B6F;
 
 float FMIN_HZ = 300.0f;
-float NOISE_GATE = 0.02f;
+float NOISE_GATE = 0.003f;
 float COMP_EXP = 1.35f;   // v1 je 1.5  v2 1.1 v3 1.3
 float TREBLE_BOOST = 1.4; // v1 je 1.3  v3 1.8 1.8
 
@@ -207,7 +207,7 @@ void fftToBands24(const float *mag, uint8_t *out) {
     for (int k = k0; k <= k1; k++) m += mag[k];
     m /= (float)(k1 - k0 + 1);
 
-    float v = m / 7000.0f;
+    float v = m / 900.0f;
     v = constrain(v, 0.0f, 1.0f);
     v = powf(v, 0.60f);
 

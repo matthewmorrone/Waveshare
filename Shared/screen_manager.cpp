@@ -19,6 +19,12 @@ static const ScreenModule *const kModulesArr[] = {
 #ifdef SCREEN_MOTION
     &motionScreenModule(),
 #endif
+#ifdef SCREEN_CUBE
+    &cubeScreenModule(),
+#endif
+#ifdef SCREEN_IMU
+    &imuScreenModule(),
+#endif
 #ifdef SCREEN_WEATHER
     &weatherScreenModule(),
 #endif

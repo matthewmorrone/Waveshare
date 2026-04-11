@@ -4,12 +4,10 @@
 #include <lvgl.h>
 #include "runtime_state.h"
 
-// --- Motion view public interface ---
-MotionViewMode motionGetViewMode();
-void motionSetViewMode(MotionViewMode mode);
-void motionAdvanceView();
-void motionReverseView();
+// --- Motion family public interface ---
+void motionHandleTap();
 void motionCenterDot();
+void cubeHandleTap();
 
 struct QrEntry
 {
@@ -57,6 +55,26 @@ bool waveformRefreshMotionScreen();
 void waveformEnterMotionScreen();
 void waveformLeaveMotionScreen();
 void waveformTickMotionScreen(uint32_t nowMs);
+lv_obj_t *waveformMotionTapTarget();
+
+#ifdef SCREEN_CUBE
+lv_obj_t *waveformCubeScreenRoot();
+bool waveformBuildCubeScreen();
+bool waveformRefreshCubeScreen();
+void waveformEnterCubeScreen();
+void waveformLeaveCubeScreen();
+void waveformTickCubeScreen(uint32_t nowMs);
+lv_obj_t *waveformCubeTapTarget();
+#endif
+
+#ifdef SCREEN_IMU
+lv_obj_t *waveformImuScreenRoot();
+bool waveformBuildImuScreen();
+bool waveformRefreshImuScreen();
+void waveformEnterImuScreen();
+void waveformLeaveImuScreen();
+void waveformTickImuScreen(uint32_t nowMs);
+#endif
 
 lv_obj_t *waveformWeatherScreenRoot();
 bool waveformBuildWeatherScreen();

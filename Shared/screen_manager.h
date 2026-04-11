@@ -46,6 +46,12 @@
 #ifdef WAVEFORM_ENABLE_SCREEN_MOTION
 #define SCREEN_MOTION
 #endif
+#ifdef WAVEFORM_ENABLE_SCREEN_CUBE
+#define SCREEN_CUBE
+#endif
+#ifdef WAVEFORM_ENABLE_SCREEN_IMU
+#define SCREEN_IMU
+#endif
 #ifdef WAVEFORM_ENABLE_SCREEN_WEATHER
 #define SCREEN_WEATHER
 #endif
@@ -111,6 +117,12 @@ enum class ScreenId : uint8_t {
 #endif
 #ifdef SCREEN_MOTION
   Motion,
+#endif
+#ifdef SCREEN_CUBE
+  Cube,
+#endif
+#ifdef SCREEN_IMU
+  Imu,
 #endif
 #ifdef SCREEN_WEATHER
   Weather,

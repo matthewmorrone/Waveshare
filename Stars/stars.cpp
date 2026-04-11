@@ -2,13 +2,13 @@
 #include "screen_constants.h"
 #include "screen_manager.h"
 #ifdef SCREEN_STARS
-#include "weather_module.h"
 #include "screen_callbacks.h"
 #include "geo_state.h"
 
 extern lv_obj_t *screenRoots[];
 extern GeoState geoState;
 bool hasValidTime();
+String weatherUpdatedLabel();
 void applyRootStyle(lv_obj_t *obj);
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b);
 float degreesToRadians(float degrees);

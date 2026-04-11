@@ -9,14 +9,6 @@ enum class ConnectivityState : uint8_t
   Online,
 };
 
-enum class MotionViewMode : uint8_t
-{
-  Dot,
-  Cube,
-  Raw,
-  Count,
-};
-
 struct MotionState
 {
   bool valid = false;

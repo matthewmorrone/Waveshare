@@ -11,7 +11,6 @@
 #include "screen_manager.h"
 #include "screen_callbacks.h"
 #include "imu_module.h"
-lv_obj_t *waveformMotionTapTarget();
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     LCD_CS,
@@ -63,10 +62,6 @@ void handleTouchInterrupt()
 void handleMotionScreenClick(lv_event_t *event)
 {
   LV_UNUSED(event);
-  imuModuleCaptureReference();
-  if (motionGetViewMode() == MotionViewMode::Dot) {
-    motionCenterDot();
-  }
 }
 } // namespace
 
@@ -111,7 +106,7 @@ void styleLine(lv_obj_t *line, lv_color_t color, int width)
 
 bool showScreenById(ScreenId id)
 {
-  return id == ScreenId::Motion;
+  return id == ScreenId::Imu;
 }
 
 void flushDisplay(lv_display_t *disp, const lv_area_t *area, uint8_t *pxMap)
@@ -252,16 +247,11 @@ void setup()
   initTouch();
   imuModuleInit();
 
-  waveformBuildMotionScreen();
-  waveformEnterMotionScreen();
+  waveformBuildImuScreen();
+  waveformEnterImuScreen();
 
-  if (lv_obj_t *root = waveformMotionScreenRoot()) {
+  if (lv_obj_t *root = waveformImuScreenRoot()) {
     lv_scr_load(root);
-    lv_obj_t *tapTarget = waveformMotionTapTarget();
-    if (!tapTarget) {
-      tapTarget = root;
-    }
-    lv_obj_add_event_cb(tapTarget, handleMotionScreenClick, LV_EVENT_CLICKED, nullptr);
   }
 
   lastRefreshAtMs = millis();
@@ -274,7 +264,7 @@ void loop()
 
   if (now - lastRefreshAtMs >= kMotionRefreshMs) {
     lastRefreshAtMs = now;
-    waveformTickMotionScreen(now);
+    waveformTickImuScreen(now);
   }
 
   lv_timer_handler();

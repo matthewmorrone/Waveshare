@@ -11,7 +11,6 @@
 #include "screen_manager.h"
 #include "screen_callbacks.h"
 #include "imu_module.h"
-lv_obj_t *waveformMotionTapTarget();
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     LCD_CS,
@@ -63,10 +62,7 @@ void handleTouchInterrupt()
 void handleMotionScreenClick(lv_event_t *event)
 {
   LV_UNUSED(event);
-  imuModuleCaptureReference();
-  if (motionGetViewMode() == MotionViewMode::Dot) {
-    motionCenterDot();
-  }
+  motionHandleTap();
 }
 } // namespace
 

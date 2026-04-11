@@ -6,6 +6,7 @@ extern const lv_font_t montserrat_bold_128;
 #include "wifi_manager.h"
 #include "screen_callbacks.h"
 #include "settings_state.h"
+#include "time_utils.h"
 #include <SensorPCF85063.hpp>
 #include <WiFi.h>
 #include <Wire.h>
@@ -23,11 +24,8 @@ String dateText();
 String timezoneText();
 void enableTapBubbling(lv_obj_t *obj);
 bool showScreenById(ScreenId id);
-// Symbols from main.cpp
 extern bool rtcReady;
 extern SensorPCF85063 rtc;
-bool rtcTimeLooksValid(const struct tm &timeInfo);
-bool setSystemTimeFromTm(const struct tm &timeInfo);
 
 extern lv_obj_t *watchTimeLabel;
 extern lv_obj_t *watchTimeRow;
@@ -151,12 +149,12 @@ void loadTimeFromRtc()
 
   struct tm rtcTime = {};
   rtc.getDateTime(&rtcTime);
-  if (!rtcTimeLooksValid(rtcTime)) {
+  if (!waveform::rtcTimeLooksValid(rtcTime)) {
     Serial.println("RTC time is not valid yet");
     return;
   }
 
-  if (setSystemTimeFromTm(rtcTime)) {
+  if (waveform::setSystemTimeFromTm(rtcTime)) {
     Serial.printf("Loaded time from RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
                   rtcTime.tm_year + 1900,
                   rtcTime.tm_mon + 1,
@@ -176,6 +174,7 @@ void initRtc()
   }
 
   loadTimeFromRtc();
+  waveform::ensureSystemTimeAtLeastBuildTimestamp();
 }
 
 void buildWatchScreen()

@@ -22,6 +22,7 @@
 #include "ota_module.h"
 #include "screen_callbacks.h"
 #include "settings_state.h"
+#include "time_utils.h"
 #include "weather_module.h"
 
 #include <XPowersLib.h>
@@ -260,12 +261,12 @@ void loadTimeFromRtc()
 
   struct tm rtcTime = {};
   rtc.getDateTime(&rtcTime);
-  if (!rtcTimeLooksValid(rtcTime)) {
+  if (!waveform::rtcTimeLooksValid(rtcTime)) {
     Serial.println("RTC time is not valid yet");
     return;
   }
 
-  if (setSystemTimeFromTm(rtcTime)) {
+  if (waveform::setSystemTimeFromTm(rtcTime)) {
     Serial.printf("Loaded time from RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
                   rtcTime.tm_year + 1900,
                   rtcTime.tm_mon + 1,
@@ -285,82 +286,42 @@ void initRtc()
   }
 
   loadTimeFromRtc();
+  waveform::ensureSystemTimeAtLeastBuildTimestamp();
 }
 
 bool rtcTimeLooksValid(const struct tm &timeInfo)
 {
-  int year = timeInfo.tm_year + 1900;
-  return year >= 2024 && year <= 2099 &&
-         timeInfo.tm_mon >= 0 && timeInfo.tm_mon <= 11 &&
-         timeInfo.tm_mday >= 1 && timeInfo.tm_mday <= 31 &&
-         timeInfo.tm_hour >= 0 && timeInfo.tm_hour <= 23 &&
-         timeInfo.tm_min >= 0 && timeInfo.tm_min <= 59 &&
-         timeInfo.tm_sec >= 0 && timeInfo.tm_sec <= 59;
+  return waveform::rtcTimeLooksValid(timeInfo);
 }
 
 bool setSystemTimeFromTm(const struct tm &timeInfo)
 {
-  struct tm localTime = timeInfo;
-  localTime.tm_isdst = -1;
-  time_t epoch = mktime(&localTime);
-  if (epoch < kMinValidEpoch) {
-    return false;
-  }
-  timeval tv = {.tv_sec = epoch, .tv_usec = 0};
-  return settimeofday(&tv, nullptr) == 0;
+  return waveform::setSystemTimeFromTm(timeInfo);
 }
 
 bool setSystemTimeFromEpoch(time_t epoch)
 {
-  if (epoch < kMinValidEpoch) {
-    return false;
-  }
-  timeval tv = {.tv_sec = epoch, .tv_usec = 0};
-  return settimeofday(&tv, nullptr) == 0;
+  return waveform::setSystemTimeFromEpoch(epoch);
 }
 
 bool hasValidTime()
 {
-  return time(nullptr) >= kMinValidEpoch;
+  return waveform::hasReasonableTime();
 }
 
 String timeText()
 {
-  if (!hasValidTime()) {
-    return "--:--";
-  }
-  char buffer[16];
-  struct tm localTime = {};
-  time_t now = time(nullptr);
-  localtime_r(&now, &localTime);
-  strftime(buffer, sizeof(buffer), settingsState().use24hClock ? "%H:%M" : "%I:%M", &localTime);
-  return String(buffer);
+  return waveform::formatTimeText(settingsState().use24hClock);
 }
 
 String dateText()
 {
-  if (!hasValidTime()) {
-    return "Waiting for RTC or Wi-Fi";
-  }
-  char buffer[24];
-  struct tm localTime = {};
-  time_t now = time(nullptr);
-  localtime_r(&now, &localTime);
-  strftime(buffer, sizeof(buffer), "%a, %b %d", &localTime);
-  return String(buffer);
+  return waveform::formatDateText();
 }
 
 String timezoneText()
 {
-  if (!hasValidTime()) {
-    return "TIME UNAVAILABLE";
-  }
-  char buffer[32];
-  struct tm localTime = {};
-  time_t now = time(nullptr);
-  localtime_r(&now, &localTime);
-  strftime(buffer, sizeof(buffer), "%Z", &localTime);
-  return String(buffer);
+  return waveform::formatTimezoneText();
 }
 
 void applyConfiguredTimezone()

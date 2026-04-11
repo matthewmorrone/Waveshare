@@ -10,8 +10,8 @@
 #include <vector>
 
 #include "cloud_sprite_assets_generated.h"
-#include "drivers/es8311.h"
-#include "drivers/es8311_reg.h"
+#include "es8311.h"
+#include "es8311_reg.h"
 #include "pin_config.h"
 #include "star_locket_melody_pcm.h"
 #include <XPowersLib.h>
