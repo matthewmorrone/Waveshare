@@ -312,8 +312,18 @@ void onSleepTap(lv_event_t *e)
 void onTimezoneTap(lv_event_t *e)
 {
   (void)e;
-  timezonePickerSetInitial(settingsState().utcOffsetHours);
-  showTimezonePicker();
+  int next = settingsState().utcOffsetHours + 1;
+  if (next > 14) {
+    next = -12;
+  }
+  settingsState().utcOffsetHours = next;
+  if (gUi.timezoneValueLabel) {
+    char tzBuf[16];
+    snprintf(tzBuf, sizeof(tzBuf), "UTC%+d", next);
+    lv_label_set_text(gUi.timezoneValueLabel, tzBuf);
+  }
+  saveAll();
+  applyConfiguredTimezone();
   noteActivity();
 }
 

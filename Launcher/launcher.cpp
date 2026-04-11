@@ -85,6 +85,18 @@ const char *connectivityLabel()
 }
 
 constexpr LauncherApp kApps[] = {
+#if defined(WAVEFORM_STANDALONE_PROFILE) && !defined(SCREEN_WATCH) && !defined(SCREEN_MOTION) && !defined(SCREEN_WEATHER) && !defined(SCREEN_CALCULATOR) && !defined(SCREEN_STOPWATCH) && !defined(SCREEN_RADIO) && !defined(SCREEN_LOCKET) && !defined(SCREEN_SYSTEM) && !defined(SCREEN_SETTINGS) && !defined(SCREEN_SPECTRUM)
+    {ScreenId::Launcher, "Clock", "Standalone preview", "TIME", 34, 131, 255},
+    {ScreenId::Launcher, "Motion", "Standalone preview", "IMU", 18, 195, 136},
+    {ScreenId::Launcher, "Weather", "Standalone preview", "WX", 255, 167, 38},
+    {ScreenId::Launcher, "Calc", "Standalone preview", "MATH", 255, 92, 114},
+    {ScreenId::Launcher, "Timers", "Standalone preview", "RUN", 255, 106, 56},
+    {ScreenId::Launcher, "Radio", "Standalone preview", "RF", 92, 224, 224},
+    {ScreenId::Launcher, "Locket", "Standalone preview", "SKY", 148, 214, 255},
+    {ScreenId::Launcher, "System", "Standalone preview", "SYS", 74, 222, 128},
+    {ScreenId::Launcher, "Settings", "Standalone preview", "SET", 168, 148, 255},
+    {ScreenId::Launcher, "Sound", "Standalone preview", "AUD", 255, 100, 180},
+#else
 #ifdef SCREEN_WATCH
     {ScreenId::Watch, "Clock", "RTC and status", "TIME", 34, 131, 255},
 #endif
@@ -115,6 +127,7 @@ constexpr LauncherApp kApps[] = {
 #ifdef SCREEN_SPECTRUM
     {ScreenId::Spectrum, "Spectrum", "Audio visualizer", "AUD", 255, 100, 180},
 #endif
+#endif
 };
 
 constexpr size_t kVisibleAppCount = sizeof(kApps) / sizeof(kApps[0]);
@@ -123,7 +136,14 @@ void onLauncherAppTap(lv_event_t *event)
 {
   uintptr_t rawId = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
   noteActivity();
+#if defined(WAVEFORM_STANDALONE_PROFILE) && !defined(SCREEN_WATCH) && !defined(SCREEN_MOTION) && !defined(SCREEN_WEATHER) && !defined(SCREEN_CALCULATOR) && !defined(SCREEN_STOPWATCH) && !defined(SCREEN_RADIO) && !defined(SCREEN_LOCKET) && !defined(SCREEN_SYSTEM) && !defined(SCREEN_SETTINGS) && !defined(SCREEN_SPECTRUM)
+  LV_UNUSED(rawId);
+  if (gUi.statusLabel) {
+    lv_label_set_text(gUi.statusLabel, "Standalone preview  |  launch disabled");
+  }
+#else
   showScreenById(static_cast<ScreenId>(rawId));
+#endif
 }
 
 void styleAppButton(lv_obj_t *button, const LauncherApp &app)
