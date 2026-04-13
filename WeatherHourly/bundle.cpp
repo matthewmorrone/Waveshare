@@ -641,6 +641,7 @@ void setup()
       weatherApiUrl,
       weatherUpdatedLabel,
   });
+  weatherModuleSetActiveView(WeatherModuleView::Hourly, false);
   weatherModuleRestoreCache();
 
   Wire.begin(IIC_SDA, IIC_SCL);
@@ -667,17 +668,17 @@ void setup()
 
   setupLvgl();
 
-  if (!waveformBuildWeatherHourlyScreen()) {
-    Serial.println("Weather hourly screen build failed");
+  if (!waveformBuildWeatherScreen()) {
+    Serial.println("Weather screen build failed");
     while (true) {
       delay(1000);
     }
   }
 
-  currentScreenIndex = static_cast<size_t>(ScreenId::WeatherHourly);
+  currentScreenIndex = static_cast<size_t>(ScreenId::Weather);
   lv_screen_load(screenRoots[currentScreenIndex]);
-  waveformEnterWeatherHourlyScreen();
-  waveformRefreshWeatherHourlyScreen();
+  waveformEnterWeatherScreen();
+  waveformRefreshWeatherScreen();
   lv_refr_now(display);
   lastRefreshAtMs = millis();
   lastWeatherAnimAtMs = lastRefreshAtMs;

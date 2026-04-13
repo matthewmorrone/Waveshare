@@ -2,18 +2,20 @@
 #include <Arduino.h>
 #include <Arduino_DriveBus_Library.h>
 #include <Arduino_GFX_Library.h>
+#include <ArduinoOTA.h>
 #include <ESP_I2S.h>
 #include <FS.h>
 #include <SD_MMC.h>
+#include <WiFi.h>
 #include <Wire.h>
 #include <math.h>
 #include <vector>
 
-#include "cloud_sprite_assets_generated.h"
+#include "clouds.h"
 #include "es8311.h"
 #include "es8311_reg.h"
 #include "pin_config.h"
-#include "star_locket_melody_pcm.h"
+#include "star_locket_melody.h"
 #include <XPowersLib.h>
 
 namespace
@@ -45,27 +47,18 @@ constexpr int kAudioSampleRate = 16000;
 constexpr int kAudioVolumePct = 75;
 constexpr es8311_mic_gain_t kAudioMicGain = static_cast<es8311_mic_gain_t>(3);
 constexpr size_t kAudioReadBufferBytes = 2048;
-constexpr bool kAudioDebugMode = true;
+constexpr bool kAudioDebugMode = false;
 constexpr size_t kAudioDebugChunkBytes = 8192;
-constexpr uint32_t kSdPollIntervalMs = 800;
 constexpr uint32_t kTapMaxDurationMs = 350;
 constexpr int kTapMaxTravelPx = 18;
 constexpr size_t kSerialLineBufferBytes = 192;
 constexpr size_t kSerialTransferChunkBytes = 512;
 
 constexpr const char *kSdMountPath = "/sdcard";
-constexpr const char *kCloudSpriteDir = "/locket/clouds";
 constexpr const char *kAudioDir = "/locket/audio";
-constexpr const char *kCloudSpriteFiles[kEmbeddedCloudSpriteCount] = {
-    "01.cld",
-    "02.cld",
-    "03.cld",
-};
 constexpr uint8_t kUsableSpriteIndices[] = {0, 1};
-constexpr const uint8_t *kEmbeddedTrackPcm =
-    _Users_matthewmorrone_Documents_Arduino_Waveshare_VendorAudioDemo_output_star_locket_melody_pcm;
-constexpr size_t kEmbeddedTrackPcmLen =
-    _Users_matthewmorrone_Documents_Arduino_Waveshare_VendorAudioDemo_output_star_locket_melody_pcm_len;
+constexpr const uint8_t *kEmbeddedTrackPcm = _star_locket_melody;
+constexpr size_t kEmbeddedTrackPcmLen = _star_locket_melody_len;
 
 struct BackgroundStar
 {
@@ -120,12 +113,10 @@ struct Cloud
 Adafruit_XCA9554 gExpander;
 XPowersPMU gPower;
 std::shared_ptr<Arduino_IIC_DriveBus> gTouchBus = std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
-std::unique_ptr<Arduino_IIC> gTouchController(
-    new Arduino_FT3x68(gTouchBus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, nullptr));
+std::unique_ptr<Arduino_IIC> gTouchController(new Arduino_FT3x68(gTouchBus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TP_INT, nullptr));
 bool gExpanderReady = false;
 bool gPowerReady = false;
 bool gSdMounted = false;
-uint8_t gSdSpriteCount = 0;
 uint8_t gSpriteCursor = 0;
 uint32_t gLastFrameAtMs = 0;
 bool gUseCanvas = false;
@@ -134,9 +125,6 @@ bool gTouchReady = false;
 bool gTouchPressed = false;
 bool gTapTracking = false;
 bool gAnimationPaused = true;
-bool gSdPresenceInitialized = false;
-bool gSdPresent = false;
-uint32_t gLastSdPollAtMs = 0;
 uint32_t gTapStartedAtMs = 0;
 uint64_t gAnimationStartUs = 0;
 uint64_t gAnimationPausedAtUs = 0;
@@ -155,9 +143,12 @@ const char *gActiveAudioPath = nullptr;
 File gAudioFile;
 uint32_t gAudioDataRemaining = 0;
 volatile bool gSkipTrack = false;
+bool gBottomButtonWasPressed = false;
 uint8_t gAudioReadBuffer[kAudioReadBufferBytes] = {};
 uint16_t gAudioSourceChannels = 0;
 uint32_t gAudioSourceSampleRate = 0;
+uint32_t gAudioHardwareRate = 0;
+bool gUsingEmbeddedTrack = false;
 size_t gAudioDebugPcmOffset = 0;
 bool gSerialTransferActive = false;
 File gSerialTransferFile;
@@ -231,7 +222,8 @@ void closeAudioPlayback();
 bool initTouch();
 void serviceTouch();
 void serviceAudioDebug();
-bool beginAudioI2s();
+bool beginAudioI2s(int sampleRate);
+bool reconfigureAudioRate(uint32_t sampleRate);
 void audioTaskMain(void *arg);
 void resetBackgroundStar(size_t index, bool initialPlacement);
 
@@ -350,6 +342,7 @@ bool initExpanderAndRails()
 
   gExpander.pinMode(PMU_IRQ_PIN, INPUT);
   gExpander.pinMode(TOP_BUTTON_PIN, INPUT);
+  gExpander.pinMode(BOTTOM_BUTTON_PIN, INPUT);
   gExpander.pinMode(0, OUTPUT);
   gExpander.pinMode(1, OUTPUT);
   gExpander.pinMode(2, OUTPUT);
@@ -382,7 +375,7 @@ bool initAudioHardware()
   delay(10);
   Serial.printf("Locket: audio amp enable GPIO%d HIGH\n", AUDIO_POWER_AMP);
 
-  if (!beginAudioI2s()) {
+  if (!beginAudioI2s(kAudioSampleRate)) {
     Serial.println("Locket: I2S begin failed");
     return false;
   }
@@ -418,15 +411,43 @@ bool initAudioHardware()
   return true;
 }
 
-bool beginAudioI2s()
+bool beginAudioI2s(int sampleRate)
 {
   gAudioI2s.end();
   gAudioI2s.setPins(AUDIO_I2S_BCLK, AUDIO_I2S_WS, AUDIO_I2S_DOUT, AUDIO_I2S_DIN, AUDIO_I2S_MCLK);
-  return gAudioI2s.begin(I2S_MODE_STD,
-                         kAudioSampleRate,
-                         I2S_DATA_BIT_WIDTH_16BIT,
-                         I2S_SLOT_MODE_STEREO,
-                         I2S_STD_SLOT_BOTH);
+  bool ok = gAudioI2s.begin(I2S_MODE_STD,
+                            sampleRate,
+                            I2S_DATA_BIT_WIDTH_16BIT,
+                            I2S_SLOT_MODE_STEREO,
+                            I2S_STD_SLOT_BOTH);
+  if (ok) {
+    gAudioHardwareRate = sampleRate;
+  }
+  return ok;
+}
+
+bool reconfigureAudioRate(uint32_t sampleRate)
+{
+  if (gAudioHardwareRate == sampleRate) {
+    return true;
+  }
+  if (!beginAudioI2s(sampleRate)) {
+    Serial.printf("Locket: I2S reconfigure to %lu failed\n", static_cast<unsigned long>(sampleRate));
+    return false;
+  }
+  const es8311_clock_config_t clk = {
+      .mclk_inverted = false,
+      .sclk_inverted = false,
+      .mclk_from_mclk_pin = true,
+      .mclk_frequency = static_cast<int>(sampleRate) * 256,
+      .sample_frequency = static_cast<int>(sampleRate),
+  };
+  esp_err_t err = es8311_sample_frequency_config(gAudioCodec, clk.mclk_frequency, clk.sample_frequency);
+  if (err != ESP_OK) {
+    Serial.printf("Locket: codec rate config failed: %s\n", esp_err_to_name(err));
+    return false;
+  }
+  return true;
 }
 
 void playTone(float freqHz, uint32_t durationMs)
@@ -574,8 +595,8 @@ bool openAudioFile()
           String lower = name;
           lower.toLowerCase();
           if (lower.endsWith(".wav")) {
-            // entry.name() returns the full path on SD_MMC
-            wavFiles.push_back(name);
+            String fullPath = String(kAudioDir) + "/" + name;
+            wavFiles.push_back(fullPath);
           }
         }
         entry.close();
@@ -676,12 +697,17 @@ bool openAudioFile()
     gAudioFile.close();
     return false;
   }
-  if (audioFormat != 1 || bitsPerSample != 16 || channels != 2 || sampleRate != static_cast<uint32_t>(kAudioSampleRate)) {
+  if (audioFormat != 1 || bitsPerSample != 16 || channels != 2 || (sampleRate != 16000 && sampleRate != 44100)) {
     Serial.printf("Locket: unsupported WAV format a=%u ch=%u sr=%lu bits=%u\n",
                   static_cast<unsigned>(audioFormat),
                   static_cast<unsigned>(channels),
                   static_cast<unsigned long>(sampleRate),
                   static_cast<unsigned>(bitsPerSample));
+    gAudioFile.close();
+    return false;
+  }
+
+  if (!reconfigureAudioRate(sampleRate)) {
     gAudioFile.close();
     return false;
   }
@@ -734,18 +760,52 @@ void updateAudioPlayback()
 
   if (gSkipTrack) {
     gSkipTrack = false;
+    gUsingEmbeddedTrack = false;
     closeAudioPlayback();
     openAudioFile();
+    if (!gAudioFile) {
+      gUsingEmbeddedTrack = true;
+      reconfigureAudioRate(kAudioSampleRate);
+      gAudioDebugPcmOffset = 0;
+    }
+    return;
+  }
+
+  if (gAnimationPaused) {
+    return;
+  }
+
+  if (gUsingEmbeddedTrack) {
+    const size_t remaining = kEmbeddedTrackPcmLen - gAudioDebugPcmOffset;
+    const size_t chunkSize = min<size_t>(kAudioDebugChunkBytes, remaining);
+    if (chunkSize == 0) {
+      gAnimationPausedAtUs = esp_timer_get_time();
+      gAnimationPaused = true;
+      return;
+    }
+    gAudioI2s.write(kEmbeddedTrackPcm + gAudioDebugPcmOffset, chunkSize);
+    gAudioDebugPcmOffset += chunkSize;
+    if (gAudioDebugPcmOffset >= kEmbeddedTrackPcmLen) {
+      gAnimationPausedAtUs = esp_timer_get_time();
+      gAnimationPaused = true;
+    }
     return;
   }
 
   if (!gAudioFile) {
     startAudioPlayback();
+    if (!gAudioFile) {
+      gUsingEmbeddedTrack = true;
+      reconfigureAudioRate(kAudioSampleRate);
+      gAudioDebugPcmOffset = 0;
+    }
     return;
   }
 
   if (gAudioDataRemaining == 0) {
-    openAudioFile();
+    closeAudioPlayback();
+    gAnimationPausedAtUs = esp_timer_get_time();
+    gAnimationPaused = true;
     return;
   }
 
@@ -756,7 +816,7 @@ void updateAudioPlayback()
     return;
   }
 
-  if ((bytesRead & 0x3) != 0 || gAudioSourceChannels != 2 || gAudioSourceSampleRate != static_cast<uint32_t>(kAudioSampleRate)) {
+  if ((bytesRead & 0x3) != 0 || gAudioSourceChannels != 2) {
     openAudioFile();
     return;
   }
@@ -778,52 +838,6 @@ void audioTaskMain(void *arg)
   }
 }
 
-bool probeSdPresent()
-{
-  if (gSdMounted) {
-    const uint8_t cardType = SD_MMC.cardType();
-    if (cardType != CARD_NONE) {
-      return true;
-    }
-
-    closeAudioPlayback();
-    SD_MMC.end();
-    gSdMounted = false;
-    Serial.println("Locket: SD removed");
-    return false;
-  }
-
-  return initSdCard();
-}
-
-void serviceSdPresence()
-{
-  const uint32_t now = millis();
-  if (now - gLastSdPollAtMs < kSdPollIntervalMs) {
-    return;
-  }
-  gLastSdPollAtMs = now;
-
-  const bool presentNow = probeSdPresent();
-  if (!gSdPresenceInitialized) {
-    gSdPresent = presentNow;
-    gSdPresenceInitialized = true;
-    return;
-  }
-
-  if (presentNow == gSdPresent) {
-    return;
-  }
-
-  gSdPresent = presentNow;
-  closeAudioPlayback();
-  if (presentNow) {
-    playSdInsertedChime();
-    startAudioPlayback();
-  } else {
-    playSdRemovedChime();
-  }
-}
 
 void finishSerialTransfer(bool success, const char *message)
 {
@@ -998,60 +1012,6 @@ bool initSdCard()
   return false;
 }
 
-bool loadSpriteFromSd(const char *path, CloudSprite &sprite)
-{
-  File file = SD_MMC.open(path, FILE_READ);
-  if (!file) {
-    return false;
-  }
-
-  uint8_t header[8];
-  if (file.read(header, sizeof(header)) != static_cast<int>(sizeof(header))) {
-    file.close();
-    return false;
-  }
-
-  if (header[0] != 'C' || header[1] != 'L' || header[2] != 'D' || header[3] != '1') {
-    file.close();
-    return false;
-  }
-
-  const uint16_t width = static_cast<uint16_t>(header[4] | (header[5] << 8));
-  const uint16_t height = static_cast<uint16_t>(header[6] | (header[7] << 8));
-  const size_t size = static_cast<size_t>(width) * static_cast<size_t>(height);
-  if (size == 0) {
-    file.close();
-    return false;
-  }
-
-#if defined(ESP32)
-  uint8_t *pixels = psramFound()
-                        ? static_cast<uint8_t *>(ps_malloc(size))
-                        : static_cast<uint8_t *>(malloc(size));
-#else
-  uint8_t *pixels = static_cast<uint8_t *>(malloc(size));
-#endif
-  if (!pixels) {
-    file.close();
-    return false;
-  }
-
-  if (file.read(pixels, size) != static_cast<int>(size)) {
-    free(pixels);
-    file.close();
-    return false;
-  }
-
-  file.close();
-
-  if (sprite.sdPixels) {
-    free(sprite.sdPixels);
-  }
-  sprite.sdWidth = width;
-  sprite.sdHeight = height;
-  sprite.sdPixels = pixels;
-  return true;
-}
 
 void initCloudSprites()
 {
@@ -1063,24 +1023,6 @@ void initCloudSprites()
     sprite.sdWidth = 0;
     sprite.sdHeight = 0;
     sprite.sdPixels = nullptr;
-  }
-
-  gSdSpriteCount = 0;
-  if (!initSdCard()) {
-    return;
-  }
-
-  char path[64];
-  for (size_t index = 0; index < kEmbeddedCloudSpriteCount; ++index) {
-    snprintf(path, sizeof(path), "%s/%s", kCloudSpriteDir, kCloudSpriteFiles[index]);
-    if (loadSpriteFromSd(path, gCloudSprites[index])) {
-      ++gSdSpriteCount;
-      Serial.printf("Locket: loaded cloud sprite from %s\n", path);
-    }
-  }
-
-  if (gSdSpriteCount == 0) {
-    Serial.println("Locket: no SD cloud sprites found, using embedded clouds");
   }
 }
 
@@ -1287,8 +1229,6 @@ void toggleAnimationPause()
     gAnimationPaused = true;
   }
 
-  // Signal the audio task to skip to a new random track
-  gSkipTrack = true;
 }
 
 bool initTouch()
@@ -1306,7 +1246,7 @@ bool initTouch()
 
   gTouchController->IIC_Write_Device_State(
       gTouchController->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
-      gTouchController->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR);
+      gTouchController->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_ACTIVE);
   gTouchController->IIC_Interrupt_Flag = false;
   gTouchPressed = false;
   gTapTracking = false;
@@ -1582,6 +1522,20 @@ void setup()
 {
   Serial.begin(115200);
   delay(250);
+
+  WiFi.begin("ESPn", "itslikeihave");
+  uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+    delay(100);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Locket: WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+    ArduinoOTA.setHostname("locket");
+    ArduinoOTA.begin();
+    Serial.println("Locket: OTA ready");
+  } else {
+    Serial.println("Locket: WiFi not available, OTA disabled");
+  }
   gAnimationStartUs = esp_timer_get_time();
   gAnimationPausedAtUs = gAnimationStartUs;
   gAnimationPaused = false;
@@ -1632,24 +1586,31 @@ void setup()
   }
   gLastFrameAtMs = millis();
 
-  Serial.printf("Locket booted. Expander: %s, PMU: %s, canvas: %s, SD sprites: %u/%u\n",
+  Serial.printf("Locket booted. Expander: %s, PMU: %s, canvas: %s\n",
                 gExpanderReady ? "OK" : "missing",
                 gPowerReady ? "OK" : "missing",
-                gUseCanvas ? "ON" : "OFF",
-                gSdSpriteCount,
-                static_cast<unsigned>(kEmbeddedCloudSpriteCount));
+                gUseCanvas ? "ON" : "OFF");
 }
 
 void loop()
 {
   const uint32_t now = millis();
+  if (WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.handle();
+  }
   serviceSerialTransfer();
   if (gSerialTransferActive) {
     delay(1);
     return;
   }
   serviceTouch();
-  serviceSdPresence();
+  if (gExpanderReady) {
+    bool pressed = gExpander.digitalRead(BOTTOM_BUTTON_PIN) == LOW;
+    if (pressed && !gBottomButtonWasPressed) {
+      gSkipTrack = true;
+    }
+    gBottomButtonWasPressed = pressed;
+  }
   if (now - gLastFrameAtMs < kFrameIntervalMs) {
     delay(1);
     return;

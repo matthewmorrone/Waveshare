@@ -28,12 +28,6 @@ static const ScreenModule *const kModulesArr[] = {
 #ifdef SCREEN_WEATHER
     &weatherScreenModule(),
 #endif
-#ifdef SCREEN_WEATHER_HOURLY
-    &weatherHourlyScreenModule(),
-#endif
-#ifdef SCREEN_WEATHER_DAILY
-    &weatherDailyScreenModule(),
-#endif
 #ifdef SCREEN_GPS
     &gpsScreenModule(),
 #endif

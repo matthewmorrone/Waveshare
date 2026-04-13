@@ -17,6 +17,7 @@
 #define TP_INT 21
 
 #define TOP_BUTTON_PIN 4
+#define BOTTOM_BUTTON_PIN 3
 #define PMU_IRQ_PIN 5
 
 constexpr int SDMMC_CLK = 2;

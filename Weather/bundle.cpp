@@ -641,6 +641,7 @@ void setup()
       weatherApiUrl,
       weatherUpdatedLabel,
   });
+  weatherModuleSetActiveView(WeatherModuleView::Current, false);
   weatherModuleRestoreCache();
 
   Wire.begin(IIC_SDA, IIC_SCL);

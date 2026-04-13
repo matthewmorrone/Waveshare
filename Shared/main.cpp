@@ -618,12 +618,6 @@ void handleScreenTap()
 bool isWeatherStackScreen(ScreenId screen)
 {
   return screen == ScreenId::Weather
-#ifdef SCREEN_WEATHER_HOURLY
-         || screen == ScreenId::WeatherHourly
-#endif
-#ifdef SCREEN_WEATHER_DAILY
-         || screen == ScreenId::WeatherDaily
-#endif
 #ifdef SCREEN_GPS
          || screen == ScreenId::Gps
 #endif
@@ -1636,32 +1630,12 @@ bool shouldKeepScreenCached(ScreenId id)
     return true;
   }
 #endif
-#ifdef SCREEN_WEATHER_HOURLY
-  if (id == ScreenId::WeatherHourly) {
-    return true;
-  }
-#endif
-#ifdef SCREEN_WEATHER_DAILY
-  if (id == ScreenId::WeatherDaily) {
-    return true;
-  }
-#endif
 
   return false;
 }
 
 ScreenId primaryNavigationAnchor(ScreenId id)
 {
-#ifdef SCREEN_WEATHER_HOURLY
-  if (id == ScreenId::WeatherHourly) {
-    return ScreenId::Weather;
-  }
-#endif
-#ifdef SCREEN_WEATHER_DAILY
-  if (id == ScreenId::WeatherDaily) {
-    return ScreenId::Weather;
-  }
-#endif
 #ifdef SCREEN_TIMER
   if (id == ScreenId::Timer) {
     return ScreenId::Stopwatch;

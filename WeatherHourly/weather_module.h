@@ -18,6 +18,13 @@ struct WeatherModuleConfig
   String (*updatedLabel)() = nullptr;
 };
 
+enum class WeatherModuleView : uint8_t
+{
+  Current,
+  Hourly,
+  Daily,
+};
+
 void weatherModuleConfigure(const WeatherModuleConfig &config);
 bool weatherModuleRestoreCache();
 bool weatherModuleHasData();
@@ -28,6 +35,8 @@ void weatherModuleUpdate();
 void weatherModuleCycleDebugScene(int direction);
 void weatherModuleClearDebugOverride();
 void weatherModuleRefreshUi();
+bool weatherModuleSetActiveView(WeatherModuleView view, bool loadScreen);
+WeatherModuleView weatherModuleActiveView();
 String weatherApiUrl();
 String weatherUpdatedLabel();
 void handleWeatherStackSwipe(int deltaY);

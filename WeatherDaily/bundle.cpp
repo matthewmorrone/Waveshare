@@ -680,6 +680,7 @@ void setup()
       weatherApiUrl,
       weatherUpdatedLabel,
   });
+  weatherModuleSetActiveView(WeatherModuleView::Daily, false);
   weatherModuleRestoreCache();
 
   Wire.begin(IIC_SDA, IIC_SCL);
@@ -706,17 +707,17 @@ void setup()
 
   setupLvgl();
 
-  if (!waveformBuildWeatherDailyScreen()) {
-    Serial.println("Weather daily screen build failed");
+  if (!waveformBuildWeatherScreen()) {
+    Serial.println("Weather screen build failed");
     while (true) {
       delay(1000);
     }
   }
 
-  currentScreenIndex = static_cast<size_t>(ScreenId::WeatherDaily);
+  currentScreenIndex = static_cast<size_t>(ScreenId::Weather);
   lv_screen_load(screenRoots[currentScreenIndex]);
-  waveformEnterWeatherDailyScreen();
-  waveformRefreshWeatherDailyScreen();
+  waveformEnterWeatherScreen();
+  waveformRefreshWeatherScreen();
   lv_refr_now(display);
   lastRefreshAtMs = millis();
   lastWeatherAnimAtMs = lastRefreshAtMs;

@@ -76,6 +76,13 @@ WeatherSceneType gDebugScene = WeatherSceneType::Clear;
 uint32_t gNextRefreshAtMs = 0;
 bool gRefreshScheduled = false;
 bool gStartupFetchPending = true;
+#if defined(WEATHER_STANDALONE_HOURLY)
+WeatherModuleView gActiveView = WeatherModuleView::Hourly;
+#elif defined(WEATHER_STANDALONE_DAILY)
+WeatherModuleView gActiveView = WeatherModuleView::Daily;
+#else
+WeatherModuleView gActiveView = WeatherModuleView::Current;
+#endif
 
 bool isWeatherFamilyScreen(ScreenId id)
 {
@@ -110,6 +117,104 @@ ScreenId nextWeatherFamilyScreen(ScreenId current, int direction)
   }
 
   return current;
+}
+
+WeatherModuleView nextWeatherView(WeatherModuleView current, int direction)
+{
+  static const WeatherModuleView kViews[] = {
+      WeatherModuleView::Current,
+      WeatherModuleView::Hourly,
+      WeatherModuleView::Daily,
+  };
+
+  size_t currentIndex = 0;
+  for (size_t i = 0; i < (sizeof(kViews) / sizeof(kViews[0])); ++i) {
+    if (kViews[i] == current) {
+      currentIndex = i;
+      break;
+    }
+  }
+
+  size_t count = sizeof(kViews) / sizeof(kViews[0]);
+  size_t nextIndex = direction > 0 ? (currentIndex + 1) % count : (currentIndex + count - 1) % count;
+  return kViews[nextIndex];
+}
+
+lv_obj_t *rootForWeatherView(WeatherModuleView view)
+{
+  switch (view) {
+    case WeatherModuleView::Hourly:
+      return gUi.hourlyScreen;
+    case WeatherModuleView::Daily:
+      return gUi.dailyScreen;
+    case WeatherModuleView::Current:
+    default:
+      return gUi.currentScreen;
+  }
+}
+
+bool ensureWeatherViewBuilt(WeatherModuleView view)
+{
+  switch (view) {
+    case WeatherModuleView::Hourly:
+      if (!gUi.hourlyScreen) {
+        buildHourlyForecastScreen(gUi);
+        screenRoots[static_cast<size_t>(ScreenId::WeatherHourly)] = gUi.hourlyScreen;
+      }
+      return gUi.hourlyScreen != nullptr;
+    case WeatherModuleView::Daily:
+      if (!gUi.dailyScreen) {
+        buildDailyForecastScreen(gUi);
+        screenRoots[static_cast<size_t>(ScreenId::WeatherDaily)] = gUi.dailyScreen;
+      }
+      return gUi.dailyScreen != nullptr;
+    case WeatherModuleView::Current:
+    default:
+      if (!gUi.currentScreen) {
+        gUi.currentScreen = buildCurrentWeatherScreen(gUi);
+      }
+      return gUi.currentScreen != nullptr;
+  }
+}
+
+void refreshActiveWeatherView()
+{
+  switch (gActiveView) {
+    case WeatherModuleView::Hourly:
+      if (gUi.hourlyScreen) {
+        refreshHourlyForecastScreen(gUi, gState);
+      }
+      break;
+    case WeatherModuleView::Daily:
+      if (gUi.dailyScreen) {
+        refreshDailyForecastScreen(gUi, gState);
+      }
+      break;
+    case WeatherModuleView::Current:
+    default:
+      if (gUi.currentScreen && gUi.cityLabel && gUi.tempLabel && gUi.conditionLabel) {
+        refreshUi();
+      }
+      break;
+  }
+}
+
+bool activateWeatherView(WeatherModuleView view, bool loadScreen)
+{
+  if (!ensureWeatherViewBuilt(view)) {
+    return false;
+  }
+
+  gActiveView = view;
+  gRoot = rootForWeatherView(view);
+  screenRoots[static_cast<size_t>(ScreenId::Weather)] = gRoot;
+
+  refreshActiveWeatherView();
+
+  if (loadScreen && gRoot) {
+    lv_screen_load(gRoot);
+  }
+  return gRoot != nullptr;
 }
 
 lv_color_t lvColor(uint8_t r, uint8_t g, uint8_t b)
@@ -1124,13 +1229,13 @@ void handleWeatherStackSwipe(int deltaY)
   }
 
   if (deltaY <= -kWeatherNavSwipeMinDistancePx) {
-    showScreenById(nextWeatherFamilyScreen(current, 1));
+    activateWeatherView(nextWeatherView(gActiveView, 1), true);
     noteActivity();
     return;
   }
 
   if (deltaY >= kWeatherNavSwipeMinDistancePx) {
-    showScreenById(nextWeatherFamilyScreen(current, -1));
+    activateWeatherView(nextWeatherView(gActiveView, -1), true);
     noteActivity();
   }
 }
@@ -1589,12 +1694,15 @@ lv_obj_t *waveformWeatherDailyScreenRoot()
 
 bool waveformBuildWeatherScreen()
 {
-  if (!gRoot) {
-    gRoot = buildCurrentWeatherScreen(gUi);
-    screenRoots[static_cast<size_t>(ScreenId::Weather)] = gRoot;
+  if (!activateWeatherView(gActiveView, false)) {
+    return false;
   }
 
-  return gRoot && gUi.currentScreen && gUi.cityLabel && gUi.tempLabel && gUi.conditionLabel;
+  if (gActiveView == WeatherModuleView::Current) {
+    return gRoot && gUi.currentScreen && gUi.cityLabel && gUi.tempLabel && gUi.conditionLabel;
+  }
+
+  return gRoot != nullptr;
 }
 
 bool waveformBuildWeatherHourlyScreen()
@@ -1619,11 +1727,11 @@ bool waveformBuildWeatherDailyScreen()
 
 bool waveformRefreshWeatherScreen()
 {
-  if (!gUi.currentScreen || !gUi.cityLabel || !gUi.tempLabel || !gUi.conditionLabel) {
+  if (!gRoot) {
     return false;
   }
 
-  refreshUi();
+  refreshActiveWeatherView();
   return true;
 }
 
@@ -1649,6 +1757,7 @@ bool waveformRefreshWeatherDailyScreen()
 
 void waveformEnterWeatherScreen()
 {
+  activateWeatherView(gActiveView, true);
   gDebugOverrideEnabled = false;
   if (gConfig.fetchEnabled && networkOnline() && !gFetchInProgress && !otaBusy() && !lightSleepActive()) {
     weatherModuleScheduleRefreshIn(250);
@@ -1687,10 +1796,16 @@ void waveformDestroyWeatherScreen()
     lv_draw_buf_destroy(gUi.moonBuf);
     gUi.moonBuf = nullptr;
   }
-  if (gRoot) {
-    lv_obj_delete(gRoot);
-    gRoot = nullptr;
+  if (gUi.currentScreen) {
+    lv_obj_delete(gUi.currentScreen);
   }
+  if (gUi.hourlyScreen && gUi.hourlyScreen != gUi.currentScreen) {
+    lv_obj_delete(gUi.hourlyScreen);
+  }
+  if (gUi.dailyScreen && gUi.dailyScreen != gUi.currentScreen && gUi.dailyScreen != gUi.hourlyScreen) {
+    lv_obj_delete(gUi.dailyScreen);
+  }
+  gRoot = nullptr;
   screenRoots[static_cast<size_t>(ScreenId::Weather)] = nullptr;
 #ifdef SCREEN_WEATHER_HOURLY
   screenRoots[static_cast<size_t>(ScreenId::WeatherHourly)] = nullptr;
@@ -1699,12 +1814,20 @@ void waveformDestroyWeatherScreen()
   screenRoots[static_cast<size_t>(ScreenId::WeatherDaily)] = nullptr;
 #endif
   gUi = WeatherUi{};
+  gActiveView = 
+#if defined(WEATHER_STANDALONE_HOURLY)
+      WeatherModuleView::Hourly;
+#elif defined(WEATHER_STANDALONE_DAILY)
+      WeatherModuleView::Daily;
+#else
+      WeatherModuleView::Current;
+#endif
 }
 
 void waveformTickWeatherScreen(uint32_t nowMs)
 {
   (void)nowMs;
-  if (gUi.currentScreen) {
+  if (gActiveView == WeatherModuleView::Current && gUi.currentScreen) {
     updateWeatherHero(gUi, gState, gDebugOverrideEnabled, gDebugScene, millis());
   }
 }
@@ -1722,6 +1845,16 @@ void waveformTickWeatherDailyScreen(uint32_t nowMs)
 const ScreenModule &weatherScreenModule()
 {
   return kModule;
+}
+
+bool weatherModuleSetActiveView(WeatherModuleView view, bool loadScreen)
+{
+  return activateWeatherView(view, loadScreen);
+}
+
+WeatherModuleView weatherModuleActiveView()
+{
+  return gActiveView;
 }
 
 const ScreenModule &weatherHourlyScreenModule()
