@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kill 77662)",
+      "Bash(python3 -u -c ':*)",
+      "Bash(awk 'NR>1{print $2}')",
+      "Bash(xargs kill:*)",
+      "Bash(grep -n 'logf\\(\"[^\"]*[^n]\"\\);$' Locket/locket.cpp)"
+    ]
+  }
+}
