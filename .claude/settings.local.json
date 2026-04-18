@@ -5,7 +5,19 @@
       "Bash(python3 -u -c ':*)",
       "Bash(awk 'NR>1{print $2}')",
       "Bash(xargs kill:*)",
-      "Bash(grep -n 'logf\\(\"[^\"]*[^n]\"\\);$' Locket/locket.cpp)"
+      "Bash(grep -n 'logf\\(\"[^\"]*[^n]\"\\);$' Locket/locket.cpp)",
+      "Bash(python3 -u -c ' *)",
+      "Bash(ffprobe -v error -show_entries format=duration,bit_rate -show_entries stream=sample_rate,channels,sample_fmt,codec_name \"/Users/matthewmorrone/Desktop/locket copy.wav\")",
+      "Bash(ffprobe -v error -show_entries format=duration,bit_rate -show_entries stream=sample_rate,channels,sample_fmt,codec_name \"/Users/matthewmorrone/Desktop/locket.wav\")",
+      "Bash(xxd \"/Users/matthewmorrone/Desktop/locket copy.wav\")",
+      "Bash(ffmpeg -y -i \"/Users/matthewmorrone/Desktop/locket copy.wav\" -ar 44100 -sample_fmt s16 -ac 2 -c:a pcm_s16le -map 0:a:0 /tmp/locket_test.wav)",
+      "Bash(ffprobe -v error -show_entries format=duration /tmp/locket_test.wav)",
+      "Bash(python3 -m pip list)",
+      "Bash(demucs -o /tmp/demucs_out \"/Users/matthewmorrone/Desktop/locket.wav\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 transcribe.py locket.wav locket_custom.mid)",
+      "Bash(python3 transcribe2.py locket.wav locket_custom.mid)",
+      "Bash(python3 /Users/matthewmorrone/Desktop/locket_build.py)"
     ]
   }
 }

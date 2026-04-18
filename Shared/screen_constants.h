@@ -27,6 +27,11 @@ constexpr int kSkyPanelY                 = 54;
 constexpr int kSkyPanelSize              = 304;
 constexpr size_t kSkyStarCount           = 20;
 
+// --- Starmap screen ---
+constexpr int kStarmapTitleY             = 20;
+constexpr int kStarmapPanelY             = 54;
+constexpr int kStarmapPanelSize          = 336;
+
 // --- Solar screen ---
 constexpr int kSolarTitleY               = 20;
 constexpr int kSolarPanelY               = 52;

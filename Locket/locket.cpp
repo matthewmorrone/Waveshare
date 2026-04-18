@@ -45,6 +45,13 @@ constexpr uint16_t kCloudHighlight = 0xFFFF;
 constexpr uint16_t kCloudBody = 0xE73C;
 constexpr uint16_t kCloudShadow = 0xB5D9;
 constexpr uint16_t kMoonWhite = 0xFFFF;
+constexpr uint16_t kMoonHot = 0xFFDE;            // bright hot yellow-white (active)
+constexpr uint16_t kMoonGold = 0xFCC0;           // gold amber (paused)
+constexpr uint16_t kMoonBorder = 0x0000;         // black outline (paused)
+constexpr uint16_t kSkyPinkTop = 0xFB57;         // bright pink top
+constexpr uint16_t kSkyPinkMid = 0xFC9F;         // light pink mid
+constexpr uint16_t kSkyPinkLow = 0xFDBF;         // pale pink lower
+constexpr uint16_t kSkyPinkHorizon = 0xFEFF;     // very pale pink horizon
 constexpr uint16_t kMoonGlow = 0xE73F;
 constexpr uint16_t kOrbCore = 0xC800;
 constexpr uint16_t kOrbMid = 0xE0A3;
@@ -64,6 +71,14 @@ constexpr size_t kSerialLineBufferBytes = 192;
 constexpr size_t kSerialTransferChunkBytes = 512;
 
 constexpr const char *kSdMountPath = "/sdcard";
+constexpr const char *kImageDir = "/locket/image";
+constexpr int kScrollImageWidth = 300;
+constexpr int kScrollImageHeight = 300;
+constexpr size_t kScrollImageBytes = kScrollImageWidth * kScrollImageHeight * 2;
+constexpr uint32_t kImageScrollDurationMs = 12000;
+constexpr bool kZoetropeEnabled = false;
+constexpr uint32_t kImageGapMinMs = 1500;
+constexpr uint32_t kImageGapMaxMs = 4000;
 constexpr const char *kAudioDir = "/locket/audio";
 constexpr uint8_t kUsableSpriteIndices[] = {0, 1};
 constexpr const uint8_t *kEmbeddedTrackPcm = _star_locket_melody;
@@ -75,6 +90,17 @@ struct BackgroundStar
   int16_t y = 0;
   uint8_t radius = 1;
   uint16_t color = kStarWhite;
+};
+
+struct ShootingStar
+{
+  bool active = false;
+  float x = 0.0f;
+  float y = 0.0f;
+  float vx = 0.0f;
+  float vy = 0.0f;
+  float lifeSec = 0.0f;
+  float maxLifeSec = 1.0f;
 };
 
 struct CloudSprite
@@ -173,6 +199,13 @@ es8311_handle_t gAudioCodec = nullptr;
 I2SClass gAudioI2s;
 const char *gActiveAudioPath = nullptr;
 std::vector<String> gPlaylist;
+std::vector<String> gImageList;
+uint16_t *gImageBuffer = nullptr;
+uint8_t *gImageAlphaMask = nullptr;  // precomputed vignette
+bool gImageActive = false;
+uint32_t gImageStartedMs = 0;
+uint32_t gImageNextSpawnMs = 0;
+String gImageActivePath;
 std::vector<String> gShuffleQueue;
 File gAudioFile;
 uint32_t gAudioDataRemaining = 0;
@@ -186,6 +219,15 @@ uint8_t gSkyPercent = 100;
 int8_t gSkyDirection = -1;
 uint32_t gLastSkyAnimMs = 0;
 constexpr bool kSkyDemoMode = false;
+bool gPauseTransitionActive = false;
+bool gLastPausedState = true;  // matches gAnimationPaused default
+uint32_t gPauseTransitionStartMs = 0;
+constexpr uint32_t kPauseTransitionDurationMs = 900;
+constexpr size_t kShootingStarCount = 8;
+ShootingStar gShootingStars[kShootingStarCount];
+bool gIsCharging = false;
+uint32_t gLastChargeCheckMs = 0;
+uint32_t gLastShootingSpawnMs = 0;
 uint8_t gAudioReadBuffer[kAudioReadBufferBytes] = {};
 uint16_t gAudioSourceChannels = 0;
 uint32_t gAudioSourceSampleRate = 0;
@@ -606,6 +648,169 @@ uint16_t readLe16(const uint8_t *bytes)
 {
   return static_cast<uint16_t>(bytes[0])
        | (static_cast<uint16_t>(bytes[1]) << 8);
+}
+
+void buildImageAlphaMask();  // forward decl
+
+void scanImageList()
+{
+  gImageList.clear();
+  File dir = SD_MMC.open(kImageDir);
+  if (!dir || !dir.isDirectory()) return;
+  File entry = dir.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      String name = entry.name();
+      if (name.endsWith(".bin") && !name.startsWith("._")) {
+        gImageList.push_back(String(kImageDir) + "/" + name);
+      }
+    }
+    entry.close();
+    entry = dir.openNextFile();
+  }
+  dir.close();
+  logf("Locket: %u scroll images found\n", static_cast<unsigned>(gImageList.size()));
+  buildImageAlphaMask();
+}
+
+bool loadScrollImage(const char *path)
+{
+  if (!gImageBuffer) {
+    gImageBuffer = static_cast<uint16_t *>(ps_malloc(kScrollImageBytes));
+    if (!gImageBuffer) {
+      logf("Locket: image buffer alloc failed\n");
+      return false;
+    }
+  }
+  File f = SD_MMC.open(path, FILE_READ);
+  if (!f) {
+    logf("Locket: image open failed %s\n", path);
+    return false;
+  }
+  size_t total = 0;
+  while (total < kScrollImageBytes) {
+    int got = f.read(reinterpret_cast<uint8_t *>(gImageBuffer) + total, kScrollImageBytes - total);
+    if (got <= 0) break;
+    total += got;
+  }
+  f.close();
+  if (total != kScrollImageBytes) {
+    logf("Locket: image short read %u/%u\n", static_cast<unsigned>(total), static_cast<unsigned>(kScrollImageBytes));
+    return false;
+  }
+  return true;
+}
+
+void buildImageAlphaMask()
+{
+  if (gImageAlphaMask) return;
+  gImageAlphaMask = static_cast<uint8_t *>(ps_malloc(kScrollImageWidth * kScrollImageHeight));
+  if (!gImageAlphaMask) {
+    logf("Locket: alpha mask alloc failed\n");
+    return;
+  }
+  const float halfW = kScrollImageWidth * 0.5f;
+  const float halfH = kScrollImageHeight * 0.5f;
+  constexpr float fadeStart = 0.55f;
+  constexpr float fadeEnd = 1.0f;
+  for (int iy = 0; iy < kScrollImageHeight; ++iy) {
+    for (int ix = 0; ix < kScrollImageWidth; ++ix) {
+      const float dx = (ix - halfW) / halfW;
+      const float dy = (iy - halfH) / halfH;
+      const float d = sqrtf(dx * dx + dy * dy);
+      float alpha = 1.0f;
+      if (d > fadeStart) {
+        alpha = 1.0f - (d - fadeStart) / (fadeEnd - fadeStart);
+        if (alpha < 0.0f) alpha = 0.0f;
+      }
+      gImageAlphaMask[iy * kScrollImageWidth + ix] = static_cast<uint8_t>(alpha * 255.0f);
+    }
+  }
+}
+
+void drawScrollImage()
+{
+  if (!kZoetropeEnabled) return;
+  if (!gImageActive || !gImageBuffer || !gImageAlphaMask) return;
+  const uint32_t elapsed = millis() - gImageStartedMs;
+  if (elapsed >= kImageScrollDurationMs) {
+    gImageActive = false;
+    gImageNextSpawnMs = millis() + kImageGapMinMs + (esp_random() % (kImageGapMaxMs - kImageGapMinMs));
+    return;
+  }
+
+  // Image is fixed centered; the spotlight sweeps left-to-right across it.
+  const float progress = static_cast<float>(elapsed) / static_cast<float>(kImageScrollDurationMs);
+  const int32_t imgX = (LCD_WIDTH - kScrollImageWidth) / 2;
+  const int32_t imgY = (LCD_HEIGHT - kScrollImageHeight) / 2;
+
+  // Spotlight: vertical column with soft Gaussian falloff. Sweeps off-left to off-right
+  // across the IMAGE's local x range so the spot enters and exits the image cleanly.
+  constexpr float kSpotlightHalfWidthPx = 60.0f;  // half-width of fully-bright zone falloff
+  const float spotCenterX = -kSpotlightHalfWidthPx +
+                            progress * (kScrollImageWidth + 2.0f * kSpotlightHalfWidthPx);
+
+  uint16_t *fb = gUseCanvas ? canvas->framebuffer() : nullptr;
+  if (!fb) return;
+
+  // Clamp iteration to visible region (the whole image is on screen, but be safe)
+  const int ixStart = max<int32_t>(0, -imgX);
+  const int ixEnd = min<int32_t>(kScrollImageWidth, LCD_WIDTH - imgX);
+  const int iyStart = max<int32_t>(0, -imgY);
+  const int iyEnd = min<int32_t>(kScrollImageHeight, LCD_HEIGHT - imgY);
+
+  for (int iy = iyStart; iy < iyEnd; ++iy) {
+    const int sy = imgY + iy;
+    const size_t rowBase = iy * kScrollImageWidth;
+    const size_t dstRowBase = sy * LCD_WIDTH;
+    for (int ix = ixStart; ix < ixEnd; ++ix) {
+      const uint8_t maskAmt = gImageAlphaMask[rowBase + ix];
+      if (maskAmt == 0) continue;
+
+      // Spotlight intensity at this column: 1.0 at center, falling off to 0 at half-width
+      const float dx = static_cast<float>(ix) - spotCenterX;
+      const float dn = dx / kSpotlightHalfWidthPx;
+      float spot = 1.0f - (dn * dn);  // quadratic falloff
+      if (spot < 0.0f) continue;
+      if (spot > 1.0f) spot = 1.0f;
+
+      // Combine vignette + spotlight
+      const uint8_t amt = static_cast<uint8_t>(maskAmt * spot);
+      if (amt == 0) continue;
+
+      const uint16_t raw = gImageBuffer[rowBase + ix];
+      const uint16_t pixel = (raw >> 8) | (raw << 8);
+      const size_t dstIdx = dstRowBase + (imgX + ix);
+      fb[dstIdx] = (amt == 255) ? pixel : blend565(fb[dstIdx], pixel, amt);
+    }
+  }
+}
+
+void updateScrollImage()
+{
+  if (!kZoetropeEnabled) {
+    gImageActive = false;
+    return;
+  }
+  if (gAnimationPaused) {
+    gImageActive = false;
+    return;
+  }
+  if (!gImageActive) {
+    const uint32_t now = millis();
+    if (gImageList.empty()) return;
+    if (now < gImageNextSpawnMs) return;
+    // Pick a random image and start scrolling
+    const size_t idx = esp_random() % gImageList.size();
+    gImageActivePath = gImageList[idx];
+    if (loadScrollImage(gImageActivePath.c_str())) {
+      gImageActive = true;
+      gImageStartedMs = now;
+      logf("Locket: scrolling %s\n", gImageActivePath.c_str());
+    } else {
+      gImageNextSpawnMs = now + 2000;
+    }
+  }
 }
 
 bool isWavPlayable(const char *path)
@@ -1253,6 +1458,7 @@ bool initSdCard(bool quiet)
     gSdInitFailed = false;
     logf("Locket: SD mounted: %s\n", cardTypeText(cardType));
     cleanDotUnderscoreFiles("/");
+    scanImageList();
     return true;
   }
 
@@ -1405,6 +1611,42 @@ void resetBackgroundStar(size_t index, bool initialPlacement)
   star.color = random(0, 7) == 0 ? kStarBlue : kStarWhite;
 }
 
+// Returns 0..255 blend amount for new-state color at column x.
+// Right-to-left wipe: right column reaches new state first.
+// 0 = old state, 255 = new state.
+uint8_t columnTransitionAmount(int16_t x)
+{
+  if (!gPauseTransitionActive) return 255;
+  const uint32_t elapsed = millis() - gPauseTransitionStartMs;
+  if (elapsed >= kPauseTransitionDurationMs) {
+    return 255;
+  }
+  const float progress = static_cast<float>(elapsed) / static_cast<float>(kPauseTransitionDurationMs);
+  const float normX = static_cast<float>(x) / static_cast<float>(LCD_WIDTH);
+  constexpr float feather = 0.25f;
+  // Threshold sweeps from 1+feather (right) to -feather (off left)
+  const float threshold = (1.0f + feather) - progress * (1.0f + 2.0f * feather);
+  const float raw = (normX - threshold) / feather + 1.0f;
+  const float clamped = raw < 0.0f ? 0.0f : (raw > 1.0f ? 1.0f : raw);
+  return static_cast<uint8_t>(clamped * 255.0f);
+}
+
+uint16_t pinkSkyColorForY(int16_t y)
+{
+  const uint32_t yClamped = static_cast<uint32_t>(max<int16_t>(0, min<int16_t>(LCD_HEIGHT - 1, y)));
+  const uint32_t t255 = (yClamped * 255U) / (LCD_HEIGHT - 1);
+  if (t255 < 128U) {
+    const uint8_t amt = static_cast<uint8_t>((t255 * 255U) / 128U);
+    return blend565(kSkyPinkTop, kSkyPinkMid, amt);
+  }
+  if (t255 < 200U) {
+    const uint8_t amt = static_cast<uint8_t>(((t255 - 128U) * 255U) / 72U);
+    return blend565(kSkyPinkMid, kSkyPinkLow, amt);
+  }
+  const uint8_t amt = static_cast<uint8_t>(((t255 - 200U) * 255U) / 55U);
+  return blend565(kSkyPinkLow, kSkyPinkHorizon, amt);
+}
+
 uint16_t skyColorForY(int16_t y)
 {
   const uint32_t yClamped = static_cast<uint32_t>(max<int16_t>(0, min<int16_t>(LCD_HEIGHT - 1, y)));
@@ -1463,6 +1705,7 @@ uint16_t skyColorForPosition(int16_t x, int16_t y)
   const uint32_t baseMix = (static_cast<uint32_t>(ySafe) * 255U) / (LCD_HEIGHT - 1);
   const uint8_t ditheredMix = clampU8(static_cast<int>(baseMix) + kBayer4x4[ySafe & 3][x & 3]);
   const int16_t ditheredY = static_cast<int16_t>((static_cast<uint32_t>(ditheredMix) * (LCD_HEIGHT - 1)) / 255U);
+
   return skyColorForY(ditheredY);
 }
 
@@ -1510,6 +1753,41 @@ void drawStars()
       scene->drawPixel(starX, star.y, starColor);
     } else {
       scene->fillCircle(starX, star.y, star.radius, starColor);
+    }
+  }
+}
+
+void drawShootingStars()
+{
+  for (size_t i = 0; i < kShootingStarCount; ++i) {
+    const ShootingStar &s = gShootingStars[i];
+    if (!s.active) continue;
+
+    // Fade in quickly, fade out slowly, with a high floor so it's never faint
+    const float t = s.lifeSec / s.maxLifeSec;
+    const float alpha = (t < 0.15f) ? (t / 0.15f) : (1.0f - (t - 0.15f) / 0.85f);
+    const uint8_t intensity = static_cast<uint8_t>(constrain(static_cast<int>(alpha * 255.0f), 0, 255));
+
+    // Bold head + long tapered trail
+    const int tailLen = 140;
+    for (int step = 0; step < tailLen; ++step) {
+      const float fade = 1.0f - (static_cast<float>(step) / tailLen);
+      const uint8_t segIntensity = static_cast<uint8_t>(intensity * fade);
+      const int16_t px = static_cast<int16_t>(s.x - s.vx * (step * 0.022f));
+      const int16_t py = static_cast<int16_t>(s.y - s.vy * (step * 0.022f));
+      if (px < 0 || px >= LCD_WIDTH || py < 0 || py >= LCD_HEIGHT) continue;
+      const uint16_t bg = skyColorForPosition(px, py);
+      const uint16_t color = blend565(bg, kStarWhite, segIntensity);
+      int radius;
+      if (step < 2) radius = 4;       // bright head
+      else if (step < 12) radius = 3;
+      else if (step < 40) radius = 2;
+      else radius = 1;
+      if (radius == 1) {
+        scene->drawPixel(px, py, color);
+      } else {
+        scene->fillCircle(px, py, radius, color);
+      }
     }
   }
 }
@@ -1678,29 +1956,218 @@ void drawMoon()
   const int32_t moonRadiusSq = moonRadius * moonRadius;   // squared radii for distance checks (avoids sqrt)
   const int32_t cutRadiusSq = cutRadius * cutRadius;
 
+  // Border thickness (pixels) for the paused gold crescent
+  constexpr int32_t borderPx = 3;
+  const int32_t moonInnerRadiusSq = (moonRadius - borderPx) * (moonRadius - borderPx);
+  const int32_t cutOuterRadiusSq = (cutRadius + borderPx) * (cutRadius + borderPx);
+
+  // ---- Glow pass: warm halo around the crescent when active ----
+  constexpr int32_t glowReach = 32;                                     // pixels outward from moon edge
+  constexpr int32_t glowOuter = moonRadius + glowReach;
+  constexpr int32_t glowOuterSq = glowOuter * glowOuter;
+  constexpr uint16_t kMoonGlow = 0xFFFF;                                // pure white
+
+  // Compute the two corner points where moon outer circle and cut circle intersect.
+  // These are the sharp tips of the crescent — both glow passes miss them because
+  // the projection onto either circle's edge falls outside the "valid" region there.
+  float cornerX[2] = {0, 0}, cornerY[2] = {0, 0};
+  bool cornersValid = false;
+  {
+    const float dx = static_cast<float>(cutX - moonX);
+    const float dy = static_cast<float>(cutY - moonY);
+    const float d = sqrtf(dx * dx + dy * dy);
+    if (d > 1e-3f && d < static_cast<float>(moonRadius + cutRadius) &&
+        d > fabsf(static_cast<float>(moonRadius - cutRadius))) {
+      const float a = (static_cast<float>(moonRadius) * static_cast<float>(moonRadius) -
+                       static_cast<float>(cutRadius) * static_cast<float>(cutRadius) + d * d) /
+                      (2.0f * d);
+      const float hSq = static_cast<float>(moonRadius) * static_cast<float>(moonRadius) - a * a;
+      if (hSq >= 0.0f) {
+        const float h = sqrtf(hSq);
+        const float px = static_cast<float>(moonX) + a * dx / d;
+        const float py = static_cast<float>(moonY) + a * dy / d;
+        const float rx = -dy / d * h;
+        const float ry = dx / d * h;
+        cornerX[0] = px + rx;
+        cornerY[0] = py + ry;
+        cornerX[1] = px - rx;
+        cornerY[1] = py - ry;
+        cornersValid = true;
+      }
+    }
+  }
+
+  if (framebuffer) {
+    for (int16_t y = moonY - glowOuter; y <= moonY + glowOuter; ++y) {
+      if (y < 0 || y >= LCD_HEIGHT) continue;
+      for (int16_t x = moonX - glowOuter; x <= moonX + glowOuter; ++x) {
+        if (x < 0 || x >= LCD_WIDTH) continue;
+
+        const int32_t outerDx = x - moonX;
+        const int32_t outerDy = y - moonY;
+        const int32_t outerDistSq = outerDx * outerDx + outerDy * outerDy;
+
+        // Glow only outside the moon's outer edge, within the glow ring
+        if (outerDistSq <= moonRadiusSq) continue;
+        if (outerDistSq > glowOuterSq) continue;
+
+        // Only glow around the visible crescent edge: project this pixel onto the
+        // moon's outer circle; if that point is inside the cut, no crescent there.
+        const float distFromCenter = sqrtf(static_cast<float>(outerDistSq));
+        const float scale = static_cast<float>(moonRadius) / distFromCenter;
+        const float projX = moonX + outerDx * scale;
+        const float projY = moonY + outerDy * scale;
+        const float pcx = projX - cutX;
+        const float pcy = projY - cutY;
+        if (pcx * pcx + pcy * pcy < static_cast<float>(cutRadiusSq)) continue;
+
+        const float dist = distFromCenter - static_cast<float>(moonRadius);
+        const float t = 1.0f - (dist / static_cast<float>(glowReach));
+        const uint8_t glowAmt = static_cast<uint8_t>(t * t * 210.0f);
+        if (glowAmt == 0) continue;
+
+        // Only show glow in active state; transition right-to-left like everything else
+        const uint8_t txAmt = columnTransitionAmount(x);
+        const uint8_t activeWeight = gAnimationPaused ? (255 - txAmt) : txAmt;
+        const uint16_t finalAmt = (static_cast<uint16_t>(glowAmt) * activeWeight) / 255;
+        if (finalAmt == 0) continue;
+
+        const size_t idx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
+        framebuffer[idx] = blend565(framebuffer[idx], kMoonGlow, finalAmt);
+      }
+    }
+
+    // ---- Inner-edge glow: inside the cut circle, near the cut boundary ----
+    // The cut circle bounds the crescent on the concave side. Glow inward from that edge.
+    constexpr int32_t innerGlowReach = 26;
+    const int32_t cutSearchRadius = cutRadius;  // iterate within cut circle
+    for (int16_t y = cutY - cutSearchRadius; y <= cutY + cutSearchRadius; ++y) {
+      if (y < 0 || y >= LCD_HEIGHT) continue;
+      for (int16_t x = cutX - cutSearchRadius; x <= cutX + cutSearchRadius; ++x) {
+        if (x < 0 || x >= LCD_WIDTH) continue;
+
+        const int32_t cdx = x - cutX;
+        const int32_t cdy = y - cutY;
+        const int32_t cutDistSq = cdx * cdx + cdy * cdy;
+
+        // Must be inside the cut circle, near its edge
+        if (cutDistSq >= cutRadiusSq) continue;
+        const float cutDistFromCenter = sqrtf(static_cast<float>(cutDistSq));
+        const float distFromCutEdge = static_cast<float>(cutRadius) - cutDistFromCenter;
+        if (distFromCutEdge > static_cast<float>(innerGlowReach)) continue;
+
+        // Project onto the cut edge: if that point is outside the moon outer circle,
+        // then this is not the crescent's inner boundary (it's the free outer part of the cut)
+        const float scaleCut = (cutDistFromCenter > 0.0f)
+                                    ? (static_cast<float>(cutRadius) / cutDistFromCenter)
+                                    : 0.0f;
+        const float projX = cutX + cdx * scaleCut;
+        const float projY = cutY + cdy * scaleCut;
+        const float pmx = projX - moonX;
+        const float pmy = projY - moonY;
+        if (pmx * pmx + pmy * pmy > static_cast<float>(moonRadiusSq)) continue;
+
+        // Don't glow pixels that are still part of the crescent itself
+        const int32_t odx = x - moonX;
+        const int32_t ody = y - moonY;
+        if (odx * odx + ody * ody >= moonRadiusSq) continue;  // outside moon = no inner glow
+        // If also inside cut (which we already checked), it's in the hole — glow here
+
+        const float t = 1.0f - (distFromCutEdge / static_cast<float>(innerGlowReach));
+        const uint8_t glowAmt = static_cast<uint8_t>(t * t * 210.0f);
+        if (glowAmt == 0) continue;
+
+        const uint8_t txAmt = columnTransitionAmount(x);
+        const uint8_t activeWeight = gAnimationPaused ? (255 - txAmt) : txAmt;
+        const uint16_t finalAmt = (static_cast<uint16_t>(glowAmt) * activeWeight) / 255;
+        if (finalAmt == 0) continue;
+
+        const size_t idx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
+        framebuffer[idx] = blend565(framebuffer[idx], kMoonGlow, finalAmt);
+      }
+    }
+
+    // ---- Corner-tip glow: radial halo around each crescent corner point ----
+    if (cornersValid) {
+      const int32_t cornerReach = glowReach;
+      const int32_t cornerReachSq = cornerReach * cornerReach;
+      for (int c = 0; c < 2; ++c) {
+        const int16_t ccx = static_cast<int16_t>(lroundf(cornerX[c]));
+        const int16_t ccy = static_cast<int16_t>(lroundf(cornerY[c]));
+        for (int16_t y = ccy - cornerReach; y <= ccy + cornerReach; ++y) {
+          if (y < 0 || y >= LCD_HEIGHT) continue;
+          for (int16_t x = ccx - cornerReach; x <= ccx + cornerReach; ++x) {
+            if (x < 0 || x >= LCD_WIDTH) continue;
+
+            // Skip pixels that are inside the crescent itself (would overdraw moon body)
+            const int32_t odx = x - moonX;
+            const int32_t ody = y - moonY;
+            const int32_t oSq = odx * odx + ody * ody;
+            const int32_t cdx = x - cutX;
+            const int32_t cdy = y - cutY;
+            const int32_t cSq = cdx * cdx + cdy * cdy;
+            const bool insideCrescent = (oSq <= moonRadiusSq) && (cSq >= cutRadiusSq);
+            if (insideCrescent) continue;
+
+            const int32_t rdx = x - ccx;
+            const int32_t rdy = y - ccy;
+            const int32_t rSq = rdx * rdx + rdy * rdy;
+            if (rSq > cornerReachSq) continue;
+
+            const float dist = sqrtf(static_cast<float>(rSq));
+            const float t = 1.0f - (dist / static_cast<float>(cornerReach));
+            const uint8_t glowAmt = static_cast<uint8_t>(t * t * 210.0f);
+            if (glowAmt == 0) continue;
+
+            const uint8_t txAmt = columnTransitionAmount(x);
+            const uint8_t activeWeight = gAnimationPaused ? (255 - txAmt) : txAmt;
+            const uint16_t finalAmt = (static_cast<uint16_t>(glowAmt) * activeWeight) / 255;
+            if (finalAmt == 0) continue;
+
+            const size_t idx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
+            framebuffer[idx] = blend565(framebuffer[idx], kMoonGlow, finalAmt);
+          }
+        }
+      }
+    }
+  }
+
   for (int16_t y = moonY - moonRadius; y <= moonY + moonRadius; ++y) {
     if (y < 0 || y >= LCD_HEIGHT) continue;
 
     for (int16_t x = moonX - moonRadius; x <= moonX + moonRadius; ++x) {
       if (x < 0 || x >= LCD_WIDTH) continue;
 
-      const int32_t outerDx = x - moonX;                                      // x offset from moon center
-      const int32_t outerDy = y - moonY;                                      // y offset from moon center
-      const int32_t outerDistSq = (outerDx * outerDx) + (outerDy * outerDy);  // squared distance to moon center
-      if (outerDistSq > moonRadiusSq) continue;                               // outside the moon: skip
+      const int32_t outerDx = x - moonX;
+      const int32_t outerDy = y - moonY;
+      const int32_t outerDistSq = (outerDx * outerDx) + (outerDy * outerDy);
+      if (outerDistSq > moonRadiusSq) continue;
 
-      const int32_t cutDx = x - cutX;                               // x offset from cut center
-      const int32_t cutDy = y - cutY;                               // y offset from cut center
-      const int32_t cutDistSq = (cutDx * cutDx) + (cutDy * cutDy);  // squared distance to cut center
-      if (cutDistSq < cutRadiusSq) continue;                        // inside the cut circle: skip
+      const int32_t cutDx = x - cutX;
+      const int32_t cutDy = y - cutY;
+      const int32_t cutDistSq = (cutDx * cutDx) + (cutDy * cutDy);
+      if (cutDistSq < cutRadiusSq) continue;
 
-      // pixel is inside the moon but outside the cut circle: draw crescent
+      // Determine which state this column is in
+      const uint8_t txAmt = columnTransitionAmount(x);
+
+      // Paused color: gold, with black border near outer/inner edge
+      const bool onOuterBorder = outerDistSq >= moonInnerRadiusSq;
+      const bool onInnerBorder = cutDistSq <= cutOuterRadiusSq;
+      const uint16_t pausedColor = (onOuterBorder || onInnerBorder) ? kMoonBorder : kMoonGold;
+
+      // Active color: hot yellow-white
+      const uint16_t activeColor = kMoonHot;
+
+      uint16_t newColor = gAnimationPaused ? pausedColor : activeColor;
+      uint16_t oldColor = gAnimationPaused ? activeColor : pausedColor;
+      const uint16_t moonColor = blend565(oldColor, newColor, txAmt);
+
       if (framebuffer) {
         const size_t pixelIndex = (static_cast<size_t>(y) * LCD_WIDTH) + static_cast<size_t>(x);
-        framebuffer[pixelIndex] = blend565(framebuffer[pixelIndex], kMoonWhite, 255);
+        framebuffer[pixelIndex] = moonColor;
       } else {
-        const uint16_t base = skyColorForPosition(x, y);
-        gfx->drawPixel(x, y, blend565(base, kMoonWhite, 255));
+        gfx->drawPixel(x, y, moonColor);
       }
     }
   }
@@ -1746,6 +2213,47 @@ void drawOrb()
   scene->fillCircle(sparkleX, sparkleY, 7, kOrbHighlight);
   scene->drawCircle(orbX, orbY, orbRadius + 1, blend565(kOrbHighlight, kOrbMid, 120));
   scene->drawCircle(orbX, orbY, orbRadius + 2, blend565(kOrbHighlight, kOrbGoldHot, 104));
+
+  // Black borders around the orb ring (paused state), with right-to-left wipe
+  uint16_t *fb = gUseCanvas ? canvas->framebuffer() : nullptr;
+  constexpr int32_t kOrbBorderPx = 3;
+  constexpr int32_t outerR1 = orbRadius + 8;                // outer edge of outer border
+  constexpr int32_t outerR0 = outerR1 - kOrbBorderPx;       // inner edge of outer border
+  constexpr int32_t innerR1 = orbRadius;                    // outer edge of inner border
+  constexpr int32_t innerR0 = innerR1 - kOrbBorderPx;       // inner edge of inner border
+  constexpr int32_t outerR1Sq = outerR1 * outerR1;
+  constexpr int32_t outerR0Sq = outerR0 * outerR0;
+  constexpr int32_t innerR1Sq = innerR1 * innerR1;
+  constexpr int32_t innerR0Sq = innerR0 * innerR0;
+
+  for (int16_t y = orbY - outerR1; y <= orbY + outerR1; ++y) {
+    if (y < 0 || y >= LCD_HEIGHT) continue;
+    for (int16_t x = orbX - outerR1; x <= orbX + outerR1; ++x) {
+      if (x < 0 || x >= LCD_WIDTH) continue;
+      const int32_t dx = x - orbX;
+      const int32_t dy = y - orbY;
+      const int32_t dSq = dx * dx + dy * dy;
+      const bool onOuterBorder = (dSq >= outerR0Sq && dSq <= outerR1Sq);
+      const bool onInnerBorder = (dSq >= innerR0Sq && dSq <= innerR1Sq);
+      if (!onOuterBorder && !onInnerBorder) continue;
+
+      const uint8_t txAmt = columnTransitionAmount(x);
+      uint16_t borderColor;
+      if (fb) {
+        const size_t idx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
+        const uint16_t existing = fb[idx];
+        // Paused state shows black; active state shows the existing orb pixel
+        const uint16_t newColor = gAnimationPaused ? kMoonBorder : existing;
+        const uint16_t oldColor = gAnimationPaused ? existing : kMoonBorder;
+        borderColor = blend565(oldColor, newColor, txAmt);
+        fb[idx] = borderColor;
+      } else {
+        if (gAnimationPaused) {
+          gfx->drawPixel(x, y, kMoonBorder);
+        }
+      }
+    }
+  }
 }
 
 void drawCloud(const Cloud &cloud)
@@ -1813,11 +2321,13 @@ void renderFrame()
 {
   drawSkyBackground();
   drawStars();
+  drawShootingStars();
   for (size_t index = 0; index < kCloudCount; ++index) {
     drawCloud(gClouds[index]);
   }
   drawMoon();
   drawOrb();
+  drawScrollImage();  // on top of everything
 }
 
 void updateStars(float elapsedSeconds)
@@ -1827,6 +2337,66 @@ void updateStars(float elapsedSeconds)
     star.x -= kSceneDriftPixelsPerSecond * elapsedSeconds;
     if (star.x < -static_cast<float>(star.radius + 2)) {
       resetBackgroundStar(index, false);
+    }
+  }
+
+  // Update shooting stars (with slight curve — rotate velocity each frame)
+  constexpr float kCurveRateRad = -0.35f; // radians per second (negative = curve the other way)
+  for (size_t i = 0; i < kShootingStarCount; ++i) {
+    ShootingStar &s = gShootingStars[i];
+    if (!s.active) continue;
+    // Rotate velocity slightly to bend the path
+    const float cr = cosf(kCurveRateRad * elapsedSeconds);
+    const float sr = sinf(kCurveRateRad * elapsedSeconds);
+    const float nvx = s.vx * cr - s.vy * sr;
+    const float nvy = s.vx * sr + s.vy * cr;
+    s.vx = nvx;
+    s.vy = nvy;
+    s.x += s.vx * elapsedSeconds;
+    s.y += s.vy * elapsedSeconds;
+    s.lifeSec += elapsedSeconds;
+    if (s.lifeSec >= s.maxLifeSec || s.x < -40 || s.x > LCD_WIDTH + 40 ||
+        s.y < -40 || s.y > LCD_HEIGHT + 40) {
+      s.active = false;
+    }
+  }
+
+  // Spawn new shooting stars from a shared radiant (top-right off-screen).
+  // Probabilistic per-frame spawn: creates natural bursts and gaps.
+  // (TEMP: always on, regardless of charging)
+  {
+    // ~1.8% chance per frame at 60fps -> ~1.1 spawns/sec average, bursty
+    const uint32_t roll = esp_random() % 1000;
+    if (roll < 18) {
+      for (size_t i = 0; i < kShootingStarCount; ++i) {
+        if (!gShootingStars[i].active) {
+          ShootingStar &s = gShootingStars[i];
+          s.active = true;
+
+          // Fixed radiant point, off-screen top-right
+          constexpr float kRadiantX = LCD_WIDTH + 180.0f;
+          constexpr float kRadiantY = -160.0f;
+
+          // Pick an angle within a cone from radiant toward the lower-left
+          // Angle from +x axis; π = pure left, 3π/4 = down-left, π/2 = down
+          const float angle = 2.55f + (static_cast<float>(esp_random() % 70) / 100.0f); // ~2.55-3.25 rad
+          const float dirX = cosf(angle);
+          const float dirY = sinf(angle);
+
+          // Spawn somewhere along the ray from radiant, distance varies
+          const float dist = 120.0f + static_cast<float>(esp_random() % 360);
+          s.x = kRadiantX + dirX * dist;
+          s.y = kRadiantY + dirY * dist;
+
+          const float speed = 160.0f + static_cast<float>(esp_random() % 120);
+          s.vx = dirX * speed;
+          s.vy = dirY * speed;
+
+          s.lifeSec = 0.0f;
+          s.maxLifeSec = 3.5f + static_cast<float>(esp_random() % 200) / 100.0f; // 3.5-5.5s
+          break;
+        }
+      }
     }
   }
 }
@@ -1899,7 +2469,8 @@ void setup()
   }
   gAnimationStartUs = esp_timer_get_time();
   gAnimationPausedAtUs = gAnimationStartUs;
-  gAnimationPaused = false;
+  gAnimationPaused = true;
+  gLastPausedState = true;
 
   pinMode(kBootButtonPin, INPUT_PULLUP);
 
@@ -1974,6 +2545,16 @@ void loop()
     return;
   }
   recheckSdCard();
+  updateScrollImage();
+  // Detect pause state transitions and arm right-to-left wipe
+  if (gAnimationPaused != gLastPausedState) {
+    gPauseTransitionActive = true;
+    gPauseTransitionStartMs = now;
+    gLastPausedState = gAnimationPaused;
+  }
+  if (gPauseTransitionActive && now - gPauseTransitionStartMs >= kPauseTransitionDurationMs) {
+    gPauseTransitionActive = false;
+  }
   if (gPowerReady && now - gLastBatteryPollMs >= kBatteryPollMs) {
     gLastBatteryPollMs = now;
     int pct = gPower.getBatteryPercent();
@@ -1981,6 +2562,11 @@ void loop()
     if (newPct != gBatteryPercent) {
       logf("Locket: battery %u%%\n", static_cast<unsigned>(newPct));
       gBatteryPercent = newPct;
+    }
+    const bool charging = gPower.isVbusIn();
+    if (charging != gIsCharging) {
+      gIsCharging = charging;
+      logf("Locket: charging %s\n", charging ? "started" : "stopped");
     }
   }
   if (kSkyDemoMode) {

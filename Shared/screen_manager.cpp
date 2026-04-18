@@ -37,6 +37,9 @@ static const ScreenModule *const kModulesArr[] = {
 #ifdef SCREEN_STARS
     &starsScreenModule(),
 #endif
+#ifdef SCREEN_STARMAP
+    &starmapScreenModule(),
+#endif
 #ifdef SCREEN_RECORDER
     &recorderScreenModule(),
 #endif

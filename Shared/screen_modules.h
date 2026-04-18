@@ -47,8 +47,11 @@ const ScreenModule &soundScreenModule();
 #ifdef SCREEN_SPECTRUM 
 const ScreenModule &spectrumScreenModule(); 
 #endif
-#ifdef SCREEN_STARS 
-const ScreenModule &starsScreenModule(); 
+#ifdef SCREEN_STARS
+const ScreenModule &starsScreenModule();
+#endif
+#ifdef SCREEN_STARMAP
+const ScreenModule &starmapScreenModule();
 #endif
 #ifdef SCREEN_STOPWATCH 
 const ScreenModule &stopwatchScreenModule(); 

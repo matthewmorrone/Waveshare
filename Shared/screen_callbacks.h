@@ -122,6 +122,15 @@ void waveformEnterStarsScreen();
 void waveformLeaveStarsScreen();
 void waveformTickStarsScreen(uint32_t nowMs);
 
+#ifdef SCREEN_STARMAP
+lv_obj_t *waveformStarmapScreenRoot();
+bool waveformBuildStarmapScreen();
+bool waveformRefreshStarmapScreen();
+void waveformEnterStarmapScreen();
+void waveformLeaveStarmapScreen();
+void waveformTickStarmapScreen(uint32_t nowMs);
+#endif
+
 lv_obj_t *waveformRecorderScreenRoot();
 bool waveformBuildRecorderScreen();
 bool waveformRefreshRecorderScreen();

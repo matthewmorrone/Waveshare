@@ -26,6 +26,7 @@
 #define SCREEN_SOUND
 #define SCREEN_SPECTRUM
 #define SCREEN_STARS
+#define SCREEN_STARMAP
 #define SCREEN_STOPWATCH
 #define SCREEN_SYSTEM
 #define SCREEN_TIMER
@@ -69,6 +70,9 @@
 #endif
 #ifdef WAVEFORM_ENABLE_SCREEN_STARS
 #define SCREEN_STARS
+#endif
+#ifdef WAVEFORM_ENABLE_SCREEN_STARMAP
+#define SCREEN_STARMAP
 #endif
 #ifdef WAVEFORM_ENABLE_SCREEN_RECORDER
 #define SCREEN_RECORDER
@@ -141,6 +145,9 @@ enum class ScreenId : uint8_t {
 #endif
 #ifdef SCREEN_STARS
   Stars,
+#endif
+#ifdef SCREEN_STARMAP
+  Starmap,
 #endif
 #ifdef SCREEN_RECORDER
   Recorder,
