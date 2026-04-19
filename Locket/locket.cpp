@@ -22,6 +22,17 @@
 
 namespace
 {
+// ---------------------------------------------------------------------------
+// Feature toggles — flip to false to disable a feature at compile time.
+// ---------------------------------------------------------------------------
+constexpr bool kFeatureCloudsMoving   = true;  // animate cloud drift across sky
+constexpr bool kFeatureMoonOrbSpin    = true;  // rotate crescent phase + orb highlight
+constexpr bool kFeatureMusic          = true;  // play background audio (SD + embedded)
+constexpr bool kFeatureStarsDrifting  = true;  // slow background star parallax
+constexpr bool kFeatureShootingStars  = true;  // charging-triggered meteor streaks
+constexpr bool kFeatureScrollImages   = true;  // SD-loaded image overlay
+// ---------------------------------------------------------------------------
+
 constexpr uint8_t kExpanderAddress = 0x20;
 constexpr size_t kBackgroundStarCount = 84;
 constexpr size_t kCloudCount = 4;
@@ -223,7 +234,12 @@ bool gPauseTransitionActive = false;
 bool gLastPausedState = true;  // matches gAnimationPaused default
 uint32_t gPauseTransitionStartMs = 0;
 constexpr uint32_t kPauseTransitionDurationMs = 900;
-constexpr size_t kShootingStarCount = 8;
+// Moon uses an angular sweep in the crescent's LOCAL frame so it tracks the spin
+// rather than sweeping in fixed screen coordinates.
+constexpr uint32_t kMoonTransitionDurationMs = 9000;
+
+
+constexpr size_t kShootingStarCount = 16;
 ShootingStar gShootingStars[kShootingStarCount];
 bool gIsCharging = false;
 uint32_t gLastChargeCheckMs = 0;
@@ -650,7 +666,8 @@ uint16_t readLe16(const uint8_t *bytes)
        | (static_cast<uint16_t>(bytes[1]) << 8);
 }
 
-void buildImageAlphaMask();  // forward decl
+void buildImageAlphaMask();          // forward decl
+float phaseAngleForPeriodUs(uint32_t periodUs);  // forward decl
 
 void scanImageList()
 {
@@ -788,7 +805,7 @@ void drawScrollImage()
 
 void updateScrollImage()
 {
-  if (!kZoetropeEnabled) {
+  if (!kFeatureScrollImages || !kZoetropeEnabled) {
     gImageActive = false;
     return;
   }
@@ -1074,6 +1091,9 @@ void closeAudioPlayback()
 
 void startAudioPlayback()
 {
+  if (!kFeatureMusic) {
+    return;
+  }
   if (!initAudioHardware()) {
     return;
   }
@@ -1086,6 +1106,9 @@ void startAudioPlayback()
 
 void updateAudioPlayback()
 {
+  if (!kFeatureMusic) {
+    return;
+  }
   if (gSerialTransferActive) {
     return;
   }
@@ -1631,6 +1654,64 @@ uint8_t columnTransitionAmount(int16_t x)
   return static_cast<uint8_t>(clamped * 255.0f);
 }
 
+// Moon transition: angular sweep in the crescent's LOCAL frame so it visually tracks the
+// spinning crescent rather than sweeping fixed screen coordinates.
+// 0 = old state, 255 = new state.
+uint8_t moonTransitionAmount(int16_t x, int16_t y, int16_t moonX, int16_t moonY)
+{
+  if (!gPauseTransitionActive) return 255;
+  const uint32_t elapsed = millis() - gPauseTransitionStartMs;
+  if (elapsed >= kMoonTransitionDurationMs) return 255;
+
+  const float dx = static_cast<float>(x - moonX);
+  const float dy = static_cast<float>(y - moonY);
+  if (dx == 0.0f && dy == 0.0f) return 255;
+
+  // Convert pixel's screen angle to the crescent's LOCAL angular frame by subtracting
+  // the current orbit angle.  This way the sweep tracks the crescent as it spins —
+  // no shimmering caused by screen-fixed angles passing in and out of the crescent shape.
+  constexpr uint32_t orbitPeriodUs = 9000000UL;
+  const float currentOrbitAngle = kFeatureMoonOrbSpin ? -phaseAngleForPeriodUs(orbitPeriodUs) : 0.0f;
+  const float screenAngle = atan2f(dy, dx);
+  float localAngle = screenAngle - currentOrbitAngle;
+  while (localAngle < 0.0f) localAngle += 2.0f * static_cast<float>(M_PI);
+  while (localAngle >= 2.0f * static_cast<float>(M_PI)) localAngle -= 2.0f * static_cast<float>(M_PI);
+
+  // Tip angle (local frame) — geometric intersection of outer moon circle and cut circle.
+  // Same constants as drawMoon().
+  static const float kTipAngleLocal = []() -> float {
+    constexpr float moonRadius = 177.0f;
+    constexpr float cutRadius  = moonRadius - 20.0f;
+    constexpr float cutOffset  = moonRadius * 0.49f;
+    const float a = (moonRadius * moonRadius - cutRadius * cutRadius + cutOffset * cutOffset)
+                    / (2.0f * cutOffset);
+    const float h = sqrtf(moonRadius * moonRadius - a * a);
+    return atan2f(h, a);  // ≈62°
+  }();
+  // Crescent spans from +tip, CCW through the belly (local π), to -tip (=2π-tip).
+  // Arc distance from the nearest tip along that body: 0 at either tip, max at belly.
+  const float crescentHalfSpan = static_cast<float>(M_PI) - kTipAngleLocal;  // ≈118°
+
+  // β: signed angular offset from the belly (local π). Body covers |β| ≤ crescentHalfSpan.
+  float beta = localAngle - static_cast<float>(M_PI);
+  while (beta >  static_cast<float>(M_PI)) beta -= 2.0f * static_cast<float>(M_PI);
+  while (beta < -static_cast<float>(M_PI)) beta += 2.0f * static_cast<float>(M_PI);
+  float distFromTip = crescentHalfSpan - fabsf(beta);  // 0 at tips, ~118° at belly
+  if (distFromTip < 0.0f) distFromTip = 0.0f;          // gap-side halo tracks the tips
+
+  // Sweep grows so both tips flip first and the belly completes exactly at the transition end.
+  const float omega = crescentHalfSpan / (static_cast<float>(kMoonTransitionDurationMs) / 1000.0f);
+  const float sweptRad = (static_cast<float>(elapsed) / 1000.0f) * omega;
+
+  constexpr float feather = 0.8f;
+  if (distFromTip <= sweptRad) return 255;
+  if (distFromTip - sweptRad < feather) {
+    const float t = 1.0f - (distFromTip - sweptRad) / feather;
+    return static_cast<uint8_t>(t * 255.0f);
+  }
+  return 0;
+}
+
 uint16_t pinkSkyColorForY(int16_t y)
 {
   const uint32_t yClamped = static_cast<uint32_t>(max<int16_t>(0, min<int16_t>(LCD_HEIGHT - 1, y)));
@@ -1905,18 +1986,19 @@ void serviceTouch()
       gTapTracking = false;
       if (dy > dx) {
         gDragActive = true;
+        logf("Locket: drag started (y=%d)\n", gTouchY);
       }
     }
   }
 
-  // Volume drag: finger position maps directly to volume (top = 100%, bottom = 0%)
+  // Volume drag: finger y position maps directly to volume (top = 100%, bottom = 0%).
+  // Volume only changes while gDragActive is true.
   if (pressedNow && gDragActive) {
-    int rawVol = constrain(100 - (gTouchY * 100 / LCD_HEIGHT), 0, 100);
-    int newVol = (rawVol / 5) * 5;
+    int newVol = constrain(100 - (gTouchY * 100 / LCD_HEIGHT), 0, 100);
     if (newVol != gVolume) {
       gVolume = newVol;
       const uint32_t now_ms = millis();
-      if (gAudioCodec && now_ms - gLastVolumeSetMs >= 50) {
+      if (gAudioCodec && now_ms - gLastVolumeSetMs >= 20) {
         gLastVolumeSetMs = now_ms;
         es8311_voice_volume_set(gAudioCodec, gVolume, nullptr);
       }
@@ -1924,12 +2006,12 @@ void serviceTouch()
     }
   }
 
-  // Apply final volume on release in case the rate limit skipped it
-  if (!pressedNow && gDragActive && gAudioCodec) {
-    es8311_voice_volume_set(gAudioCodec, gVolume, nullptr);
-  }
-
-  if (!pressedNow) {
+  if (!pressedNow && gDragActive) {
+    // Apply final volume on release in case rate limit skipped it
+    if (gAudioCodec) {
+      es8311_voice_volume_set(gAudioCodec, gVolume, nullptr);
+    }
+    logf("Locket: drag ended (volume=%d%%)\n", gVolume);
     gDragActive = false;
   }
 
@@ -1947,7 +2029,7 @@ void drawMoon()
   constexpr float cutOffsetFactor = 0.49f;           // how far the cut center sits from the moon center (fraction of moonRadius)
   constexpr uint32_t orbitPeriodUs = 9000000UL;      // full rotation period of the crescent phase (9 s)
 
-  const float orbitAngle = -phaseAngleForPeriodUs(orbitPeriodUs);                           // current rotation angle of the cut circle
+  const float orbitAngle = kFeatureMoonOrbSpin ? -phaseAngleForPeriodUs(orbitPeriodUs) : 0.0f;  // current rotation angle of the cut circle
   const float cutOffset = static_cast<float>(moonRadius) * cutOffsetFactor;                 // pixel distance from moon center to cut center
   const int16_t cutX = static_cast<int16_t>(roundf(moonX + cosf(orbitAngle) * cutOffset));  // x position of cut center
   const int16_t cutY = static_cast<int16_t>(roundf(moonY + sinf(orbitAngle) * cutOffset));  // y position of cut center
@@ -1997,137 +2079,77 @@ void drawMoon()
     }
   }
 
-  if (framebuffer) {
-    for (int16_t y = moonY - glowOuter; y <= moonY + glowOuter; ++y) {
+  // Unified glow: for each pixel in the bounding box around the crescent, compute
+  // the true minimum distance to the crescent outline (two arcs joined at corners),
+  // then apply a quadratic glow falloff. This eliminates seams between separate passes.
+  if (framebuffer && cornersValid) {
+    const float moonRf = static_cast<float>(moonRadius);
+    const float cutRf = static_cast<float>(cutRadius);
+    const int32_t bboxR = moonRadius + glowReach;
+    const float reachF = static_cast<float>(glowReach);
+    for (int16_t y = moonY - bboxR; y <= moonY + bboxR; ++y) {
       if (y < 0 || y >= LCD_HEIGHT) continue;
-      for (int16_t x = moonX - glowOuter; x <= moonX + glowOuter; ++x) {
+      for (int16_t x = moonX - bboxR; x <= moonX + bboxR; ++x) {
         if (x < 0 || x >= LCD_WIDTH) continue;
 
-        const int32_t outerDx = x - moonX;
-        const int32_t outerDy = y - moonY;
-        const int32_t outerDistSq = outerDx * outerDx + outerDy * outerDy;
-
-        // Glow only outside the moon's outer edge, within the glow ring
-        if (outerDistSq <= moonRadiusSq) continue;
-        if (outerDistSq > glowOuterSq) continue;
-
-        // Only glow around the visible crescent edge: project this pixel onto the
-        // moon's outer circle; if that point is inside the cut, no crescent there.
-        const float distFromCenter = sqrtf(static_cast<float>(outerDistSq));
-        const float scale = static_cast<float>(moonRadius) / distFromCenter;
-        const float projX = moonX + outerDx * scale;
-        const float projY = moonY + outerDy * scale;
-        const float pcx = projX - cutX;
-        const float pcy = projY - cutY;
-        if (pcx * pcx + pcy * pcy < static_cast<float>(cutRadiusSq)) continue;
-
-        const float dist = distFromCenter - static_cast<float>(moonRadius);
-        const float t = 1.0f - (dist / static_cast<float>(glowReach));
-        const uint8_t glowAmt = static_cast<uint8_t>(t * t * 210.0f);
-        if (glowAmt == 0) continue;
-
-        // Only show glow in active state; transition right-to-left like everything else
-        const uint8_t txAmt = columnTransitionAmount(x);
-        const uint8_t activeWeight = gAnimationPaused ? (255 - txAmt) : txAmt;
-        const uint16_t finalAmt = (static_cast<uint16_t>(glowAmt) * activeWeight) / 255;
-        if (finalAmt == 0) continue;
-
-        const size_t idx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
-        framebuffer[idx] = blend565(framebuffer[idx], kMoonGlow, finalAmt);
-      }
-    }
-
-    // ---- Inner-edge glow: inside the cut circle, near the cut boundary ----
-    // The cut circle bounds the crescent on the concave side. Glow inward from that edge.
-    constexpr int32_t innerGlowReach = 26;
-    const int32_t cutSearchRadius = cutRadius;  // iterate within cut circle
-    for (int16_t y = cutY - cutSearchRadius; y <= cutY + cutSearchRadius; ++y) {
-      if (y < 0 || y >= LCD_HEIGHT) continue;
-      for (int16_t x = cutX - cutSearchRadius; x <= cutX + cutSearchRadius; ++x) {
-        if (x < 0 || x >= LCD_WIDTH) continue;
-
-        const int32_t cdx = x - cutX;
-        const int32_t cdy = y - cutY;
-        const int32_t cutDistSq = cdx * cdx + cdy * cdy;
-
-        // Must be inside the cut circle, near its edge
-        if (cutDistSq >= cutRadiusSq) continue;
-        const float cutDistFromCenter = sqrtf(static_cast<float>(cutDistSq));
-        const float distFromCutEdge = static_cast<float>(cutRadius) - cutDistFromCenter;
-        if (distFromCutEdge > static_cast<float>(innerGlowReach)) continue;
-
-        // Project onto the cut edge: if that point is outside the moon outer circle,
-        // then this is not the crescent's inner boundary (it's the free outer part of the cut)
-        const float scaleCut = (cutDistFromCenter > 0.0f)
-                                    ? (static_cast<float>(cutRadius) / cutDistFromCenter)
-                                    : 0.0f;
-        const float projX = cutX + cdx * scaleCut;
-        const float projY = cutY + cdy * scaleCut;
-        const float pmx = projX - moonX;
-        const float pmy = projY - moonY;
-        if (pmx * pmx + pmy * pmy > static_cast<float>(moonRadiusSq)) continue;
-
-        // Don't glow pixels that are still part of the crescent itself
         const int32_t odx = x - moonX;
         const int32_t ody = y - moonY;
-        if (odx * odx + ody * ody >= moonRadiusSq) continue;  // outside moon = no inner glow
-        // If also inside cut (which we already checked), it's in the hole — glow here
+        const int32_t oSq = odx * odx + ody * ody;
+        const int32_t cdx = x - cutX;
+        const int32_t cdy = y - cutY;
+        const int32_t cSq = cdx * cdx + cdy * cdy;
 
-        const float t = 1.0f - (distFromCutEdge / static_cast<float>(innerGlowReach));
+        // Skip pixels inside the crescent (moon body will be drawn on top)
+        if (oSq <= moonRadiusSq && cSq >= cutRadiusSq) continue;
+
+        float bestDist = reachF + 1.0f;
+
+        // Outer arc: project onto moon outer circle. Valid if projection is outside cut.
+        if (oSq > 0) {
+          const float od = sqrtf(static_cast<float>(oSq));
+          const float s = moonRf / od;
+          const float px = moonX + odx * s;
+          const float py = moonY + ody * s;
+          const float pcx = px - cutX;
+          const float pcy = py - cutY;
+          if (pcx * pcx + pcy * pcy >= cutRf * cutRf) {
+            const float d = fabsf(od - moonRf);
+            if (d < bestDist) bestDist = d;
+          }
+        }
+        // Inner arc: project onto cut circle. Valid if projection is inside moon.
+        if (cSq > 0) {
+          const float cd = sqrtf(static_cast<float>(cSq));
+          const float s = cutRf / cd;
+          const float px = cutX + cdx * s;
+          const float py = cutY + cdy * s;
+          const float pmx = px - moonX;
+          const float pmy = py - moonY;
+          if (pmx * pmx + pmy * pmy <= moonRf * moonRf) {
+            const float d = fabsf(cd - cutRf);
+            if (d < bestDist) bestDist = d;
+          }
+        }
+        // Corner points (guarantees coverage where arc projections fall outside their valid ranges)
+        for (int c = 0; c < 2; ++c) {
+          const float rdx = x - cornerX[c];
+          const float rdy = y - cornerY[c];
+          const float d = sqrtf(rdx * rdx + rdy * rdy);
+          if (d < bestDist) bestDist = d;
+        }
+
+        if (bestDist >= reachF) continue;
+        const float t = 1.0f - (bestDist / reachF);
         const uint8_t glowAmt = static_cast<uint8_t>(t * t * 210.0f);
         if (glowAmt == 0) continue;
 
-        const uint8_t txAmt = columnTransitionAmount(x);
+        const uint8_t txAmt = moonTransitionAmount(x, y, moonX, moonY);
         const uint8_t activeWeight = gAnimationPaused ? (255 - txAmt) : txAmt;
         const uint16_t finalAmt = (static_cast<uint16_t>(glowAmt) * activeWeight) / 255;
         if (finalAmt == 0) continue;
 
         const size_t idx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
         framebuffer[idx] = blend565(framebuffer[idx], kMoonGlow, finalAmt);
-      }
-    }
-
-    // ---- Corner-tip glow: radial halo around each crescent corner point ----
-    if (cornersValid) {
-      const int32_t cornerReach = glowReach;
-      const int32_t cornerReachSq = cornerReach * cornerReach;
-      for (int c = 0; c < 2; ++c) {
-        const int16_t ccx = static_cast<int16_t>(lroundf(cornerX[c]));
-        const int16_t ccy = static_cast<int16_t>(lroundf(cornerY[c]));
-        for (int16_t y = ccy - cornerReach; y <= ccy + cornerReach; ++y) {
-          if (y < 0 || y >= LCD_HEIGHT) continue;
-          for (int16_t x = ccx - cornerReach; x <= ccx + cornerReach; ++x) {
-            if (x < 0 || x >= LCD_WIDTH) continue;
-
-            // Skip pixels that are inside the crescent itself (would overdraw moon body)
-            const int32_t odx = x - moonX;
-            const int32_t ody = y - moonY;
-            const int32_t oSq = odx * odx + ody * ody;
-            const int32_t cdx = x - cutX;
-            const int32_t cdy = y - cutY;
-            const int32_t cSq = cdx * cdx + cdy * cdy;
-            const bool insideCrescent = (oSq <= moonRadiusSq) && (cSq >= cutRadiusSq);
-            if (insideCrescent) continue;
-
-            const int32_t rdx = x - ccx;
-            const int32_t rdy = y - ccy;
-            const int32_t rSq = rdx * rdx + rdy * rdy;
-            if (rSq > cornerReachSq) continue;
-
-            const float dist = sqrtf(static_cast<float>(rSq));
-            const float t = 1.0f - (dist / static_cast<float>(cornerReach));
-            const uint8_t glowAmt = static_cast<uint8_t>(t * t * 210.0f);
-            if (glowAmt == 0) continue;
-
-            const uint8_t txAmt = columnTransitionAmount(x);
-            const uint8_t activeWeight = gAnimationPaused ? (255 - txAmt) : txAmt;
-            const uint16_t finalAmt = (static_cast<uint16_t>(glowAmt) * activeWeight) / 255;
-            if (finalAmt == 0) continue;
-
-            const size_t idx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
-            framebuffer[idx] = blend565(framebuffer[idx], kMoonGlow, finalAmt);
-          }
-        }
       }
     }
   }
@@ -2148,8 +2170,8 @@ void drawMoon()
       const int32_t cutDistSq = (cutDx * cutDx) + (cutDy * cutDy);
       if (cutDistSq < cutRadiusSq) continue;
 
-      // Determine which state this column is in
-      const uint8_t txAmt = columnTransitionAmount(x);
+      // Determine which state this pixel is in (angular sweep at spin rate)
+      const uint8_t txAmt = moonTransitionAmount(x, y, moonX, moonY);
 
       // Paused color: gold, with black border near outer/inner edge
       const bool onOuterBorder = outerDistSq >= moonInnerRadiusSq;
@@ -2181,7 +2203,7 @@ void drawOrb()
   constexpr uint32_t spinPeriodUs = 2100000UL;
   constexpr uint16_t kOrbGlowOuter = 0xFD20;
   constexpr uint16_t kOrbGlowInner = 0xFBE0;
-  const float spinAngle = -phaseAngleForPeriodUs(spinPeriodUs);
+  const float spinAngle = kFeatureMoonOrbSpin ? -phaseAngleForPeriodUs(spinPeriodUs) : 0.0f;
 
   for (int16_t ring = orbRadius + 12; ring >= orbRadius + 7; --ring) {
     const uint8_t amount = static_cast<uint8_t>(34 + ((orbRadius + 12 - ring) * 9));
@@ -2332,6 +2354,7 @@ void renderFrame()
 
 void updateStars(float elapsedSeconds)
 {
+  if (!kFeatureStarsDrifting) return;
   for (size_t index = 0; index < kBackgroundStarCount; ++index) {
     BackgroundStar &star = gBackgroundStars[index];
     star.x -= kSceneDriftPixelsPerSecond * elapsedSeconds;
@@ -2340,12 +2363,16 @@ void updateStars(float elapsedSeconds)
     }
   }
 
-  // Update shooting stars (with slight curve — rotate velocity each frame)
-  constexpr float kCurveRateRad = -0.35f; // radians per second (negative = curve the other way)
+}
+
+void updateShootingStars(float elapsedSeconds)
+{
+  if (!kFeatureShootingStars) return;
+  // Move and age active stars — runs even while paused so they keep streaming.
+  constexpr float kCurveRateRad = 0.35f;
   for (size_t i = 0; i < kShootingStarCount; ++i) {
     ShootingStar &s = gShootingStars[i];
     if (!s.active) continue;
-    // Rotate velocity slightly to bend the path
     const float cr = cosf(kCurveRateRad * elapsedSeconds);
     const float sr = sinf(kCurveRateRad * elapsedSeconds);
     const float nvx = s.vx * cr - s.vy * sr;
@@ -2361,41 +2388,27 @@ void updateStars(float elapsedSeconds)
     }
   }
 
-  // Spawn new shooting stars from a shared radiant (top-right off-screen).
-  // Probabilistic per-frame spawn: creates natural bursts and gaps.
-  // (TEMP: always on, regardless of charging)
-  {
-    // ~1.8% chance per frame at 60fps -> ~1.1 spawns/sec average, bursty
-    const uint32_t roll = esp_random() % 1000;
-    if (roll < 18) {
-      for (size_t i = 0; i < kShootingStarCount; ++i) {
-        if (!gShootingStars[i].active) {
-          ShootingStar &s = gShootingStars[i];
-          s.active = true;
-
-          // Fixed radiant point, off-screen top-right
-          constexpr float kRadiantX = LCD_WIDTH + 180.0f;
-          constexpr float kRadiantY = -160.0f;
-
-          // Pick an angle within a cone from radiant toward the lower-left
-          // Angle from +x axis; π = pure left, 3π/4 = down-left, π/2 = down
-          const float angle = 2.55f + (static_cast<float>(esp_random() % 70) / 100.0f); // ~2.55-3.25 rad
-          const float dirX = cosf(angle);
-          const float dirY = sinf(angle);
-
-          // Spawn somewhere along the ray from radiant, distance varies
-          const float dist = 120.0f + static_cast<float>(esp_random() % 360);
-          s.x = kRadiantX + dirX * dist;
-          s.y = kRadiantY + dirY * dist;
-
-          const float speed = 160.0f + static_cast<float>(esp_random() % 120);
-          s.vx = dirX * speed;
-          s.vy = dirY * speed;
-
-          s.lifeSec = 0.0f;
-          s.maxLifeSec = 3.5f + static_cast<float>(esp_random() % 200) / 100.0f; // 3.5-5.5s
-          break;
-        }
+  // Spawn new shooting stars — ~25% chance per frame at 60fps, ~15 attempts/sec.
+  if (esp_random() % 1000 < 250) {
+    for (size_t i = 0; i < kShootingStarCount; ++i) {
+      if (!gShootingStars[i].active) {
+        ShootingStar &s = gShootingStars[i];
+        s.active = true;
+        // Radiant off the top-left; stars streak down and to the right.
+        constexpr float kRadiantX = -180.0f;
+        constexpr float kRadiantY = -160.0f;
+        const float angle = 0.59f - (static_cast<float>(esp_random() % 70) / 100.0f);
+        const float dirX = cosf(angle);
+        const float dirY = sinf(angle);
+        const float dist = 120.0f + static_cast<float>(esp_random() % 360);
+        s.x = kRadiantX + dirX * dist;
+        s.y = kRadiantY + dirY * dist;
+        const float speed = 160.0f + static_cast<float>(esp_random() % 120);
+        s.vx = dirX * speed;
+        s.vy = dirY * speed;
+        s.lifeSec = 0.0f;
+        s.maxLifeSec = 2.0f + static_cast<float>(esp_random() % 150) / 100.0f; // 2.0–3.5s
+        break;
       }
     }
   }
@@ -2403,6 +2416,7 @@ void updateStars(float elapsedSeconds)
 
 void updateClouds(float elapsedSeconds)
 {
+  if (!kFeatureCloudsMoving) return;
   for (size_t index = 0; index < kCloudCount; ++index) {
     Cloud &cloud = gClouds[index];
     cloud.x -= cloud.speed * elapsedSeconds * kSceneDriftPixelsPerSecond * 3.0f;
@@ -2411,6 +2425,7 @@ void updateClouds(float elapsedSeconds)
     }
   }
 }
+
 } // namespace
 
 void setup()
@@ -2546,15 +2561,6 @@ void loop()
   }
   recheckSdCard();
   updateScrollImage();
-  // Detect pause state transitions and arm right-to-left wipe
-  if (gAnimationPaused != gLastPausedState) {
-    gPauseTransitionActive = true;
-    gPauseTransitionStartMs = now;
-    gLastPausedState = gAnimationPaused;
-  }
-  if (gPauseTransitionActive && now - gPauseTransitionStartMs >= kPauseTransitionDurationMs) {
-    gPauseTransitionActive = false;
-  }
   if (gPowerReady && now - gLastBatteryPollMs >= kBatteryPollMs) {
     gLastBatteryPollMs = now;
     int pct = gPower.getBatteryPercent();
@@ -2601,6 +2607,16 @@ void loop()
     }
     gBootButtonWasPressed = pressed;
   }
+  // Detect pause state transitions AFTER all input handling so the first rendered frame
+  // already has the transition active (prevents a single flash-frame of the new state).
+  if (gAnimationPaused != gLastPausedState) {
+    gPauseTransitionActive = true;
+    gPauseTransitionStartMs = now;
+    gLastPausedState = gAnimationPaused;
+  }
+  if (gPauseTransitionActive && now - gPauseTransitionStartMs >= kMoonTransitionDurationMs) {
+    gPauseTransitionActive = false;
+  }
   if (now - gLastFrameAtMs < kFrameIntervalMs) {
     delay(1);
     return;
@@ -2613,6 +2629,7 @@ void loop()
     updateStars(elapsedSeconds);
     updateClouds(elapsedSeconds);
   }
+  updateShootingStars(elapsedSeconds);  // always — runs even while paused
   renderFrame();
   if (gUseCanvas) {
     canvas->flush();
