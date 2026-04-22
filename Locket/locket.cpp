@@ -190,7 +190,7 @@ bool gAudioReady = false;
 bool gTouchReady = false;
 bool gTouchPressed = false;
 bool gTapTracking = false;
-bool gDragActive = false;
+int gDragActive = 0;  // 0 = none, 1 = orb horizontal tug, 2 = orb vertical tug
 int gVolume = kAudioVolumeDefault;
 uint32_t gLastVolumeSetMs = 0;
 bool gAnimationPaused = true;
@@ -202,6 +202,15 @@ int16_t gTouchX = LCD_WIDTH / 2;
 int16_t gTouchY = LCD_HEIGHT / 2;
 int16_t gTapStartX = LCD_WIDTH / 2;
 int16_t gTapStartY = LCD_HEIGHT / 2;
+
+// Orb tug: drag starting on the orb in a cardinal direction triggers an action.
+bool gOrbTugActive = false;
+volatile bool gRestartTrackRequested = false;       // left tug → restart current song
+int gOrbOffsetX = 0;                                // visible "pull" offset while tug is active
+int gOrbOffsetY = 0;
+uint32_t gVolTugLastMs = 0;                         // last touch-service tick while vertical tug active
+int32_t  gVolTugAccumQ8 = 0;                        // Q8 fractional-volume accumulator (rate × time)
+// std::vector<String> gPlayedHistory;  // (unused) previous-track history; kept for reference
 
 BackgroundStar gBackgroundStars[kBackgroundStarCount];
 CloudSprite gCloudSprites[kEmbeddedCloudSpriteCount];
@@ -234,9 +243,8 @@ bool gPauseTransitionActive = false;
 bool gLastPausedState = true;  // matches gAnimationPaused default
 uint32_t gPauseTransitionStartMs = 0;
 constexpr uint32_t kPauseTransitionDurationMs = 900;
-// Moon uses an angular sweep in the crescent's LOCAL frame so it tracks the spin
-// rather than sweeping in fixed screen coordinates.
-constexpr uint32_t kMoonTransitionDurationMs = 9000;
+// Moon uses a uniform crossfade — the whole crescent glows up/down together.
+constexpr uint32_t kMoonTransitionDurationMs = 1000;
 
 
 constexpr size_t kShootingStarCount = 16;
@@ -962,6 +970,10 @@ bool openAudioFile()
   gSelectedAudioPath = chosen;
   gActiveAudioPath = gSelectedAudioPath.c_str();
 
+  // (Previous-track history — unused; left tug restarts the current song instead.)
+  // gPlayedHistory.push_back(chosen);
+  // if (gPlayedHistory.size() > 16) gPlayedHistory.erase(gPlayedHistory.begin());
+
   if (gAudioFile) {
     gAudioFile.close();
   }
@@ -1136,6 +1148,46 @@ void updateAudioPlayback()
     }
     return;
   }
+
+  if (gRestartTrackRequested) {
+    gRestartTrackRequested = false;
+    // Restart the current track: push its path back onto the top of the shuffle
+    // queue so the next openAudioFile() re-picks it.
+    if (gActiveAudioPath) {
+      gShuffleQueue.push_back(String(gActiveAudioPath));
+    }
+    gUsingEmbeddedTrack = false;
+    closeAudioPlayback();
+    openAudioFile();
+    if (!gAudioFile) {
+      gUsingEmbeddedTrack = true;
+      reconfigureAudioRate(kAudioSampleRate);
+      gAudioDebugPcmOffset = 0;
+    }
+    return;
+  }
+
+  // (Previous-track via history — kept for reference)
+  // if (gPrevTrackRequested) {
+  //   gPrevTrackRequested = false;
+  //   if (gPlayedHistory.size() >= 2) {
+  //     const String current = gPlayedHistory.back();
+  //     gPlayedHistory.pop_back();
+  //     const String prev = gPlayedHistory.back();
+  //     gPlayedHistory.pop_back();
+  //     gShuffleQueue.push_back(current);
+  //     gShuffleQueue.push_back(prev);
+  //   }
+  //   gUsingEmbeddedTrack = false;
+  //   closeAudioPlayback();
+  //   openAudioFile();
+  //   if (!gAudioFile) {
+  //     gUsingEmbeddedTrack = true;
+  //     reconfigureAudioRate(kAudioSampleRate);
+  //     gAudioDebugPcmOffset = 0;
+  //   }
+  //   return;
+  // }
 
   if (gAnimationPaused) {
     return;
@@ -1654,15 +1706,17 @@ uint8_t columnTransitionAmount(int16_t x)
   return static_cast<uint8_t>(clamped * 255.0f);
 }
 
-// Moon transition: angular sweep in the crescent's LOCAL frame so it visually tracks the
-// spinning crescent rather than sweeping fixed screen coordinates.
+// Moon transition: uniform crossfade over kMoonTransitionDurationMs — every pixel
+// of the crescent glows up (or down) together, no spatial sweep.
 // 0 = old state, 255 = new state.
 uint8_t moonTransitionAmount(int16_t x, int16_t y, int16_t moonX, int16_t moonY)
 {
   if (!gPauseTransitionActive) return 255;
   const uint32_t elapsed = millis() - gPauseTransitionStartMs;
   if (elapsed >= kMoonTransitionDurationMs) return 255;
+  return static_cast<uint8_t>((elapsed * 255U) / kMoonTransitionDurationMs);
 
+#if 0  // previous angular sweep — kept for reference
   const float dx = static_cast<float>(x - moonX);
   const float dy = static_cast<float>(y - moonY);
   if (dx == 0.0f && dy == 0.0f) return 255;
@@ -1710,6 +1764,7 @@ uint8_t moonTransitionAmount(int16_t x, int16_t y, int16_t moonX, int16_t moonY)
     return static_cast<uint8_t>(t * 255.0f);
   }
   return 0;
+#endif
 }
 
 uint16_t pinkSkyColorForY(int16_t y)
@@ -1773,31 +1828,54 @@ uint16_t skyColorForY(int16_t y)
   return blend565(nightColor, dayColor, dayAmount);
 }
 
+static const int8_t kBayer4x4[4][4] = {
+    {-6, 2, -4, 4},
+    {6, -2, 4, -4},
+    {-3, 5, -5, 3},
+    {5, -3, 3, -5},
+};
+
+// Sky LUT: per-row, 4 dithered colors (indexed by x & 3). Rebuilt when gSkyPercent changes.
+uint16_t gSkyLUT[LCD_HEIGHT][4];
+uint8_t gSkyLUTPercent = 255;  // sentinel so first frame rebuilds
+
+void rebuildSkyLUT()
+{
+  for (int16_t y = 0; y < LCD_HEIGHT; ++y) {
+    const uint32_t baseMix = (static_cast<uint32_t>(y) * 255U) / (LCD_HEIGHT - 1);
+    for (int xm = 0; xm < 4; ++xm) {
+      const uint8_t ditheredMix = clampU8(static_cast<int>(baseMix) + kBayer4x4[y & 3][xm]);
+      const int16_t ditheredY = static_cast<int16_t>((static_cast<uint32_t>(ditheredMix) * (LCD_HEIGHT - 1)) / 255U);
+      gSkyLUT[y][xm] = skyColorForY(ditheredY);
+    }
+  }
+  gSkyLUTPercent = gSkyPercent;
+}
+
 uint16_t skyColorForPosition(int16_t x, int16_t y)
 {
-  static const int8_t kBayer4x4[4][4] = {
-      {-6, 2, -4, 4},
-      {6, -2, 4, -4},
-      {-3, 5, -5, 3},
-      {5, -3, 3, -5},
-  };
-
   const int16_t ySafe = max<int16_t>(0, min<int16_t>(LCD_HEIGHT - 1, y));
-  const uint32_t baseMix = (static_cast<uint32_t>(ySafe) * 255U) / (LCD_HEIGHT - 1);
-  const uint8_t ditheredMix = clampU8(static_cast<int>(baseMix) + kBayer4x4[ySafe & 3][x & 3]);
-  const int16_t ditheredY = static_cast<int16_t>((static_cast<uint32_t>(ditheredMix) * (LCD_HEIGHT - 1)) / 255U);
-
-  return skyColorForY(ditheredY);
+  return gSkyLUT[ySafe][x & 3];
 }
 
 void drawSkyBackground()
 {
+  if (gSkyLUTPercent != gSkyPercent) rebuildSkyLUT();
+
   uint16_t *framebuffer = gUseCanvas ? canvas->framebuffer() : nullptr;
   if (framebuffer) {
     for (int16_t y = 0; y < LCD_HEIGHT; ++y) {
-      const size_t row = static_cast<size_t>(y) * LCD_WIDTH;
-      for (int16_t x = 0; x < LCD_WIDTH; ++x) {
-        framebuffer[row + static_cast<size_t>(x)] = skyColorForPosition(x, y);
+      uint16_t *dst = framebuffer + static_cast<size_t>(y) * LCD_WIDTH;
+      const uint16_t c0 = gSkyLUT[y][0];
+      const uint16_t c1 = gSkyLUT[y][1];
+      const uint16_t c2 = gSkyLUT[y][2];
+      const uint16_t c3 = gSkyLUT[y][3];
+      // LCD_WIDTH is 368 (divisible by 4), unroll the 4-wide Bayer pattern.
+      for (int16_t x = 0; x < LCD_WIDTH; x += 4) {
+        dst[x]     = c0;
+        dst[x + 1] = c1;
+        dst[x + 2] = c2;
+        dst[x + 3] = c3;
       }
     }
     return;
@@ -1805,7 +1883,7 @@ void drawSkyBackground()
 
   for (int16_t y = 0; y < LCD_HEIGHT; ++y) {
     for (int16_t x = 0; x < LCD_WIDTH; ++x) {
-      gfx->drawPixel(x, y, skyColorForPosition(x, y));
+      gfx->drawPixel(x, y, gSkyLUT[y][x & 3]);
     }
   }
 }
@@ -1966,57 +2044,243 @@ void serviceTouch()
     gTouchY = static_cast<int16_t>(gTouchController->IIC_Read_Device_Value( gTouchController->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y));
   }
 
+  constexpr int orbCenterX = LCD_WIDTH / 2;
+  constexpr int orbCenterY = LCD_HEIGHT / 2;
+  constexpr int orbTugRadius = 80;          // touches within this radius are "on the orb"
+  constexpr int orbTugActivatePx = 10;      // drag must move this far before direction locks
+  constexpr int orbHorizThresholdPx = 50;   // horizontal tug must reach this to trigger nav
+  constexpr int orbHorizCommitted = 1;      // gDragActive value encoding "horizontal tug"
+  constexpr int orbVertCommitted = 2;       // encoding "vertical (volume) tug"
+
   if (pressedNow && !wasPressed) {
     gTapTracking = true;
     gTapStartedAtMs = millis();
     gTapStartX = gTouchX;
     gTapStartY = gTouchY;
+    const int odx = gTouchX - orbCenterX;
+    const int ody = gTouchY - orbCenterY;
+    gOrbTugActive = (odx * odx + ody * ody) <= orbTugRadius * orbTugRadius;
+    gDragActive = 0;
+    gVolTugLastMs = 0;
+    gVolTugAccumQ8 = 0;
   } else if (!pressedNow && wasPressed) {
-    const int dx = abs(gTouchX - gTapStartX);
-    const int dy = abs(gTouchY - gTapStartY);
+    const int dxSigned = gTouchX - gTapStartX;
+    const int dySigned = gTouchY - gTapStartY;
+    const int dxAbs = abs(dxSigned);
+    const int dyAbs = abs(dySigned);
     const uint32_t heldMs = millis() - gTapStartedAtMs;
-    if (gTapTracking && heldMs <= kTapMaxDurationMs && dx <= kTapMaxTravelPx && dy <= kTapMaxTravelPx) {
+    if (gTapTracking && heldMs <= kTapMaxDurationMs && dxAbs <= kTapMaxTravelPx && dyAbs <= kTapMaxTravelPx) {
       toggleAnimationPause();
-    }
-    gTapTracking = false;
-  } else if (pressedNow && gTapTracking) {
-    const int dx = abs(gTouchX - gTapStartX);
-    const int dy = abs(gTouchY - gTapStartY);
-    if (dx > kTapMaxTravelPx || dy > kTapMaxTravelPx) {
-      gTapTracking = false;
-      if (dy > dx) {
-        gDragActive = true;
-        logf("Locket: drag started (y=%d)\n", gTouchY);
+    } else if (gOrbTugActive && gDragActive == orbHorizCommitted) {
+      // Horizontal tug released — trigger nav if it crossed the threshold.
+      if (dxSigned >= orbHorizThresholdPx) {
+        if (gAnimationPaused) {
+          toggleAnimationPause();
+          logf("Locket: orb tug right (paused) → play\n");
+        } else {
+          gSkipTrack = true;
+          logf("Locket: orb tug right → next track\n");
+        }
+      } else if (dxSigned <= -orbHorizThresholdPx) {
+        gRestartTrackRequested = true;
+        logf("Locket: orb tug left → restart track\n");
       }
-    }
-  }
-
-  // Volume drag: finger y position maps directly to volume (top = 100%, bottom = 0%).
-  // Volume only changes while gDragActive is true.
-  if (pressedNow && gDragActive) {
-    int newVol = constrain(100 - (gTouchY * 100 / LCD_HEIGHT), 0, 100);
-    if (newVol != gVolume) {
-      gVolume = newVol;
-      const uint32_t now_ms = millis();
-      if (gAudioCodec && now_ms - gLastVolumeSetMs >= 20) {
-        gLastVolumeSetMs = now_ms;
+    } else if (gOrbTugActive && gDragActive == orbVertCommitted) {
+      // Vertical tug: volume has been ticking continuously — apply final value.
+      if (gAudioCodec) {
         es8311_voice_volume_set(gAudioCodec, gVolume, nullptr);
       }
-      logf("Locket: volume %d%% (y=%d)\n", gVolume, gTouchY);
+      logf("Locket: orb tug vertical released → volume=%d%%\n", gVolume);
+    }
+    gTapTracking = false;
+    gOrbTugActive = false;
+    gDragActive = 0;
+    gOrbOffsetX = 0;
+    gOrbOffsetY = 0;
+  } else if (pressedNow && gTapTracking) {
+    const int dxAbs = abs(gTouchX - gTapStartX);
+    const int dyAbs = abs(gTouchY - gTapStartY);
+    if (dxAbs > kTapMaxTravelPx || dyAbs > kTapMaxTravelPx) {
+      gTapTracking = false;
     }
   }
 
-  if (!pressedNow && gDragActive) {
-    // Apply final volume on release in case rate limit skipped it
-    if (gAudioCodec) {
-      es8311_voice_volume_set(gAudioCodec, gVolume, nullptr);
+  // Once movement passes the activation distance, lock the tug to a cardinal axis.
+  if (pressedNow && gOrbTugActive && gDragActive == 0) {
+    const int dxAbs = abs(gTouchX - gTapStartX);
+    const int dyAbs = abs(gTouchY - gTapStartY);
+    if (dxAbs >= orbTugActivatePx || dyAbs >= orbTugActivatePx) {
+      gDragActive = (dxAbs > dyAbs) ? orbHorizCommitted : orbVertCommitted;
+      gTapTracking = false;  // past threshold → definitely not a tap
     }
-    logf("Locket: drag ended (volume=%d%%)\n", gVolume);
-    gDragActive = false;
+  }
+
+  // Vertical tug: rate-based volume. Past a small dead-zone, the offset becomes a rate,
+  // so holding pulled-up keeps raising volume, and a bigger pull changes it faster.
+  if (pressedNow && gOrbTugActive && gDragActive == orbVertCommitted) {
+    const uint32_t now_ms = millis();
+    if (gVolTugLastMs == 0) gVolTugLastMs = now_ms;
+    const uint32_t dtMs = now_ms - gVolTugLastMs;
+    gVolTugLastMs = now_ms;
+
+    constexpr int kDeadZonePx = 12;
+    const int dy = gTouchY - gTapStartY;   // +down / −up
+    int pastDz = 0;
+    if (dy >  kDeadZonePx) pastDz = dy - kDeadZonePx;
+    else if (dy < -kDeadZonePx) pastDz = dy + kDeadZonePx;
+
+    // Rate law: ~80 px past dead-zone ≈ 10 %/s (slow — fine-grained control is the goal;
+    // reach the extremes by pulling hard). Accumulate in Q8 so sub-1% ticks don't lose.
+    gVolTugAccumQ8 += (-static_cast<int32_t>(pastDz) * static_cast<int32_t>(dtMs) * 256) / 8000;
+    const int32_t wholeSteps = gVolTugAccumQ8 >> 8;
+    if (wholeSteps != 0) {
+      gVolTugAccumQ8 -= wholeSteps << 8;
+      const int newVol = constrain(gVolume + static_cast<int>(wholeSteps), 0, 100);
+      if (newVol != gVolume) {
+        gVolume = newVol;
+        if (gAudioCodec && now_ms - gLastVolumeSetMs >= 20) {
+          gLastVolumeSetMs = now_ms;
+          es8311_voice_volume_set(gAudioCodec, gVolume, nullptr);
+        }
+      }
+    }
+  } else {
+    gVolTugLastMs = 0;
+    gVolTugAccumQ8 = 0;
+  }
+
+  // Visible "pull" offset — track the finger from the instant it lands on the orb.
+  // Pre-lock: free 2D rubber-band. After axis lock: constrain to the locked axis.
+  if (pressedNow && gOrbTugActive) {
+    const int rawX = (gTouchX - gTapStartX) / 2;
+    const int rawY = (gTouchY - gTapStartY) / 2;
+    if (gDragActive == orbHorizCommitted) {
+      gOrbOffsetX = constrain(rawX, -30, 30);
+      gOrbOffsetY = 0;
+    } else if (gDragActive == orbVertCommitted) {
+      gOrbOffsetX = 0;
+      gOrbOffsetY = constrain(rawY, -30, 30);
+    } else {
+      gOrbOffsetX = constrain(rawX, -30, 30);
+      gOrbOffsetY = constrain(rawY, -30, 30);
+    }
+  } else if (!pressedNow) {
+    gOrbOffsetX = 0;
+    gOrbOffsetY = 0;
   }
 
   gTouchPressed = pressedNow;
   gTouchController->IIC_Interrupt_Flag = false;
+}
+
+// Precomputed moon masks (rotation-invariant, built once at boot).
+// Mask lives in PSRAM — indexed in the crescent's LOCAL frame (cut on +x axis).
+// At draw time we rotate each world pixel back into the local frame and sample.
+constexpr int kMoonMaskR = 210;                          // covers moonRadius(177) + glowReach(32) + margin
+constexpr int kMoonMaskSize = 2 * kMoonMaskR + 1;        // 421
+uint8_t *gMoonGlowMask = nullptr;                        // [N] glow intensity 0..210, 0 if body
+uint8_t *gMoonBodyMask = nullptr;                        // [N] 0=empty,1=interior,2=outerBorder,3=innerBorder
+
+void buildMoonMasks()
+{
+  if (gMoonGlowMask && gMoonBodyMask) return;
+
+  const size_t N = static_cast<size_t>(kMoonMaskSize) * static_cast<size_t>(kMoonMaskSize);
+  gMoonGlowMask = static_cast<uint8_t *>(ps_calloc(N, 1));
+  gMoonBodyMask = static_cast<uint8_t *>(ps_calloc(N, 1));
+  if (!gMoonGlowMask || !gMoonBodyMask) {
+    logf("Locket: moon mask alloc failed (%zu bytes each)\n", N);
+    return;
+  }
+
+  constexpr float moonR = 177.0f;
+  constexpr float cutR  = 177.0f - 20.0f;
+  constexpr float cutOff = 177.0f * 0.49f;
+  constexpr float borderPx = 3.0f;
+  const float moonRSq = moonR * moonR;
+  const float cutRSq  = cutR  * cutR;
+  const float moonInnerRSq = (moonR - borderPx) * (moonR - borderPx);
+  const float cutOuterRSq  = (cutR  + borderPx) * (cutR  + borderPx);
+  constexpr float glowReachF = 32.0f;
+
+  // Corner points in local frame (cut center at (cutOff, 0))
+  float cornerLx[2] = {0, 0}, cornerLy[2] = {0, 0};
+  bool cornersValid = false;
+  {
+    const float d = cutOff;
+    if (d > 1e-3f && d < moonR + cutR && d > fabsf(moonR - cutR)) {
+      const float a = (moonR * moonR - cutR * cutR + d * d) / (2.0f * d);
+      const float hSq = moonR * moonR - a * a;
+      if (hSq >= 0.0f) {
+        const float h = sqrtf(hSq);
+        cornerLx[0] = a;  cornerLy[0] =  h;
+        cornerLx[1] = a;  cornerLy[1] = -h;
+        cornersValid = true;
+      }
+    }
+  }
+
+  for (int my = 0; my < kMoonMaskSize; ++my) {
+    const float ly = static_cast<float>(my - kMoonMaskR);
+    for (int mx = 0; mx < kMoonMaskSize; ++mx) {
+      const float lx = static_cast<float>(mx - kMoonMaskR);
+      const float oSq = lx * lx + ly * ly;
+      const float ccdx = lx - cutOff;
+      const float ccdy = ly;
+      const float cSq = ccdx * ccdx + ccdy * ccdy;
+      const size_t idx = static_cast<size_t>(my) * kMoonMaskSize + static_cast<size_t>(mx);
+
+      // Body classification
+      if (oSq <= moonRSq && cSq >= cutRSq) {
+        uint8_t state = 1;
+        if (oSq >= moonInnerRSq) state = 2;
+        else if (cSq <= cutOuterRSq) state = 3;
+        gMoonBodyMask[idx] = state;
+        continue;
+      }
+
+      // Glow pass — min distance to crescent outline
+      float bestDist = glowReachF + 1.0f;
+
+      if (oSq > 0.0f) {
+        const float od = sqrtf(oSq);
+        const float s = moonR / od;
+        const float px = lx * s;
+        const float py = ly * s;
+        const float pcx = px - cutOff;
+        const float pcy = py;
+        if (pcx * pcx + pcy * pcy >= cutRSq) {
+          const float d = fabsf(od - moonR);
+          if (d < bestDist) bestDist = d;
+        }
+      }
+      if (cSq > 0.0f) {
+        const float cd = sqrtf(cSq);
+        const float s = cutR / cd;
+        const float px = cutOff + ccdx * s;
+        const float py = ccdy * s;
+        if (px * px + py * py <= moonRSq) {
+          const float d = fabsf(cd - cutR);
+          if (d < bestDist) bestDist = d;
+        }
+      }
+      if (cornersValid) {
+        for (int c = 0; c < 2; ++c) {
+          const float rdx = lx - cornerLx[c];
+          const float rdy = ly - cornerLy[c];
+          const float d = sqrtf(rdx * rdx + rdy * rdy);
+          if (d < bestDist) bestDist = d;
+        }
+      }
+
+      if (bestDist < glowReachF) {
+        const float t = 1.0f - (bestDist / glowReachF);
+        gMoonGlowMask[idx] = static_cast<uint8_t>(t * t * 210.0f);
+      }
+    }
+  }
+
+  logf("Locket: moon masks built (%dx%d)\n", kMoonMaskSize, kMoonMaskSize);
 }
 
 void drawMoon()
@@ -2079,6 +2343,72 @@ void drawMoon()
     }
   }
 
+  // Fast path: rotation-sampled mask lookup (built once, no per-pixel sqrts).
+  if (framebuffer && gMoonGlowMask && gMoonBodyMask) {
+    // Q16 fixed-point rotation — avoids per-pixel float→int conversion.
+    const int32_t cosQ = static_cast<int32_t>(cosf(orbitAngle) * 65536.0f);
+    const int32_t sinQ = static_cast<int32_t>(sinf(orbitAngle) * 65536.0f);
+    const int32_t bboxR = kMoonMaskR;
+    const bool txActive = gPauseTransitionActive;
+    const bool paused = gAnimationPaused;
+    const int32_t bboxRSq = bboxR * bboxR;
+
+    for (int16_t y = moonY - bboxR; y <= moonY + bboxR; ++y) {
+      if (y < 0 || y >= LCD_HEIGHT) continue;
+      const int32_t wdyI = y - moonY;
+      const int32_t wdyISq = wdyI * wdyI;
+      // Row-invariant components: sinQ*wdy and cosQ*wdy.
+      const int32_t sinQ_wdy = sinQ * wdyI;
+      const int32_t cosQ_wdy = cosQ * wdyI;
+      for (int16_t x = moonX - bboxR; x <= moonX + bboxR; ++x) {
+        if (x < 0 || x >= LCD_WIDTH) continue;
+        const int32_t wdxI = x - moonX;
+        // Disk early-out: mask content is empty beyond bboxR radius.
+        if (wdxI * wdxI + wdyISq > bboxRSq) continue;
+        // Rotate world→local by -orbitAngle via integer Q16 math.
+        const int32_t lxQ = cosQ * wdxI + sinQ_wdy;
+        const int32_t lyQ = -sinQ * wdxI + cosQ_wdy;
+        const int mx = ((lxQ + 32768) >> 16) + kMoonMaskR;
+        const int my = ((lyQ + 32768) >> 16) + kMoonMaskR;
+        if (mx < 0 || mx >= kMoonMaskSize || my < 0 || my >= kMoonMaskSize) continue;
+        const size_t maskIdx = static_cast<size_t>(my) * kMoonMaskSize + static_cast<size_t>(mx);
+        const uint8_t bodyState = gMoonBodyMask[maskIdx];
+        const size_t fbIdx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
+        if (bodyState) {
+          const bool isBorder = (bodyState == 2 || bodyState == 3);
+          const uint16_t pausedColor = isBorder ? kMoonBorder : kMoonGold;
+          const uint16_t activeColor = kMoonHot;
+          uint16_t moonColor;
+          if (txActive) {
+            const uint8_t txAmt = moonTransitionAmount(x, y, moonX, moonY);
+            const uint16_t newColor = paused ? pausedColor : activeColor;
+            const uint16_t oldColor = paused ? activeColor : pausedColor;
+            moonColor = blend565(oldColor, newColor, txAmt);
+          } else {
+            moonColor = paused ? pausedColor : activeColor;
+          }
+          framebuffer[fbIdx] = moonColor;
+        } else {
+          const uint8_t glowAmt = gMoonGlowMask[maskIdx];
+          if (!glowAmt) continue;
+          uint8_t activeWeight;
+          if (txActive) {
+            const uint8_t txAmt = moonTransitionAmount(x, y, moonX, moonY);
+            activeWeight = paused ? static_cast<uint8_t>(255 - txAmt) : txAmt;
+          } else if (paused) {
+            continue;  // no glow when paused and no transition running
+          } else {
+            activeWeight = 255;
+          }
+          const uint16_t finalAmt = (static_cast<uint16_t>(glowAmt) * activeWeight) / 255;
+          if (finalAmt == 0) continue;
+          framebuffer[fbIdx] = blend565(framebuffer[fbIdx], kMoonGlow, finalAmt);
+        }
+      }
+    }
+    return;  // Done — skip the legacy glow+body paths below.
+  }
+
   // Unified glow: for each pixel in the bounding box around the crescent, compute
   // the true minimum distance to the crescent outline (two arcs joined at corners),
   // then apply a quadratic glow falloff. This eliminates seams between separate passes.
@@ -2087,6 +2417,19 @@ void drawMoon()
     const float cutRf = static_cast<float>(cutRadius);
     const int32_t bboxR = moonRadius + glowReach;
     const float reachF = static_cast<float>(glowReach);
+    // Squared-distance bounds for early-out — a pixel can only glow if it's within
+    // glowReach of at least one of: outer arc, inner arc, or a corner point.
+    const int32_t outerNearSq = (moonRadius - glowReach) * (moonRadius - glowReach);
+    const int32_t outerFarSq  = (moonRadius + glowReach) * (moonRadius + glowReach);
+    const int32_t cutNearSq   = (cutRadius  - glowReach) * (cutRadius  - glowReach);
+    const int32_t cutFarSq    = (cutRadius  + glowReach) * (cutRadius  + glowReach);
+    const int32_t cornerReachSq = glowReach * glowReach;
+    const bool pauseTxActive = gPauseTransitionActive;
+    const bool paused = gAnimationPaused;
+    // When no transition is running, moonTransitionAmount returns 255 → activeWeight
+    // is constant across the loop; avoid the per-pixel function call.
+    const uint8_t staticActiveWeight = paused ? 0 : 255;
+
     for (int16_t y = moonY - bboxR; y <= moonY + bboxR; ++y) {
       if (y < 0 || y >= LCD_HEIGHT) continue;
       for (int16_t x = moonX - bboxR; x <= moonX + bboxR; ++x) {
@@ -2102,10 +2445,25 @@ void drawMoon()
         // Skip pixels inside the crescent (moon body will be drawn on top)
         if (oSq <= moonRadiusSq && cSq >= cutRadiusSq) continue;
 
+        // Early-out: is this pixel near ANY part of the outline? If not, no sqrt needed.
+        const bool nearOuter = (oSq >= outerNearSq && oSq <= outerFarSq);
+        const bool nearInner = (cSq >= cutNearSq   && cSq <= cutFarSq);
+        const int32_t c0dx = x - static_cast<int32_t>(cornerX[0]);
+        const int32_t c0dy = y - static_cast<int32_t>(cornerY[0]);
+        const int32_t c0Sq = c0dx * c0dx + c0dy * c0dy;
+        const int32_t c1dx = x - static_cast<int32_t>(cornerX[1]);
+        const int32_t c1dy = y - static_cast<int32_t>(cornerY[1]);
+        const int32_t c1Sq = c1dx * c1dx + c1dy * c1dy;
+        const bool nearCorner = (c0Sq <= cornerReachSq || c1Sq <= cornerReachSq);
+        if (!nearOuter && !nearInner && !nearCorner) continue;
+
+        // If paused and no transition is running, glow contributes zero — skip.
+        if (!pauseTxActive && paused) continue;
+
         float bestDist = reachF + 1.0f;
 
         // Outer arc: project onto moon outer circle. Valid if projection is outside cut.
-        if (oSq > 0) {
+        if (nearOuter && oSq > 0) {
           const float od = sqrtf(static_cast<float>(oSq));
           const float s = moonRf / od;
           const float px = moonX + odx * s;
@@ -2118,7 +2476,7 @@ void drawMoon()
           }
         }
         // Inner arc: project onto cut circle. Valid if projection is inside moon.
-        if (cSq > 0) {
+        if (nearInner && cSq > 0) {
           const float cd = sqrtf(static_cast<float>(cSq));
           const float s = cutRf / cd;
           const float px = cutX + cdx * s;
@@ -2130,11 +2488,14 @@ void drawMoon()
             if (d < bestDist) bestDist = d;
           }
         }
-        // Corner points (guarantees coverage where arc projections fall outside their valid ranges)
-        for (int c = 0; c < 2; ++c) {
-          const float rdx = x - cornerX[c];
-          const float rdy = y - cornerY[c];
-          const float d = sqrtf(rdx * rdx + rdy * rdy);
+        // Corner points (guarantees coverage where arc projections fall outside their valid ranges).
+        // Only take sqrt if the squared-distance bound was already satisfied (nearCorner).
+        if (c0Sq <= cornerReachSq) {
+          const float d = sqrtf(static_cast<float>(c0Sq));
+          if (d < bestDist) bestDist = d;
+        }
+        if (c1Sq <= cornerReachSq) {
+          const float d = sqrtf(static_cast<float>(c1Sq));
           if (d < bestDist) bestDist = d;
         }
 
@@ -2143,8 +2504,13 @@ void drawMoon()
         const uint8_t glowAmt = static_cast<uint8_t>(t * t * 210.0f);
         if (glowAmt == 0) continue;
 
-        const uint8_t txAmt = moonTransitionAmount(x, y, moonX, moonY);
-        const uint8_t activeWeight = gAnimationPaused ? (255 - txAmt) : txAmt;
+        uint8_t activeWeight;
+        if (pauseTxActive) {
+          const uint8_t txAmt = moonTransitionAmount(x, y, moonX, moonY);
+          activeWeight = paused ? (255 - txAmt) : txAmt;
+        } else {
+          activeWeight = staticActiveWeight;
+        }
         const uint16_t finalAmt = (static_cast<uint16_t>(glowAmt) * activeWeight) / 255;
         if (finalAmt == 0) continue;
 
@@ -2154,6 +2520,8 @@ void drawMoon()
     }
   }
 
+  const bool bodyTxActive = gPauseTransitionActive;
+  const bool bodyPaused = gAnimationPaused;
   for (int16_t y = moonY - moonRadius; y <= moonY + moonRadius; ++y) {
     if (y < 0 || y >= LCD_HEIGHT) continue;
 
@@ -2170,20 +2538,21 @@ void drawMoon()
       const int32_t cutDistSq = (cutDx * cutDx) + (cutDy * cutDy);
       if (cutDistSq < cutRadiusSq) continue;
 
-      // Determine which state this pixel is in (angular sweep at spin rate)
-      const uint8_t txAmt = moonTransitionAmount(x, y, moonX, moonY);
-
       // Paused color: gold, with black border near outer/inner edge
       const bool onOuterBorder = outerDistSq >= moonInnerRadiusSq;
       const bool onInnerBorder = cutDistSq <= cutOuterRadiusSq;
       const uint16_t pausedColor = (onOuterBorder || onInnerBorder) ? kMoonBorder : kMoonGold;
-
-      // Active color: hot yellow-white
       const uint16_t activeColor = kMoonHot;
 
-      uint16_t newColor = gAnimationPaused ? pausedColor : activeColor;
-      uint16_t oldColor = gAnimationPaused ? activeColor : pausedColor;
-      const uint16_t moonColor = blend565(oldColor, newColor, txAmt);
+      uint16_t moonColor;
+      if (bodyTxActive) {
+        const uint8_t txAmt = moonTransitionAmount(x, y, moonX, moonY);
+        const uint16_t newColor = bodyPaused ? pausedColor : activeColor;
+        const uint16_t oldColor = bodyPaused ? activeColor : pausedColor;
+        moonColor = blend565(oldColor, newColor, txAmt);
+      } else {
+        moonColor = bodyPaused ? pausedColor : activeColor;
+      }
 
       if (framebuffer) {
         const size_t pixelIndex = (static_cast<size_t>(y) * LCD_WIDTH) + static_cast<size_t>(x);
@@ -2197,8 +2566,8 @@ void drawMoon()
 
 void drawOrb()
 {
-  constexpr int16_t orbX = LCD_WIDTH / 2;
-  constexpr int16_t orbY = LCD_HEIGHT / 2;
+  const int16_t orbX = LCD_WIDTH / 2 + gOrbOffsetX;
+  const int16_t orbY = LCD_HEIGHT / 2 + gOrbOffsetY;
   constexpr int16_t orbRadius = 42;
   constexpr uint32_t spinPeriodUs = 2100000UL;
   constexpr uint16_t kOrbGlowOuter = 0xFD20;
@@ -2298,6 +2667,26 @@ void drawCloud(const Cloud &cloud)
   const int16_t originY = cloud.y;
   uint16_t *framebuffer = gUseCanvas ? canvas->framebuffer() : nullptr;
 
+  // Clamp dx range to the visible horizontal extent — removes per-pixel bounds checks.
+  int16_t dxStart = max<int16_t>(0, -originX);
+  int16_t dxEnd   = min<int16_t>(drawWidth, LCD_WIDTH - originX);
+  if (dxStart >= dxEnd) return;
+
+  // Q16 step accumulator replaces a per-pixel 32-bit divide.
+  const uint32_t stepQ16 = (static_cast<uint32_t>(sourceWidth) << 16) / static_cast<uint32_t>(drawWidth);
+  const uint16_t flipBase = cloud.flipX ? static_cast<uint16_t>(sourceWidth - 1U) : 0;
+
+  const uint16_t alphaScale = static_cast<uint16_t>(17U * cloud.alphaPct);
+
+  // Precompute 16-entry tone and opacity tables for this cloud (4-bit light + 4-bit alpha nibbles).
+  uint16_t toneLUT[16];
+  uint8_t opacityLUT[16];
+  for (int i = 0; i < 16; ++i) {
+    toneLUT[i] = cloudTone(static_cast<uint8_t>(i));
+    uint16_t o = (static_cast<uint16_t>(i) * alphaScale) / 100U;
+    opacityLUT[i] = static_cast<uint8_t>(o > 235U ? 235U : o);
+  }
+
   for (int16_t dy = 0; dy < drawHeight; ++dy) {
     const int16_t destY = originY + dy;
     if (destY < 0 || destY >= LCD_HEIGHT) {
@@ -2308,48 +2697,68 @@ void drawCloud(const Cloud &cloud)
     const size_t srcRow = static_cast<size_t>(srcY) * sourceWidth;
     const size_t destRow = static_cast<size_t>(destY) * LCD_WIDTH;
 
-    for (int16_t dx = 0; dx < drawWidth; ++dx) {
-      const int16_t destX = originX + dx;
-      if (destX < 0 || destX >= LCD_WIDTH) {
-        continue;
+    if (framebuffer) {
+      uint16_t *dst = framebuffer + destRow;
+      uint32_t srcXQ16 = stepQ16 * static_cast<uint32_t>(dxStart);
+      for (int16_t dx = dxStart; dx < dxEnd; ++dx, srcXQ16 += stepQ16) {
+        uint16_t sx = static_cast<uint16_t>(srcXQ16 >> 16);
+        if (cloud.flipX) sx = flipBase - sx;
+        const uint8_t packed = pixels[srcRow + sx];
+        const uint8_t alpha4 = packed >> 4;
+        if (!alpha4) continue;
+        const uint8_t opacity = opacityLUT[alpha4];
+        const uint16_t color = toneLUT[packed & 0x0F];
+        const int16_t destX = originX + dx;
+        dst[destX] = blend565(dst[destX], color, opacity);
       }
-
-      uint16_t srcX = static_cast<uint16_t>((static_cast<uint32_t>(dx) * sourceWidth) / drawWidth);
-      if (cloud.flipX) {
-        srcX = static_cast<uint16_t>((sourceWidth - 1U) - srcX);
-      }
-
-      const uint8_t packed = pixels[srcRow + srcX];
-      const uint8_t alpha4 = packed >> 4;
-      if (!alpha4) {
-        continue;
-      }
-
-      uint8_t opacity = static_cast<uint8_t>((static_cast<uint16_t>(alpha4) * 17U * cloud.alphaPct) / 100U);
-      opacity = min<uint8_t>(opacity, 235);
-      const uint16_t color = cloudTone(packed & 0x0F);
-
-      if (framebuffer) {
-        const size_t pixelIndex = destRow + static_cast<size_t>(destX);
-        framebuffer[pixelIndex] = blend565(framebuffer[pixelIndex], color, opacity);
-      } else {
+    } else {
+      uint32_t srcXQ16 = stepQ16 * static_cast<uint32_t>(dxStart);
+      for (int16_t dx = dxStart; dx < dxEnd; ++dx, srcXQ16 += stepQ16) {
+        uint16_t sx = static_cast<uint16_t>(srcXQ16 >> 16);
+        if (cloud.flipX) sx = flipBase - sx;
+        const uint8_t packed = pixels[srcRow + sx];
+        const uint8_t alpha4 = packed >> 4;
+        if (!alpha4) continue;
+        const uint8_t opacity = opacityLUT[alpha4];
+        const uint16_t color = toneLUT[packed & 0x0F];
+        const int16_t destX = originX + dx;
         gfx->drawPixel(destX, destY, blend565(skyColorForPosition(destX, destY), color, opacity));
       }
     }
   }
 }
 
+struct FrameTimings {
+  uint32_t sky, stars, shootingStars, clouds, moon, orb, scroll;
+};
+FrameTimings gLastFrameTimings = {};
+
 void renderFrame()
 {
+  const uint64_t t0 = esp_timer_get_time();
   drawSkyBackground();
+  const uint64_t t1 = esp_timer_get_time();
   drawStars();
+  const uint64_t t2 = esp_timer_get_time();
   drawShootingStars();
+  const uint64_t t3 = esp_timer_get_time();
   for (size_t index = 0; index < kCloudCount; ++index) {
     drawCloud(gClouds[index]);
   }
+  const uint64_t t4 = esp_timer_get_time();
   drawMoon();
+  const uint64_t t5 = esp_timer_get_time();
   drawOrb();
+  const uint64_t t6 = esp_timer_get_time();
   drawScrollImage();  // on top of everything
+  const uint64_t t7 = esp_timer_get_time();
+  gLastFrameTimings.sky = static_cast<uint32_t>(t1 - t0);
+  gLastFrameTimings.stars = static_cast<uint32_t>(t2 - t1);
+  gLastFrameTimings.shootingStars = static_cast<uint32_t>(t3 - t2);
+  gLastFrameTimings.clouds = static_cast<uint32_t>(t4 - t3);
+  gLastFrameTimings.moon = static_cast<uint32_t>(t5 - t4);
+  gLastFrameTimings.orb = static_cast<uint32_t>(t6 - t5);
+  gLastFrameTimings.scroll = static_cast<uint32_t>(t7 - t6);
 }
 
 void updateStars(float elapsedSeconds)
@@ -2369,7 +2778,7 @@ void updateShootingStars(float elapsedSeconds)
 {
   if (!kFeatureShootingStars) return;
   // Move and age active stars — runs even while paused so they keep streaming.
-  constexpr float kCurveRateRad = 0.35f;
+  constexpr float kCurveRateRad = 0.0f;
   for (size_t i = 0; i < kShootingStarCount; ++i) {
     ShootingStar &s = gShootingStars[i];
     if (!s.active) continue;
@@ -2388,24 +2797,38 @@ void updateShootingStars(float elapsedSeconds)
     }
   }
 
-  // Spawn new shooting stars — ~25% chance per frame at 60fps, ~15 attempts/sec.
-  if (esp_random() % 1000 < 250) {
+  // Spawn new shooting stars only while charging. In-flight stars keep going so
+  // they finish naturally if charging stops mid-streak.
+  if (gIsCharging && esp_random() % 1000 < 250) {
     for (size_t i = 0; i < kShootingStarCount; ++i) {
       if (!gShootingStars[i].active) {
         ShootingStar &s = gShootingStars[i];
         s.active = true;
-        // Radiant off the top-left; stars streak down and to the right.
-        constexpr float kRadiantX = -180.0f;
-        constexpr float kRadiantY = -160.0f;
-        const float angle = 0.59f - (static_cast<float>(esp_random() % 70) / 100.0f);
-        const float dirX = cosf(angle);
-        const float dirY = sinf(angle);
-        const float dist = 120.0f + static_cast<float>(esp_random() % 360);
-        s.x = kRadiantX + dirX * dist;
-        s.y = kRadiantY + dirY * dist;
+        // Point-source radiant near the top-right corner of the screen (slightly off-screen
+        // so the convergence point is outside the visible area). Each star's velocity
+        // points directly away from this radiant, so spawns on the top edge get shallower
+        // (more horizontal) trajectories and spawns on the right edge get steeper (more
+        // vertical) ones — the "greater/lesser incidence" effect.
+        constexpr float radiantX = static_cast<float>(LCD_WIDTH) + 80.0f;
+        constexpr float radiantY = -80.0f;
+
+        // Spawn along the top or right edge (weighted by edge length).
+        const uint32_t edgeRoll = esp_random() % static_cast<uint32_t>(LCD_WIDTH + LCD_HEIGHT);
+        if (edgeRoll < static_cast<uint32_t>(LCD_WIDTH)) {
+          s.x = static_cast<float>(edgeRoll);
+          s.y = -20.0f;
+        } else {
+          s.x = static_cast<float>(LCD_WIDTH) + 20.0f;
+          s.y = static_cast<float>(edgeRoll - static_cast<uint32_t>(LCD_WIDTH));
+        }
+
+        // Velocity: from radiant → spawn point, scaled to a random speed.
+        const float dx = s.x - radiantX;
+        const float dy = s.y - radiantY;
+        const float invNorm = 1.0f / sqrtf(dx * dx + dy * dy);
         const float speed = 160.0f + static_cast<float>(esp_random() % 120);
-        s.vx = dirX * speed;
-        s.vy = dirY * speed;
+        s.vx = dx * invNorm * speed;
+        s.vy = dy * invNorm * speed;
         s.lifeSec = 0.0f;
         s.maxLifeSec = 2.0f + static_cast<float>(esp_random() % 150) / 100.0f; // 2.0–3.5s
         break;
@@ -2495,7 +2918,7 @@ void setup()
   initPower();
   initTouch();
 
-  if (!gfx->begin()) {
+  if (!gfx->begin(80000000)) {
     logf("Locket: display init failed\n");
     while (true) {
       delay(1000);
@@ -2517,6 +2940,7 @@ void setup()
   }
 
   initCloudSprites();
+  buildMoonMasks();
   seedScene();
   playBootAudioDiagnostic();
   startAudioPlayback();
@@ -2625,13 +3049,71 @@ void loop()
   const float elapsedSeconds = static_cast<float>(now - gLastFrameAtMs) / 1000.0f;
   gLastFrameAtMs = now;
 
+  static uint64_t sPerfWindowStartUs = 0;
+  static uint32_t sPerfFrameCount = 0;
+  static uint64_t sPerfRenderUsSum = 0, sPerfFlushUsSum = 0, sPerfFrameUsSum = 0;
+  static uint32_t sPerfRenderUsMax = 0, sPerfFlushUsMax = 0, sPerfFrameUsMax = 0;
+  static uint64_t sPerfSkySum = 0, sPerfStarsSum = 0, sPerfShootSum = 0;
+  static uint64_t sPerfCloudsSum = 0, sPerfMoonSum = 0, sPerfOrbSum = 0, sPerfScrollSum = 0;
+  static uint32_t sPerfActiveShooters = 0;
+  const uint64_t perfFrameStartUs = esp_timer_get_time();
+  if (sPerfWindowStartUs == 0) sPerfWindowStartUs = perfFrameStartUs;
+
   if (!gAnimationPaused) {
     updateStars(elapsedSeconds);
     updateClouds(elapsedSeconds);
   }
   updateShootingStars(elapsedSeconds);  // always — runs even while paused
+  const uint64_t perfRenderStartUs = esp_timer_get_time();
   renderFrame();
+  const uint64_t perfRenderEndUs = esp_timer_get_time();
   if (gUseCanvas) {
     canvas->flush();
+  }
+  const uint64_t perfFlushEndUs = esp_timer_get_time();
+
+  {
+    const uint32_t renderUs = static_cast<uint32_t>(perfRenderEndUs - perfRenderStartUs);
+    const uint32_t flushUs  = static_cast<uint32_t>(perfFlushEndUs  - perfRenderEndUs);
+    const uint32_t frameUs  = static_cast<uint32_t>(perfFlushEndUs  - perfFrameStartUs);
+    sPerfRenderUsSum += renderUs;  if (renderUs > sPerfRenderUsMax) sPerfRenderUsMax = renderUs;
+    sPerfFlushUsSum  += flushUs;   if (flushUs  > sPerfFlushUsMax)  sPerfFlushUsMax  = flushUs;
+    sPerfFrameUsSum  += frameUs;   if (frameUs  > sPerfFrameUsMax)  sPerfFrameUsMax  = frameUs;
+    sPerfSkySum    += gLastFrameTimings.sky;
+    sPerfStarsSum  += gLastFrameTimings.stars;
+    sPerfShootSum  += gLastFrameTimings.shootingStars;
+    sPerfCloudsSum += gLastFrameTimings.clouds;
+    sPerfMoonSum   += gLastFrameTimings.moon;
+    sPerfOrbSum    += gLastFrameTimings.orb;
+    sPerfScrollSum += gLastFrameTimings.scroll;
+    uint32_t activeShooters = 0;
+    for (size_t i = 0; i < kShootingStarCount; ++i) if (gShootingStars[i].active) ++activeShooters;
+    sPerfActiveShooters += activeShooters;
+    ++sPerfFrameCount;
+  }
+
+  if (perfFlushEndUs - sPerfWindowStartUs >= 1000000ULL && sPerfFrameCount > 0) {
+    const uint32_t n = sPerfFrameCount;
+    logf("perf fps=%lu frame avg/max=%lu/%lu us  render avg/max=%lu/%lu  flush avg/max=%lu/%lu  "
+         "sky=%lu stars=%lu shoot=%lu clouds=%lu moon=%lu orb=%lu scroll=%lu  shooters_avg=%lu\n",
+         static_cast<unsigned long>(n),
+         static_cast<unsigned long>(sPerfFrameUsSum / n),  static_cast<unsigned long>(sPerfFrameUsMax),
+         static_cast<unsigned long>(sPerfRenderUsSum / n), static_cast<unsigned long>(sPerfRenderUsMax),
+         static_cast<unsigned long>(sPerfFlushUsSum / n),  static_cast<unsigned long>(sPerfFlushUsMax),
+         static_cast<unsigned long>(sPerfSkySum / n),
+         static_cast<unsigned long>(sPerfStarsSum / n),
+         static_cast<unsigned long>(sPerfShootSum / n),
+         static_cast<unsigned long>(sPerfCloudsSum / n),
+         static_cast<unsigned long>(sPerfMoonSum / n),
+         static_cast<unsigned long>(sPerfOrbSum / n),
+         static_cast<unsigned long>(sPerfScrollSum / n),
+         static_cast<unsigned long>((sPerfActiveShooters * 10U) / n));
+    sPerfWindowStartUs = perfFlushEndUs;
+    sPerfFrameCount = 0;
+    sPerfRenderUsSum = sPerfFlushUsSum = sPerfFrameUsSum = 0;
+    sPerfRenderUsMax = sPerfFlushUsMax = sPerfFrameUsMax = 0;
+    sPerfSkySum = sPerfStarsSum = sPerfShootSum = 0;
+    sPerfCloudsSum = sPerfMoonSum = sPerfOrbSum = sPerfScrollSum = 0;
+    sPerfActiveShooters = 0;
   }
 }
