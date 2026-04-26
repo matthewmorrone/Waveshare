@@ -18,6 +18,7 @@
 #include "es8311_reg.h"
 #include "pin_config.h"
 #include "star_locket_melody.h"
+#include "usb_msc.h"
 #include <XPowersLib.h>
 
 namespace
@@ -249,7 +250,26 @@ constexpr uint32_t kMoonTransitionDurationMs = 1000;
 
 constexpr size_t kShootingStarCount = 16;
 ShootingStar gShootingStars[kShootingStarCount];
-bool gIsCharging = false;
+bool gIsPluggedIn = false;         // VBUS present (USB connected) — gates shooting stars
+bool gIsActivelyCharging = false;  // battery actually drawing charge — triggers lightning
+
+// Lightning strike: a jagged polyline flashed briefly while the battery is charging.
+// Points are the vertices of the main bolt; one optional branch forks off mid-bolt.
+constexpr size_t kLightningMainPoints = 18;
+constexpr size_t kLightningBranchPoints = 6;
+struct Lightning {
+  bool active = false;
+  uint32_t startMs = 0;
+  uint32_t durationMs = 0;
+  int16_t mainX[kLightningMainPoints];
+  int16_t mainY[kLightningMainPoints];
+  uint8_t mainCount = 0;
+  int16_t branchX[kLightningBranchPoints];
+  int16_t branchY[kLightningBranchPoints];
+  uint8_t branchCount = 0;
+};
+Lightning gLightning;
+uint32_t gLightningNextMinMs = 0;  // soonest time we'll try to strike again
 uint32_t gLastChargeCheckMs = 0;
 uint32_t gLastShootingSpawnMs = 0;
 uint8_t gAudioReadBuffer[kAudioReadBufferBytes] = {};
@@ -334,6 +354,8 @@ bool beginAudioI2s(int sampleRate);
 bool reconfigureAudioRate(uint32_t sampleRate);
 void audioTaskMain(void *arg);
 void resetBackgroundStar(size_t index, bool initialPlacement);
+void updateLightning(uint32_t nowMs);
+void drawLightning();
 
 bool initPower()
 {
@@ -1196,14 +1218,27 @@ void updateAudioPlayback()
   if (gUsingEmbeddedTrack) {
     const size_t remaining = kEmbeddedTrackPcmLen - gAudioDebugPcmOffset;
     const size_t chunkSize = min<size_t>(kAudioDebugChunkBytes, remaining);
-    if (chunkSize == 0) {
-      gAnimationPausedAtUs = esp_timer_get_time();
-      gAnimationPaused = true;
-      return;
+    if (chunkSize > 0) {
+      gAudioI2s.write(kEmbeddedTrackPcm + gAudioDebugPcmOffset, chunkSize);
+      gAudioDebugPcmOffset += chunkSize;
     }
-    gAudioI2s.write(kEmbeddedTrackPcm + gAudioDebugPcmOffset, chunkSize);
-    gAudioDebugPcmOffset += chunkSize;
     if (gAudioDebugPcmOffset >= kEmbeddedTrackPcmLen) {
+      // End of the built-in song — re-check the SD card. If it's available now, hand
+      // playback off to a real track. If still missing, pause as before.
+      logf("Locket: embedded song ended, re-checking SD card\n");
+      if (initSdCard(true)) {
+        gUsingEmbeddedTrack = false;
+        closeAudioPlayback();
+        openAudioFile();
+        if (gAudioFile) {
+          logf("Locket: SD card detected, switching to playlist\n");
+          return;
+        }
+        // open failed → fall back to embedded mode
+        gUsingEmbeddedTrack = true;
+        reconfigureAudioRate(kAudioSampleRate);
+        gAudioDebugPcmOffset = 0;
+      }
       gAnimationPausedAtUs = esp_timer_get_time();
       gAnimationPaused = true;
     }
@@ -1562,6 +1597,7 @@ void recheckSdCard()
     gPlaylist.clear();
     gShuffleQueue.clear();
     SD_MMC.end();
+    setMscMediaPresent(false);
     logf("Locket: SD card removed\n");
     playSdRemovedChime();
   } else {
@@ -1572,6 +1608,7 @@ void recheckSdCard()
       gSdInitFailed = false;
       logf("Locket: SD card inserted: %s\n", cardTypeText(SD_MMC.cardType()));
       cleanDotUnderscoreFiles("/");
+      setMscMediaPresent(true);
       playSdInsertedChime();
       startAudioPlayback();
     } else {
@@ -2745,6 +2782,7 @@ void renderFrame()
   for (size_t index = 0; index < kCloudCount; ++index) {
     drawCloud(gClouds[index]);
   }
+  drawLightning();  // flashes across the sky + clouds while charging
   const uint64_t t4 = esp_timer_get_time();
   drawMoon();
   const uint64_t t5 = esp_timer_get_time();
@@ -2797,9 +2835,9 @@ void updateShootingStars(float elapsedSeconds)
     }
   }
 
-  // Spawn new shooting stars only while charging. In-flight stars keep going so
-  // they finish naturally if charging stops mid-streak.
-  if (gIsCharging && esp_random() % 1000 < 250) {
+  // Spawn new shooting stars only while USB is connected. In-flight stars keep going
+  // so they finish naturally if the cable is unplugged mid-streak.
+  if (gIsPluggedIn && esp_random() % 1000 < 250) {
     for (size_t i = 0; i < kShootingStarCount; ++i) {
       if (!gShootingStars[i].active) {
         ShootingStar &s = gShootingStars[i];
@@ -2834,6 +2872,139 @@ void updateShootingStars(float elapsedSeconds)
         break;
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lightning (triggered while the battery is actively charging).
+// ---------------------------------------------------------------------------
+void spawnLightning()
+{
+  gLightning.active = true;
+  gLightning.startMs = millis();
+  // Two-beat flash: quick bright stroke, then a softer echo.
+  gLightning.durationMs = 420 + (esp_random() % 180);
+
+  // Main bolt: start somewhere along the upper portion of the screen and zig-zag down.
+  int16_t x = static_cast<int16_t>(40 + (esp_random() % (LCD_WIDTH - 80)));
+  int16_t y = 0;
+  gLightning.mainCount = 0;
+  for (size_t i = 0; i < kLightningMainPoints; ++i) {
+    if (y >= LCD_HEIGHT + 20) break;
+    gLightning.mainX[i] = x;
+    gLightning.mainY[i] = y;
+    ++gLightning.mainCount;
+    const int step = 20 + static_cast<int>(esp_random() % 24);           // 20..43 px down
+    const int jitter = static_cast<int>(esp_random() % 42) - 21;         // ±20 px
+    y = static_cast<int16_t>(y + step);
+    x = static_cast<int16_t>(constrain(x + jitter, 4, LCD_WIDTH - 5));
+  }
+
+  // Branch: fork off the main bolt somewhere in the middle third.
+  gLightning.branchCount = 0;
+  if (gLightning.mainCount >= 6 && (esp_random() & 1) == 0) {
+    const size_t forkIdx = 2 + (esp_random() % (gLightning.mainCount - 4));
+    int16_t bx = gLightning.mainX[forkIdx];
+    int16_t by = gLightning.mainY[forkIdx];
+    const int dir = ((esp_random() & 1) == 0) ? -1 : 1;
+    for (size_t i = 0; i < kLightningBranchPoints; ++i) {
+      if (by >= LCD_HEIGHT + 10) break;
+      gLightning.branchX[i] = bx;
+      gLightning.branchY[i] = by;
+      ++gLightning.branchCount;
+      const int step = 16 + static_cast<int>(esp_random() % 18);
+      const int jitter = (dir * (18 + static_cast<int>(esp_random() % 18)));
+      by = static_cast<int16_t>(by + step);
+      bx = static_cast<int16_t>(constrain(bx + jitter, 4, LCD_WIDTH - 5));
+    }
+  }
+}
+
+void updateLightning(uint32_t nowMs)
+{
+  if (gLightning.active && nowMs - gLightning.startMs >= gLightning.durationMs) {
+    gLightning.active = false;
+  }
+  // While actively charging, strike every few seconds.
+  if (!gLightning.active && gIsActivelyCharging && nowMs >= gLightningNextMinMs) {
+    // ~4% chance per frame → ~1–2 strikes per sec at 30fps, but we gate further with
+    // a minimum cooldown so it doesn't feel spammy.
+    if ((esp_random() % 100) < 4) {
+      spawnLightning();
+      gLightningNextMinMs = nowMs + 1800 + (esp_random() % 2200);  // 1.8–4 s cooldown
+    }
+  }
+}
+
+// Draw a jagged polyline with a soft halo (3 parallel passes) + bright core stroke.
+// `coreAmt` / `glowAmt` are scaled intensities (0..255); blending with 0x0000 dims.
+static void drawLightningPolyline(const int16_t *xs, const int16_t *ys, uint8_t count,
+                                  uint16_t coreColor, uint16_t glowColor,
+                                  uint8_t coreAmt, uint8_t glowAmt)
+{
+  if (count < 2) return;
+  const uint16_t glowPx = blend565(0x0000, glowColor, glowAmt);
+  const uint16_t corePx = blend565(0x0000, coreColor, coreAmt);
+  for (uint8_t i = 1; i < count; ++i) {
+    const int16_t x0 = xs[i - 1];
+    const int16_t y0 = ys[i - 1];
+    const int16_t x1 = xs[i];
+    const int16_t y1 = ys[i];
+    if (glowAmt) {
+      scene->drawLine(x0 - 1, y0, x1 - 1, y1, glowPx);
+      scene->drawLine(x0 + 1, y0, x1 + 1, y1, glowPx);
+      scene->drawLine(x0, y0 - 1, x1, y1 - 1, glowPx);
+    }
+    scene->drawLine(x0, y0, x1, y1, corePx);
+  }
+}
+
+void drawLightning()
+{
+  if (!gLightning.active) return;
+  const uint32_t nowMs = millis();
+  const uint32_t elapsed = nowMs - gLightning.startMs;
+  if (elapsed >= gLightning.durationMs) return;
+
+  // Two-beat intensity: big spike in the first ~40% then a softer second strike.
+  const float t = static_cast<float>(elapsed) / static_cast<float>(gLightning.durationMs);
+  float intensity;
+  if (t < 0.12f) {
+    intensity = t / 0.12f;                       // sharp rise
+  } else if (t < 0.40f) {
+    intensity = 1.0f - (t - 0.12f) / 0.56f;      // first fade
+  } else if (t < 0.55f) {
+    intensity = 0.55f + (0.55f - t) / 0.15f * 0.2f;  // small rebound
+  } else {
+    intensity = 0.75f * (1.0f - (t - 0.55f) / 0.45f);
+  }
+  if (intensity < 0.0f) intensity = 0.0f;
+  if (intensity > 1.0f) intensity = 1.0f;
+
+  const uint8_t coreAmt = static_cast<uint8_t>(intensity * 255.0f);
+  const uint8_t glowAmt = static_cast<uint8_t>(intensity * 140.0f);
+  constexpr uint16_t kLightningCore = 0xFFFF;      // pure white
+  constexpr uint16_t kLightningGlow = 0xBEFF;      // pale blue-white
+
+  // Full-screen flash: brighten the framebuffer uniformly.
+  uint16_t *fb = gUseCanvas ? canvas->framebuffer() : nullptr;
+  if (fb) {
+    const uint8_t flashAmt = static_cast<uint8_t>(intensity * 70.0f);
+    if (flashAmt) {
+      const size_t N = static_cast<size_t>(LCD_WIDTH) * static_cast<size_t>(LCD_HEIGHT);
+      for (size_t i = 0; i < N; ++i) {
+        fb[i] = blend565(fb[i], kLightningGlow, flashAmt);
+      }
+    }
+  }
+
+  drawLightningPolyline(gLightning.mainX, gLightning.mainY, gLightning.mainCount,
+                        kLightningCore, kLightningGlow, coreAmt, glowAmt);
+  if (gLightning.branchCount >= 2) {
+    drawLightningPolyline(gLightning.branchX, gLightning.branchY, gLightning.branchCount,
+                          kLightningCore, kLightningGlow,
+                          static_cast<uint8_t>(coreAmt * 0.75f),
+                          static_cast<uint8_t>(glowAmt * 0.75f));
   }
 }
 
@@ -2963,6 +3134,16 @@ void setup()
                 gExpanderReady ? "OK" : "missing",
                 gPowerReady ? "OK" : "missing",
                 gUseCanvas ? "ON" : "OFF");
+
+  // Make sure the card is mounted (lazy paths above may not have touched
+  // it yet), then advertise it to the host as a USB disk. TinyUSB
+  // descriptors are fixed at USB.begin(), so MSC can only come up if the
+  // card is present at this moment — a later insert still updates media
+  // presence via setMscMediaPresent() in recheckSdCard().
+  initSdCard(true);
+  if (initUsbMsc()) {
+    logf("Locket: USB MSC active — SD visible to host\n");
+  }
 }
 
 void loop()
@@ -2993,10 +3174,15 @@ void loop()
       logf("Locket: battery %u%%\n", static_cast<unsigned>(newPct));
       gBatteryPercent = newPct;
     }
-    const bool charging = gPower.isVbusIn();
-    if (charging != gIsCharging) {
-      gIsCharging = charging;
-      logf("Locket: charging %s\n", charging ? "started" : "stopped");
+    const bool pluggedIn = gPower.isVbusIn();
+    if (pluggedIn != gIsPluggedIn) {
+      gIsPluggedIn = pluggedIn;
+      logf("Locket: USB %s\n", pluggedIn ? "connected" : "disconnected");
+    }
+    const bool actuallyCharging = gPower.isCharging() && gPower.isBatteryConnect();
+    if (actuallyCharging != gIsActivelyCharging) {
+      gIsActivelyCharging = actuallyCharging;
+      logf("Locket: charging %s\n", actuallyCharging ? "started" : "stopped");
     }
   }
   if (kSkyDemoMode) {
@@ -3064,6 +3250,7 @@ void loop()
     updateClouds(elapsedSeconds);
   }
   updateShootingStars(elapsedSeconds);  // always — runs even while paused
+  updateLightning(millis());            // spawns new bolts while charging, ages active ones
   const uint64_t perfRenderStartUs = esp_timer_get_time();
   renderFrame();
   const uint64_t perfRenderEndUs = esp_timer_get_time();
