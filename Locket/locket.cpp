@@ -7,6 +7,8 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
+#include <WiFiProv.h>
 #include <WiFiServer.h>
 #include <Wire.h>
 #include <math.h>
@@ -2938,24 +2940,54 @@ void updateLightning(uint32_t nowMs)
 
 // Draw a jagged polyline with a soft halo (3 parallel passes) + bright core stroke.
 // `coreAmt` / `glowAmt` are scaled intensities (0..255); blending with 0x0000 dims.
+// Bresenham line that alpha-blends `color` into the framebuffer with `amt` as the
+// alpha (0 = invisible, 255 = opaque). Skips work when amt == 0.
+static void blendLineFb(uint16_t *fb, int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                        uint16_t color, uint8_t amt)
+{
+  if (!fb || amt == 0) return;
+  int16_t dx = x1 > x0 ? x1 - x0 : x0 - x1;
+  int16_t dy = y1 > y0 ? y1 - y0 : y0 - y1;
+  int16_t sx = x0 < x1 ? 1 : -1;
+  int16_t sy = y0 < y1 ? 1 : -1;
+  int16_t err = (dx > dy ? dx : -dy) / 2;
+  int16_t x = x0, y = y0;
+  for (;;) {
+    if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT) {
+      const size_t idx = static_cast<size_t>(y) * LCD_WIDTH + static_cast<size_t>(x);
+      fb[idx] = (amt == 255) ? color : blend565(fb[idx], color, amt);
+    }
+    if (x == x1 && y == y1) break;
+    const int16_t e2 = err;
+    if (e2 > -dx) { err -= dy; x += sx; }
+    if (e2 <  dy) { err += dx; y += sy; }
+  }
+}
+
 static void drawLightningPolyline(const int16_t *xs, const int16_t *ys, uint8_t count,
                                   uint16_t coreColor, uint16_t glowColor,
                                   uint8_t coreAmt, uint8_t glowAmt)
 {
   if (count < 2) return;
-  const uint16_t glowPx = blend565(0x0000, glowColor, glowAmt);
-  const uint16_t corePx = blend565(0x0000, coreColor, coreAmt);
+  uint16_t *fb = gUseCanvas ? canvas->framebuffer() : nullptr;
+  if (!fb) {
+    // Canvas-less fallback: write the bolt opaquely so it's at least visible.
+    for (uint8_t i = 1; i < count; ++i) {
+      scene->drawLine(xs[i - 1], ys[i - 1], xs[i], ys[i], coreColor);
+    }
+    return;
+  }
   for (uint8_t i = 1; i < count; ++i) {
     const int16_t x0 = xs[i - 1];
     const int16_t y0 = ys[i - 1];
     const int16_t x1 = xs[i];
     const int16_t y1 = ys[i];
     if (glowAmt) {
-      scene->drawLine(x0 - 1, y0, x1 - 1, y1, glowPx);
-      scene->drawLine(x0 + 1, y0, x1 + 1, y1, glowPx);
-      scene->drawLine(x0, y0 - 1, x1, y1 - 1, glowPx);
+      blendLineFb(fb, x0 - 1, y0,     x1 - 1, y1,     glowColor, glowAmt);
+      blendLineFb(fb, x0 + 1, y0,     x1 + 1, y1,     glowColor, glowAmt);
+      blendLineFb(fb, x0,     y0 - 1, x1,     y1 - 1, glowColor, glowAmt);
     }
-    scene->drawLine(x0, y0, x1, y1, corePx);
+    blendLineFb(fb, x0, y0, x1, y1, coreColor, coreAmt);
   }
 }
 
@@ -3020,6 +3052,88 @@ void updateClouds(float elapsedSeconds)
   }
 }
 
+WiFiMulti &wifiMulti()
+{
+  static WiFiMulti instance;
+  return instance;
+}
+
+// Brings up OTA + telnet on first successful Wi-Fi association, regardless of
+// whether the connection came from a WiFiMulti SSID or from BLE provisioning.
+// Idempotent — repeated WL_CONNECTED events (post-roam) won't restart services.
+static bool gOnlineServicesReady = false;
+static void bringUpOnlineServices()
+{
+  if (gOnlineServicesReady) return;
+  gOnlineServicesReady = true;
+  logf("Locket: WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+  ArduinoOTA.setHostname("locket");
+  ArduinoOTA.onStart([]() {
+    closeAudioPlayback();
+    gAnimationPaused = true;
+    gfx->fillScreen(0x0000);
+    gfx->setTextColor(0xFFFF);
+    gfx->setTextSize(2);
+    gfx->setCursor(LCD_WIDTH / 2 - 60, LCD_HEIGHT / 2 - 30);
+    gfx->print("Updating...");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    const int pct = static_cast<int>(progress * 100 / total);
+    const int barW = LCD_WIDTH - 80;
+    const int barH = 16;
+    const int barX = 40;
+    const int barY = LCD_HEIGHT / 2;
+    const int fillW = pct * barW / 100;
+    gfx->fillRect(barX, barY, barW, barH, 0x0000);
+    gfx->drawRect(barX, barY, barW, barH, 0xFFFF);
+    gfx->fillRect(barX + 1, barY + 1, fillW - 2, barH - 2, 0xFFFF);
+  });
+  ArduinoOTA.onEnd([]() {
+    gfx->fillScreen(0x0000);
+    gfx->setCursor(LCD_WIDTH / 2 - 48, LCD_HEIGHT / 2 - 10);
+    gfx->setTextColor(0xFFFF);
+    gfx->setTextSize(2);
+    gfx->print("Rebooting");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    gfx->fillScreen(0x0000);
+    gfx->setCursor(LCD_WIDTH / 2 - 60, LCD_HEIGHT / 2 - 10);
+    gfx->setTextColor(0xF800);
+    gfx->setTextSize(2);
+    gfx->print("OTA Failed");
+  });
+  ArduinoOTA.begin();
+  gTelnetServer.begin();
+  gTelnetServer.setNoDelay(true);
+  logf("Locket: OTA ready, telnet on port 23\n");
+}
+
+// Logs provisioning lifecycle events. Wi-Fi associations also flow through
+// here; bringUpOnlineServices() is called on STA_GOT_IP (DHCP success).
+static void onWiFiEvent(arduino_event_t *event)
+{
+  switch (event->event_id) {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      bringUpOnlineServices();
+      break;
+    case ARDUINO_EVENT_PROV_START:
+      logf("Locket: BLE provisioning ready — pair with 'ESP BLE Provisioning' app\n");
+      break;
+    case ARDUINO_EVENT_PROV_CRED_RECV:
+      logf("Locket: received credentials for SSID '%s'\n",
+           (const char *)event->event_info.prov_cred_recv.ssid);
+      break;
+    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+      logf("Locket: provisioning successful — credentials saved to NVS\n");
+      break;
+    case ARDUINO_EVENT_PROV_CRED_FAIL:
+      logf("Locket: provisioning failed (bad password or SSID unreachable)\n");
+      break;
+    default:
+      break;
+  }
+}
+
 } // namespace
 
 void setup()
@@ -3027,54 +3141,39 @@ void setup()
   Serial.begin(115200);
   delay(250);
 
-  WiFi.begin("The Y-Files", "quartz21wrench10crown");
+  // The event handler installs OTA + telnet asynchronously the first time we
+  // get a DHCP lease, regardless of which path got us connected (WiFiMulti or
+  // BLE provisioning). Register before kicking anything off.
+  WiFi.onEvent(onWiFiEvent);
+
+  // Hardcoded networks — additional SSIDs go here.
+  wifiMulti().addAP("The Y-Files", "quartz21wrench10crown");
+  wifiMulti().addAP("jotunheim", "2217concordcircle");
   uint32_t wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+  while (wifiMulti().run() != WL_CONNECTED && millis() - wifiStart < 10000) {
     delay(100);
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    logf("Locket: WiFi connected: %s\n", WiFi.localIP().toString().c_str());
-    ArduinoOTA.setHostname("locket");
-    ArduinoOTA.onStart([]() {
-      closeAudioPlayback();
-      gAnimationPaused = true;
-      gfx->fillScreen(0x0000);
-      gfx->setTextColor(0xFFFF);
-      gfx->setTextSize(2);
-      gfx->setCursor(LCD_WIDTH / 2 - 60, LCD_HEIGHT / 2 - 30);
-      gfx->print("Updating...");
-    });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      const int pct = static_cast<int>(progress * 100 / total);
-      const int barW = LCD_WIDTH - 80;
-      const int barH = 16;
-      const int barX = 40;
-      const int barY = LCD_HEIGHT / 2;
-      const int fillW = pct * barW / 100;
-      gfx->fillRect(barX, barY, barW, barH, 0x0000);
-      gfx->drawRect(barX, barY, barW, barH, 0xFFFF);
-      gfx->fillRect(barX + 1, barY + 1, fillW - 2, barH - 2, 0xFFFF);
-    });
-    ArduinoOTA.onEnd([]() {
-      gfx->fillScreen(0x0000);
-      gfx->setCursor(LCD_WIDTH / 2 - 48, LCD_HEIGHT / 2 - 10);
-      gfx->setTextColor(0xFFFF);
-      gfx->setTextSize(2);
-      gfx->print("Rebooting");
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-      gfx->fillScreen(0x0000);
-      gfx->setCursor(LCD_WIDTH / 2 - 60, LCD_HEIGHT / 2 - 10);
-      gfx->setTextColor(0xF800);
-      gfx->setTextSize(2);
-      gfx->print("OTA Failed");
-    });
-    ArduinoOTA.begin();
-    gTelnetServer.begin();
-    gTelnetServer.setNoDelay(true);
-    logf("Locket: OTA ready, telnet on port 23\n");
-  } else {
-    logf("Locket: WiFi not available, OTA disabled\n");
+  if (WiFi.status() != WL_CONNECTED) {
+    // No known SSID nearby. Fall back to BLE provisioning: device advertises a
+    // service named "PROV_locket"; on the phone, install the official
+    // "ESP BLE Provisioning" app (Espressif, free on iOS/Android), tap the
+    // device, enter the PIN, and pick the network. Provisioned credentials
+    // are saved to NVS, so subsequent boots connect without phone interaction.
+    static const uint8_t kProvUuid[16] = {
+      0xb4, 0xdf, 0x5a, 0x1c, 0x3f, 0x6b, 0xf4, 0xbf,
+      0xea, 0x4a, 0x82, 0x03, 0x04, 0x90, 0x1a, 0x02
+    };
+    WiFiProv.beginProvision(
+      NETWORK_PROV_SCHEME_BLE,
+      NETWORK_PROV_SCHEME_HANDLER_FREE_BLE,
+      NETWORK_PROV_SECURITY_1,
+      "locket1234",   // PoP / PIN entered in the app
+      "PROV_locket",  // BLE service name shown in the app
+      nullptr,
+      const_cast<uint8_t *>(kProvUuid),
+      false           // keep any previously-saved NVS credentials
+    );
+    logf("Locket: no known WiFi — BLE provisioning service running (PIN: locket1234)\n");
   }
   gAnimationStartUs = esp_timer_get_time();
   gAnimationPausedAtUs = gAnimationStartUs;
@@ -3149,6 +3248,14 @@ void setup()
 void loop()
 {
   const uint32_t now = millis();
+  // Drive WiFiMulti at 1 Hz so we re-associate (or pick a different SSID from
+  // the list) if the current AP drops, instead of giving up forever like the
+  // single-shot WiFi.begin() in setup() used to.
+  static uint32_t lastWifiTickMs = 0;
+  if (now - lastWifiTickMs >= 1000) {
+    lastWifiTickMs = now;
+    wifiMulti().run();
+  }
   if (WiFi.status() == WL_CONNECTED) {
     ArduinoOTA.handle();
     if (gTelnetServer.hasClient()) {
